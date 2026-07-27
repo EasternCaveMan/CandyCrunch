@@ -13,7 +13,7 @@ import pymzml
 import torch
 import torch.nn.functional as F
 from glycowork.glycan_data.loader import df_glycan, stringify_dict, unwrap
-from glycowork.motif.graph import subgraph_isomorphism, glycan_to_graph, glycan_to_nxGraph, compare_glycans, \
+from glycowork.motif.graph import subgraph_isomorphism, glycan_to_nxGraph, compare_glycans, \
     graph_to_string
 from glycowork.motif.processing import enforce_class
 from glycowork.motif.tokenization import (composition_to_mass,
@@ -337,23 +337,22 @@ def get_topk(dataloader, model, glycans, k = 25, temp = False, temperature = tem
     preds = np.empty((n_samples, k), dtype = int)
     conf = np.empty((n_samples, k), dtype = float)
     start_idx = 0
-    for data in dataloader:
-        mz_list, mz_remainder, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
-        mz_list = torch.stack([mz_list, mz_remainder], dim = 1)
-        batch_size = len(y)
-        inputs = [mz_list, precursor, glycan_type, rt, mode, lc, modification, trap]
-        inputs = [x.to(device) for x in inputs]
-        pred = model(*inputs)
-        if temp:
-            pred = torch.div(pred, temperature)
-        pred = F.softmax(pred, dim = 1)
-        pred = pred.cpu().detach().numpy()
-        idx_topk = np.argsort(pred, axis = 1)[:, ::-1][:, :k]
-        conf_topk = -np.sort(-pred)[:, :k]
-        end_idx = start_idx + batch_size
-        preds[start_idx:end_idx, :] = idx_topk
-        conf[start_idx:end_idx, :] = conf_topk
-        start_idx = end_idx
+    with torch.inference_mode():
+        for data in dataloader:
+            mz_list, mz_remainder, precursor, glycan_type, rt, mode, lc, modification, trap, y = data
+            mz_list = torch.stack([mz_list, mz_remainder], dim = 1)
+            batch_size = len(y)
+            inputs = [x.to(device, non_blocking = True) for x in
+                      [mz_list, precursor, glycan_type, rt, mode, lc, modification, trap]]
+            pred = model(*inputs)
+            if temp:
+                pred = pred / temperature
+            pred = F.softmax(pred, dim = 1)
+            conf_topk, idx_topk = torch.topk(pred, k, dim = 1)
+            end_idx = start_idx + batch_size
+            preds[start_idx:end_idx, :] = idx_topk.cpu().numpy()
+            conf[start_idx:end_idx, :] = conf_topk.cpu().numpy()
+            start_idx = end_idx
     preds = [[glycans[i] for i in j] for j in preds]
     return preds, conf.tolist()
 
@@ -453,27 +452,29 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
     df.sort_values(by = ['rounded_mz', 'rounded_RT'], inplace = True)
     df.drop(['rounded_mz', 'rounded_RT'], axis = 1, inplace = True)
     # Initialize the first cluster
-    first_row = df.iloc[0]
+    mz_arr = df[idx_col].to_numpy()
+    rt_arr = df['RT'].to_numpy()
+    int_arr = df['intensity'].to_numpy()
+    peak_arr = df['peak_d'].to_numpy(dtype = object)
+    chg_arr = df['precursor_charge'].to_numpy(dtype = object)
     clusters.append({
-        'm/z': [first_row[idx_col]],
-        'RT': [first_row['RT']],
-        'intensity': [first_row['intensity']],
-        'peak_d': [first_row['peak_d']],
-        'max_intensity': [first_row['intensity']],
-        'precursor_charge': [first_row['precursor_charge']]
+        'm/z': [mz_arr[0]],
+        'RT': [rt_arr[0]],
+        'intensity': [int_arr[0]],
+        'peak_d': [peak_arr[0]],
+        'precursor_charge': [chg_arr[0]],
+        'apex_int': int_arr[0],
+        'apex_mz': mz_arr[0],
+        'apex_rt': rt_arr[0]
     })
     # Loop through the sorted dataframe starting from the second row
-    for _, row in df.iloc[1:].iterrows():
-        mz = row[idx_col]
-        rt = row['RT']
-        intensity = row['intensity']
-        peak_d = row['peak_d']
+    for r in range(1, len(mz_arr)):
+        mz, rt, intensity, peak_d = mz_arr[r], rt_arr[r], int_arr[r], peak_arr[r]
         found = False
         for cluster in clusters:
-            last_max = cluster['max_intensity'][-1]
+            last_max = cluster['apex_int']
             if last_max > 0:
-                idx = np.argmax(cluster['max_intensity'])
-                last_mz, last_rt = cluster['m/z'][idx], cluster['RT'][idx]
+                last_mz, last_rt = cluster['apex_mz'], cluster['apex_rt']
             else:
                 last_mz, last_rt = cluster['m/z'][-1], cluster['RT'][-1]
             if abs(last_mz - mz) <= mz_diff and abs(last_rt - rt) <= rt_diff:
@@ -481,8 +482,9 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
                 cluster['RT'].append(rt)
                 cluster['intensity'].append(intensity)
                 cluster['peak_d'].append(peak_d)
-                cluster['max_intensity'].append(intensity if intensity > last_max else last_max)
-                cluster['precursor_charge'].append(row['precursor_charge'])
+                cluster['precursor_charge'].append(chg_arr[r])
+                if intensity > last_max:
+                    cluster['apex_int'], cluster['apex_mz'], cluster['apex_rt'] = intensity, mz, rt
                 found = True
                 break
         if not found:
@@ -491,8 +493,10 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
                 'RT': [rt],
                 'intensity': [intensity],
                 'peak_d': [peak_d],
-                'max_intensity': [intensity],
-                'precursor_charge': [row['precursor_charge']],
+                'precursor_charge': [chg_arr[r]],
+                'apex_int': intensity,
+                'apex_mz': mz,
+                'apex_rt': rt
             })
     # Create a condensed dataframe
     condensed_data = []
@@ -500,10 +504,10 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
         highest_intensity_index = np.argmax(cluster['intensity'])
         highest_intensity = cluster['intensity'][highest_intensity_index]
         if highest_intensity > 0:
-            min_mz = cluster['m/z'][highest_intensity_index]
+            rep_mz = cluster['m/z'][highest_intensity_index]
             mean_rt = cluster['RT'][highest_intensity_index]
         else:
-            min_mz = min(cluster['m/z'])
+            rep_mz = min(cluster['m/z'])
             mean_rt = np.mean(cluster['RT'])
         # Cluster fragment peaks across spectra by mass proximity, then weight-average mass and sum intensity
         mi_pairs = sorted([(m, i) for spec in cluster['peak_d'] for m, i in spec.items()], key = lambda x: x[0])
@@ -537,7 +541,7 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
         num_spectra = len(cluster['RT'])
         rep_charge = cluster['precursor_charge'][highest_intensity_index]
         condensed_data.append(
-            [min_mz, mean_rt, sum_intensity, peaks, binned_intensities, mz_remainder, num_spectra, rep_charge])
+            [rep_mz, mean_rt, sum_intensity, peaks, binned_intensities, mz_remainder, num_spectra, rep_charge])
     return pd.DataFrame(condensed_data,
                         columns = ['m/z', 'RT', 'intensity', 'peak_d', 'binned_intensities', 'mz_remainder',
                                    'num_spectra', 'precursor_charge'])
@@ -668,13 +672,16 @@ def deisotope_ms2(peaks: Dict[float, float], precursor_charge: int,
                   validate_pattern: bool = True) -> Dict[float, float]:
     """De-isotope MS2 spectrum identifying direct isotope patterns."""
     sorted_peaks = sorted([(m, i) for m, i in peaks.items() if i >= min_intensity])
-    processed = set()
+    mass_arr = np.array([m for m, _ in sorted_peaks])
+    consumed = np.zeros(len(sorted_peaks), dtype = bool)
     deisotoped = {}
     spacings = [1.0034 / z for z in range(1, precursor_charge + 1)]
     for i, (current_mass, current_intensity) in enumerate(sorted_peaks):
         # Skip if already processed
-        if any(abs(current_mass - x) <= mass_tolerance for x in processed): continue
-        processed.add(current_mass)
+        if consumed[i]: continue
+        consumed[np.searchsorted(mass_arr, current_mass - mass_tolerance, 'left'):np.searchsorted(mass_arr,
+                                                                                                  current_mass + mass_tolerance,
+                                                                                                  'right')] = True
         best_pattern = [(current_mass, current_intensity)]
         best_charge = 0
         # Check all charge states
@@ -689,7 +696,7 @@ def deisotope_ms2(peaks: Dict[float, float], precursor_charge: int,
                 candidate_mass, candidate_intensity = sorted_peaks[j]
                 if candidate_mass > next_mass + spacing + mass_tolerance:
                     break
-                if any(abs(candidate_mass - x) <= mass_tolerance for x in processed):
+                if consumed[j]:
                     continue
                 if abs(candidate_mass - next_mass - spacing) <= mass_tolerance:
                     if validate_pattern and not (candidate_intensity <= charge_pattern[-1][1] * 1.20 or
@@ -702,7 +709,9 @@ def deisotope_ms2(peaks: Dict[float, float], precursor_charge: int,
                 best_charge = charge
         if len(best_pattern) >= min_isotope_count:
             mono_mass = best_pattern[0][0]
-            for peak_mass, _ in best_pattern[1:]: processed.add(peak_mass)
+            for peak_mass, _ in best_pattern[1:]:
+                consumed[np.searchsorted(mass_arr, peak_mass - mass_tolerance, 'left'):
+                                                           np.searchsorted(mass_arr, peak_mass + mass_tolerance, 'right')] = True
             deisotoped[mono_mass] = sum(i for _, i in best_pattern) if sum_intensities else best_pattern[0][1]
         else:
             deisotoped[current_mass] = current_intensity
@@ -715,18 +724,24 @@ def assign_annotation_scores_pooled(df_in, multiplier, mass_tag, mass_tolerance,
     adduct_list = get_adduct_list(mode)
     idx_col = 'm/z' if 'm/z' in df_in.columns else 'reducing_mass'
     unq_structs = df_in[df_in['candidate_structure'].notnull()].groupby('candidate_structure').first().reset_index()
-    for struct, comp in zip(unq_structs.candidate_structure, unq_structs.composition):
-        row_charge = max(df_in[df_in['candidate_structure'] == struct].charge)
-        comp_mass = composition_to_mass(comp, sample_prep = sample_prep, modification = modification) + (
+    groups = df_in.groupby('candidate_structure', sort = False).indices
+    comp_map = dict(zip(unq_structs.candidate_structure, unq_structs.composition))
+    charge_vals = np.asarray(df_in['charge'].values, dtype = float)
+    mz_vals, peak_vals = df_in[idx_col].values, df_in['peak_d'].values
+    scores_out = np.zeros(len(df_in))
+    for struct, rows in groups.items():
+        grp_charges = charge_vals[rows]
+        row_charge = np.nanmax(grp_charges) if not np.all(np.isnan(grp_charges)) else 1.0
+        comp_mass = composition_to_mass(comp_map[struct], sample_prep = sample_prep, modification = modification) + (
             mass_tag if mass_tag else 0)
-        charges_arr = np.abs(df_in[df_in['candidate_structure'] == struct].charge.values)
-        spec_masses = df_in[df_in['candidate_structure'] == struct][idx_col].values * charges_arr
+        charges_arr = np.abs(charge_vals[rows])
+        spec_masses = mz_vals[rows] * charges_arr
         is_adduct = any(
             np.any(np.abs(comp_mass + mass_dict.get(adduct, 999) - spec_masses) < mass_tolerance) or
             np.any(np.abs(comp_mass + mass_dict.get(adduct, 999) * charges_arr - spec_masses) < mass_tolerance)
             for adduct in adduct_list)
         rounded_mass_rows = [[np.round(y, 1) for y in deisotope_ms2(x, int(abs(row_charge)), 0.05)][:15] for x in
-                             df_in[df_in['candidate_structure'] == struct].peak_d]
+                             peak_vals[rows]]
         unq_rounded_masses = set([x for y in rounded_mass_rows for x in y])
         cc_out = CandyCrumbs(struct, unq_rounded_masses, mass_tolerance, simplify = False,
                              charge = int(multiplier * abs(row_charge)),
@@ -749,7 +764,8 @@ def assign_annotation_scores_pooled(df_in, multiplier, mass_tag, mass_tolerance,
             else:
                 tester_mass_scores[_k] = 0
         row_scores = [sum([tester_mass_scores[x] for x in y]) for y in rounded_mass_rows]
-        df_in.loc[df_in['candidate_structure'] == struct, 'annotation_score'] = row_scores
+        scores_out[rows] = row_scores
+    df_in['annotation_score'] = scores_out
     return df_in
 
 
@@ -768,27 +784,26 @@ def deduplicate_predictions(df, mz_diff = 0.5, rt_diff = 1.0):
     df.sort_values(by = 'RT', inplace = True)
     df.sort_index(inplace = True)
     max_conf_rows = []
+    idx_vals = df.index.values
+    rt_vals = df['RT'].values
+    preds_col = df['predictions'].values
+    first_preds = np.array([p[0][0] if p else None for p in preds_col], dtype = object)
+    conf_first = np.array([p[0][1] if p else -np.inf for p in preds_col])
+    abund = df['rel_abundance'].values if 'rel_abundance' in df.columns else None
+    lo = np.searchsorted(idx_vals, idx_vals - mz_diff, side = 'right')
+    hi = np.searchsorted(idx_vals, idx_vals + mz_diff, side = 'left')
     # Loop through the DataFrame to find duplicates
-    for idx, row in df.iterrows():
-        # Set a mask for close enough index values and RT values
-        mask = (np.abs(df.index - idx) < mz_diff) & (np.abs(df['RT'] - row['RT']) < rt_diff)
-        # Filter DataFrame based on mask
-        sub_df = df[mask]
-        # Get the first prediction from the tuple
-        first_pred = row['predictions'][0][0] if row['predictions'] else None
+    for k in range(len(df)):
+        first_pred = first_preds[k]
         if first_pred is None:
-            max_conf_rows.append(row)
+            max_conf_rows.append(df.iloc[k])
             continue
-        # Filter sub_df based on the first prediction value
-        pred_mask = sub_df['predictions'].apply(lambda x: x[0][0] if x else None) == first_pred
-        # Choose the row with the max confidence for this prediction
-        max_conf_row = sub_df.loc[pred_mask].iloc[np.argmax([p[0][1] for p in sub_df.loc[pred_mask, 'predictions']])]
-        if 'rel_abundance' in df.columns:
-            # Sum 'rel_abundance' for this subset
-            summed_abundance = np.nansum(sub_df.loc[pred_mask, 'rel_abundance'])
-            # Update 'rel_abundance'
-            max_conf_row['rel_abundance'] = summed_abundance
-        # Store in max_conf_rows
+        window = np.arange(lo[k], hi[k])
+        sel = window[(np.abs(rt_vals[window] - rt_vals[k]) < rt_diff) & (first_preds[window] == first_pred)]
+        max_conf_row = df.iloc[sel[np.argmax(conf_first[sel])]]
+        if abund is not None:
+            max_conf_row = max_conf_row.copy()
+            max_conf_row['rel_abundance'] = np.nansum(abund[sel])
         max_conf_rows.append(max_conf_row)
     dedup_df = pd.DataFrame(max_conf_rows, columns = df.columns)
     dedup_df = dedup_df.astype(dict(df.dtypes))
@@ -878,7 +893,7 @@ def domain_filter(df_out, glycan_class, mode = 'negative', modification = 'reduc
                 truth.append(not any(abs(mass_dict['Neu5Ac'] + HYDROGEN_MASS * multiplier - j) < double_mass_tolerance or
                                      abs(precursor_mz - mass_dict['Neu5Ac'] - j) < double_mass_tolerance
                                      for j in top_frags[:10] if isinstance(j, float)))
-            if 'S' in m and len(current_preds) < 1:
+            if 'S' in m and len(current_preds) == 1:
                 truth.append(any('S' in (mz_to_composition(t, max_charge = max_charge, mass_tolerance = mass_tolerance,
                                                            glycan_class = glycan_class, df_use = df_use,
                                                            filter_out = filter_out, modification = modification,
@@ -1302,28 +1317,21 @@ def filter_delayed_rts(df_out, mass_tolerance):
     # Create an empty list to store indices of rows to discard
     rows_to_discard = []
     # Group by m/z with a tolerance of +/- 0.5 and identical top1 predictions
-    for i, mz_val in enumerate(df_out.index.unique()):
-        mz_group = df_out.loc[
-            (df_out.index >= mz_val - mass_tolerance) & (df_out.index <= mz_val + mass_tolerance)
+    df_work = df_out.assign(
+        _cxn = np.array([p[0][1] if p else 0.0 for p in df_out['predictions']]) * df_out['num_spectra'].to_numpy())
+    for mz_val in df_out.index.unique():
+        mz_group = df_work.loc[
+            (df_work.index >= mz_val - mass_tolerance) & (df_work.index <= mz_val + mass_tolerance)
             ]
         # Further group by top1 prediction
         for top1_pred, group in mz_group.groupby('top1_pred'):
             # Sort the group by RT to easily find the first instance
             group_sorted = group.sort_values(by = "RT")
             first_rt = group_sorted.iloc[0]["RT"]
-            # Find rows with RT more than 10 units after the first instance
-            delayed_rows = group_sorted[group_sorted["RT"] > first_rt + 10]
-            # Calculate the confidence * num_spectra for each row and find the maximum in the group
-            group["conf_times_num_spectra"] = group.apply(
-                lambda row: row["predictions"][0][1] * row["num_spectra"], axis = 1
-            )
-            max_conf_times_num_spectra = group["conf_times_num_spectra"].max()
-            # Check each delayed row against the maximum value
-            for idx, row in delayed_rows.iterrows():
-                if row["predictions"][0][1] * row["num_spectra"] < max_conf_times_num_spectra:
-                    rows_to_discard.append(idx)
-            # Clean up temporary column
-            group.drop(columns = ["conf_times_num_spectra"], inplace = True, errors = "ignore")
+            max_cxn = group['_cxn'].max()
+            # Delayed rows that lose to the group maximum
+            rows_to_discard.extend(
+                group_sorted.index[(group_sorted["RT"] > first_rt + 10) & (group_sorted['_cxn'] < max_cxn)])
     # Discard the marked rows
     df_out_filtered = df_out.drop(rows_to_discard)
     return df_out_filtered
@@ -1407,7 +1415,8 @@ def augment_predictions(df_out, pred_thresh, supplement, experimental, glycan_cl
 
 
 def finalise_predictions(df_out, get_missing, pred_thresh, mode, modification, mass_tag, multiplier, plot_glycans,
-                         spectra_filepath, spectra, sample_prep = 'underivatized', glycan_class = 'O'):
+                         spectra_filepath, spectra, sample_prep = 'underivatized', glycan_class = 'O',
+                         mass_tolerance = 0.5):
     """Cleans up incorrect structure predictions and formats dataframe\n
     | Arguments:
     | :-
@@ -1440,7 +1449,7 @@ def finalise_predictions(df_out, get_missing, pred_thresh, mode, modification, m
     df_out = df_out[df_out['predictions'].apply(len) > 0]
     for preds, obs_mass in zip(df_out['predictions'], df_out.index):
         theo_mass = mass_check(obs_mass, preds[0][0], modification = modification, mass_tag = mass_tag, mode = mode,
-                               sample_prep = sample_prep)
+                               sample_prep = sample_prep, mass_tolerance = mass_tolerance)
         if theo_mass:
             valid_indices.append(True)
             ppm_errors.append(abs(((theo_mass[0] - obs_mass) / theo_mass[0]) * 1e6))
@@ -1476,7 +1485,7 @@ def finalise_predictions(df_out, get_missing, pred_thresh, mode, modification, m
     df_out.index.name = "m/z"
     if plot_glycans:
         from glycowork.motif.draw import plot_glycans_excel
-        plot_glycans_excel(df_out, '/'.join(spectra_filepath.split("\\")[:-1]) + '/', glycan_col_num = 0)
+        plot_glycans_excel(df_out, os.path.dirname(spectra_filepath) or '.', glycan_col_num = 0)
     return (df_out, spectra_out) if spectra else df_out
 
 
@@ -1905,6 +1914,7 @@ def wrap_inference_batch(spectra_filepath_list, glycan_class, intra_cat_thresh, 
    | Returns a tuple of (pivot_table, dict of per-file dataframes)
    """
     mode = "negative" if max_charge < 0 else "positive"
+    mass_tolerance = ppm_thresh * MZ_REF / 1e6
     print(
         f"Your chosen settings are: {glycan_class} glycans, {mode} ion mode, {modification} glycans, {lc} LC, and {trap} ion trap. If any of that seems off to you, please restart with correct parameters.")
     if df_use is None:
@@ -1918,7 +1928,7 @@ def wrap_inference_batch(spectra_filepath_list, glycan_class, intra_cat_thresh, 
         file_label = spectra_filepath.split('/')[-1].split('.')[0]
         df_out = wrap_inference(spectra_filepath, glycan_class, model = model, glycans = glycans, bin_num = bin_num,
                                 max_charge = max_charge,
-                                frag_num = frag_num, mode = mode, modification = modification, mass_tag = mass_tag,
+                                frag_num = frag_num, modification = modification, mass_tag = mass_tag,
                                 lc = lc, trap = trap, rt_min = rt_min, rt_max = rt_max, rt_diff = rt_diff, rt_max_default = rt_max_default,
                                 pred_thresh = pred_thresh, temperature = temperature, get_missing = get_missing,
                                 extra_thresh = extra_thresh, crumbs_thresh = crumbs_thresh, ppm_thresh = ppm_thresh,
@@ -1994,7 +2004,8 @@ def wrap_inference_batch(spectra_filepath_list, glycan_class, intra_cat_thresh, 
             if len(df_out) > 0:
                 df_out = finalise_predictions(df_out, get_missing, pred_thresh, mode, modification,
                                               mass_tag, multiplier, plot_glycans, file_label, spectra,
-                                              sample_prep = sample_prep, glycan_class = glycan_class)
+                                              sample_prep = sample_prep, glycan_class = glycan_class,
+                                              mass_tolerance = mass_tolerance)
         else:
             df_out = pd.DataFrame()
         # Unpack if spectra=True returned a tuple

@@ -2,7 +2,6 @@ import copy
 import math
 import random
 import re
-from collections import Counter
 from itertools import product
 from operator import neg
 import bisect
@@ -1589,10 +1588,12 @@ def select_indices(arrays, indices, array_indices):
 
 def check_masses(desired_masses, new_masses, threshold):
     """Calculates indices of masses which are within a threshold of any mass in another array"""
-    d = desired_masses.reshape(1, -1)
-    f = new_masses.reshape(-1, 1)
-    within_threshold = np.abs(f - d) < threshold
-    return np.any(within_threshold, axis = 1)
+    d = np.sort(np.asarray(desired_masses))
+    f = np.asarray(new_masses)
+    idx = np.searchsorted(d, f)
+    left = np.abs(f - d[np.clip(idx - 1, 0, len(d) - 1)])
+    right = np.abs(f - d[np.clip(idx, 0, len(d) - 1)])
+    return np.minimum(left, right) < threshold
 
 
 def glycopeptide_string_to_input(gpep_string):
@@ -2044,15 +2045,13 @@ def get_unique_subgraphs(nx_mono1, nx_mono2):
         graphs2 = set()
         first_graphs = enumerate_k_graphs(nx_mono1, i)
         second_graphs = enumerate_k_graphs(nx_mono2, i)
-        for subg_1 in first_graphs:
-            undir_subg_1 = subg_1.to_undirected()
-            for subg_2 in second_graphs:
-                undir_subg_2 = subg_2.to_undirected()
-                if nx.is_isomorphic(undir_subg_1, undir_subg_2, node_match = nm):
-                    graphs1.add(first_graphs.index(subg_1))
-                    graphs2.add(second_graphs.index(subg_2))
-                else:
-                    pass
+        undir1 = [g.to_undirected() for g in first_graphs]
+        undir2 = [g.to_undirected() for g in second_graphs]
+        for a, ua in enumerate(undir1):
+            for b, ub in enumerate(undir2):
+                if nx.is_isomorphic(ua, ub, node_match = nm):
+                    graphs1.add(a)
+                    graphs2.add(b)
         # Take only the subgraphs from each graph which are not isomorphic
         kunique_graphs1 = [first_graphs[x] for x in range(len(first_graphs)) if x not in graphs1]
         all_unique_graphs1.extend(kunique_graphs1)
@@ -2216,6 +2215,7 @@ def follow_sigs(df, glycan_list, mz_cap = 3000, max_mz = 3000, min_mz = 39.714, 
     df_r = pd.concat([df_a, df_b], axis = 0)
     remainder = [np.median(col) for col in zip(*df_r.mz_remainder.values.tolist())]
     bins = {min_mz + ((max_mz - min_mz) / bin_num) * k + remainder[k]: [] for k in range(max_bin)}
+    bin_keys = list(bins)
     for conf in conf_range:
         df_a2 = df_a[df_a.Confidence.between(conf[0], conf[1])]
         df_b2 = df_b[df_b.Confidence.between(conf[0], conf[1])]
@@ -2224,11 +2224,8 @@ def follow_sigs(df, glycan_list, mz_cap = 3000, max_mz = 3000, min_mz = 39.714, 
         cohensd = [cohen_d(df_a2[:, k], df_b2[:, k]) for k in range(max_bin)]
         pvals = [ttest_ind(df_a2[:, k], df_b2[:, k], equal_var = False)[1] for k in range(max_bin)]
         pvals = multipletests(pvals)[1]
-        for c in range(len(cohensd)):
-            if pvals[c] < 0.05:
-                bins[list(bins.keys())[c]] += [cohensd[c]]
-            else:
-                bins[list(bins.keys())[c]] += [0]
+        for c, cd in enumerate(cohensd):
+            bins[bin_keys[c]].append(cd if pvals[c] < 0.05 else 0)
     bins = {k: v for k, v in bins.items() if
             max([abs(v2) for v2 in v]) >= thresh and not any([math.isinf(v2) for v2 in v])}
     conf_idx = [c[1] for c in conf_range]
