@@ -2005,18 +2005,18 @@ def composition_to_fragments(composition, fragment_masses, mass_threshold, max_c
 
 
 @rescue_glycans
-def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
+def CandyCrumbs(input_string, fragment_masses, mass_threshold = None,
                 max_cleavages = 3, simplify = True, charge = -1, mass_tag = None,
                 iupac = False, intensities = None, disable_global_mods = False, disable_X_cross_rings = None,
                 disable_A_cross_rings = None, sample_prep = 'underivatized', prior_weight = 1.0, glycan_class = None,
                 fragmentation_method = None, allow_internal_peptide_fragments = False, mass_threshold_ppm = None,
-                max_global_mods = 1):
+                max_global_mods = None):
     """Basic wrapper for the annotation of observed masses with correct nomenclature given a glycan\n
     | Arguments:
     | :-
     | input_string (string): glycan in IUPAC-condensed format (or composition as dict/string)
     | fragment_masses (list): all masses which are to be annotated with a fragment name
-    | mass_threshold (float): the maximum tolerated mass difference around each observed mass at which to include fragments; default:0.5
+    | mass_threshold (float): the maximum tolerated mass difference around each observed mass at which to include fragments; default:None (0.5 Da, or 10 ppm for glycopeptides)
     | max_cleavages (int): maximum number of allowed concurrent fragmentations per mass; default:3
     | simplify (bool): whether to try condensing fragment options to the most likely option; default:True
     | charge (int): the charge state of the precursor ion (singly-charged, doubly-charged); default:-1
@@ -2030,11 +2030,23 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
     | allow_internal_peptide_fragments (bool): whether to allow peptide fragments cleaved at both termini; default:False
     | mass_threshold_ppm (float): relative tolerance in ppm, applied on top of mass_threshold; default:None
     | max_global_mods (int): how many global modifications may co-occur on one fragment; 2 captures the
-    |                        sequential water losses of the oxonium series. Counts as one cleavage either way; default:1\n
+    |                        sequential water losses of the oxonium series. Counts as one cleavage either way;
+    |                        default:None (2 for glycopeptides, 1 for free glycans)\n
     | Returns:
     | :-
     | Returns a list of tuples containing the observed mass and all of the possible fragment names within the threshold
     """
+    glycopeptide_input = (isinstance(input_string, dict) and bool(input_string.get('peptide'))) or (
+            isinstance(input_string, str) and '*' in input_string)
+    if max_global_mods is None:
+        # Glycopeptide oxonium series routinely lose two waters; free glycans rarely need a second modification
+        max_global_mods = 2 if glycopeptide_input else 1
+    if mass_threshold_ppm is None and mass_threshold is None and glycopeptide_input:
+        # Intact glycopeptides are only measurable on FT instruments, where a fixed Da window is far too
+        # loose; an explicitly given mass_threshold is always respected instead
+        mass_threshold_ppm = 10
+    if mass_threshold is None:
+        mass_threshold = 0.5
     if mass_threshold_ppm is not None:
         mass_threshold = max(fragment_masses) * abs(charge) * mass_threshold_ppm / 1e6
     if disable_A_cross_rings is None:
@@ -2612,7 +2624,7 @@ def draw_peptide_ladder(peptide, hit_dict, glycosites = (), ax = None, fontsize 
     return ax
 
 
-def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_threshold = 0.5,
+def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_threshold = None,
                             max_cleavages = 3, mass_tag = None, sample_prep = 'underivatized',
                             disable_global_mods = False, prior_weight = 1.0, charge = None, ax = None,
                             annotate_top_n = None, annotation_threshold = 0.05, figsize = None,
@@ -2624,7 +2636,7 @@ def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_thr
     | input_string (string/dict): anything CandyCrumbs accepts, i.e., a glycan, a peptide*glycan* string, or an input dict
     | spectrum (dataframe/list): either the prediction dataframe from wrap_inference, or the observed m/z values
     | intensities (list): the peak_d list from wrap_inference when spectrum is a dataframe, else the intensities
-    | mass_threshold (float): maximum tolerated mass difference for fragment matching; default:0.5
+    | mass_threshold (float): maximum tolerated mass difference for fragment matching; default:None (see CandyCrumbs)
     | max_cleavages (int): maximum concurrent fragmentations per mass; default:3
     | mass_tag (float): mass of the glycan label or reducing end modification; default:None
     | sample_prep (string): underivatized/permethylated; default:'underivatized'
@@ -2731,7 +2743,9 @@ def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_thr
         # neutral loss, so a box per loss repeats the same picture and drags them away from their peaks
         groups = {}
         for mz, rel_int, _, kind, dc_name in peaks:
-            if kind not in ('oxonium', 'glycan'):
+            # A leader to a noise-level peak is a line across the plot for nothing, so a cartoon only
+            # claims the peaks that were worth labeling in the first place
+            if kind not in ('oxonium', 'glycan') or rel_int < annotation_threshold * 100:
                 continue
             frag_iupac = fragment_to_fragIUPAC(glycan_string, dc_name)
             if frag_iupac is not None:
