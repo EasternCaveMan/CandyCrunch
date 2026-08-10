@@ -170,6 +170,11 @@ MODIFICATION_TOKENS = {
     'Carbamidomethyl': {'C': 'c'},
     'Guanidinyl': {'K': 'j'},
 }
+N_TERM_IONS = {'a', 'b', 'c'}
+C_TERM_IONS = {'x', 'y', 'z'}
+PEPTIDE_ION_TYPES = {'CID': {'b', 'y'}, 'HCD': {'a', 'b', 'y'}, 'ETD': {'c', 'z'}, 'ECD': {'c', 'z'},
+                     'EThcD': {'b', 'c', 'y', 'z'}, 'ETciD': {'b', 'c', 'y', 'z'},
+                     None: N_TERM_IONS | C_TERM_IONS}
 tester_ma_addition = {k: {'mass': {k: v}, 'atoms': {k: [1, 2, 3, 4, 5, 6]}} for k, v in AA_masses.items()}
 mono_attributes = mono_attributes | tester_ma_addition
 bond_masses = {'red_bond': WATER_MASS, 'no_bond': -WATER_MASS, 'peptide_b': -WATER_MASS,
@@ -641,15 +646,16 @@ def precalculate_mod_masses(all_mono_mods, all_terminal_perms, terminal_labels, 
     return product(*all_mono_mod_masses), product(*all_atom_dict_masses), global_mods_mass
 
 
-def temporary_root_calc_func(glyco_pep):
+def temporary_root_calc_func(subg, parent_graph = None):
     """Determines whether and where to add label and extra oxygen masses to the reducing end of a glycan\n"""
-    reducing_ends = [x for x in nx.get_node_attributes(glyco_pep, 'reducing_end')]
+    reducing_ends = [x for x in nx.get_node_attributes(subg, 'reducing_end')]
     if not reducing_ends:
         return False, None
-    bond_labels = nx.get_edge_attributes(glyco_pep, 'bond_label')
+    graph = subg if parent_graph is None else parent_graph
+    bond_labels = nx.get_edge_attributes(graph, 'bond_label')
     for red_end in reducing_ends:
-        for x in glyco_pep.in_edges(red_end):
-            if bond_labels[x] == 'glycosite':
+        for x in graph.in_edges(red_end):
+            if bond_labels.get(x) == 'glycosite':
                 return False, None
     return True, red_end
 
@@ -877,7 +883,7 @@ def generate_atomic_frags(nx_mono, global_mods, special_residues, allowed_X_clea
         lo = bisect.bisect_left(sorted_charge_masses, avg_graph_mass - graph_mass_thresh)
         if lo >= len(sorted_charge_masses) or sorted_charge_masses[lo] > avg_graph_mass + graph_mass_thresh:
             continue
-        bonus_root_mass, bonus_root_node = temporary_root_calc_func(subg)
+        bonus_root_mass, bonus_root_node = temporary_root_calc_func(subg, nx_mono)
         terminal_labels = [node_dict_basic[x] for x in terminals]
         subg_global_mods = global_mods.copy()
         if special_residues:
@@ -1264,6 +1270,63 @@ def compute_fragment_lability(nx_mono, subg):
     return total / max(n, 1)
 
 
+def merge_gp_global_mods(gp_names):
+    """Reports a fragment-wide global modification only once across the peptide and glycan label lists"""
+    seen, out = set(), []
+    for sub in gp_names:
+        new = []
+        for y in sub:
+            if y.startswith('M_'):
+                if y in seen:
+                    continue
+                seen.add(y)
+            new.append(y)
+        out.append(new)
+    return out
+
+
+def count_gp_cleavages(gp_names):
+    """Counts the bond cleavages a glycopeptide fragment label actually implies"""
+    n, global_mods = 0, set()
+    for sub in gp_names:
+        for y in sub:
+            if y in ('Peptide', 'No Peptide', 'M') or y.startswith('loss of glycan'):
+                continue
+            if y.startswith('M_'):
+                global_mods.add(y)
+                continue
+            n += 1
+    return n + len(global_mods)
+
+
+def score_gp_prior(gp_names, charge):
+    """Prior score for the glycan cleavages and global modifications of a glycopeptide fragment"""
+    cuts = [y for sub in gp_names for y in sub if
+            y not in ('Peptide', 'No Peptide', 'M') and not y.startswith('loss of glycan') and
+            not (y[0] in N_TERM_IONS | C_TERM_IONS and '_' in y and y.split('_')[-1].isdigit())]
+    if not cuts:
+        return 1.0
+    return min(score_fragment_prior(cuts, charge) / len(cuts), 1.0)
+
+
+def glycopeptide_frag_to_string(pep_gr, subg):
+    """IUPAC-condensed representation of a glycopeptide fragment, glycans delimited by asterisks"""
+    peptide_nodes = set(pep_gr.nodes)
+    labels = nx.get_node_attributes(subg, 'string_labels')
+    pep_part = ''.join(v for k, v in sorted(((k, v) for k, v in labels.items() if k in peptide_nodes),
+                                            key = lambda x: int(x[0].split('-')[1])))
+    glycan_strings = []
+    for prefix in sorted({x.split('-')[0] for x in subg.nodes if x not in peptide_nodes}, key = int):
+        glyc = subg.subgraph([x for x in subg.nodes if x.split('-')[0] == prefix])
+        glycan_strings.append(mono_frag_to_string(nx.relabel_nodes(glyc, {x: int(x.split('-')[1]) for x in glyc.nodes},
+                                                                   copy = True)))
+    if not pep_part:
+        return '*'.join(glycan_strings)
+    if not glycan_strings:
+        return pep_part
+    return pep_part + '*' + '*'.join(glycan_strings)
+
+
 def priority_filter(dc_names, diffs, peptide = False, charge = -1):
     """Filters Domon-Costello fragment names by number of cleavages, fragmentation prior, and difference from observed mass\n
     | Arguments:
@@ -1278,9 +1341,7 @@ def priority_filter(dc_names, diffs, peptide = False, charge = -1):
     """
     if peptide:
         sorted_frags = sorted(list(zip(dc_names, diffs)),
-                              key = lambda x: (len([y for v in x[0] for y in v if
-                                                    y not in ['Peptide', 'No Peptide', 'M'] and not y.startswith(
-                                                        'loss of glycan')]), x[1]))
+                              key = lambda x: (count_gp_cleavages(x[0]), -score_gp_prior(x[0], charge), x[1]))
     else:
         sorted_frags = sorted(list(zip(dc_names, diffs)),
                               key = lambda x: (len(x[0]), -score_fragment_prior(x[0], charge), x[1]))
@@ -1354,23 +1415,16 @@ def simplify_fragments(dc_names, peptide = False, diffs = None, intensities = No
     """
     observed_frags = []
     if peptide:
-        diff_weight = 4.0 / mass_threshold if mass_threshold > 0 else 10.0
+        diff_weight = 10.0 / mass_threshold if mass_threshold > 0 else 25.0
         for i, possible_frags in enumerate(dc_names):
-            if not possible_frags or (len(possible_frags) > 0 and len(possible_frags[0]) == 0):
+            if not possible_frags or len(possible_frags[0]) == 0:
                 observed_frags.append([])
                 continue
-            if diffs and diffs[i]:
-                paired = sorted(zip(possible_frags, diffs[i]),
-                                key = lambda x: (len([y for v in x[0] for y in v if
-                                                      y not in ['Peptide', 'No Peptide', 'M'] and not y.startswith(
-                                                          'loss of glycan')]) * (1 + diff_weight * x[1]), x[1]))
-                observed_frags.append([paired[0][0]])
-            else:
-                possible_frags = sorted(possible_frags,
-                                        key = lambda x: len([y for v in x for y in v if
-                                                             y not in ['Peptide', 'No Peptide',
-                                                                       'M'] and not y.startswith('loss of glycan')]))
-                observed_frags.append([possible_frags[0]])
+            frag_diffs = diffs[i] if diffs and diffs[i] else [0.0] * len(possible_frags)
+            paired = sorted(zip(possible_frags, frag_diffs),
+                            key = lambda x: (count_gp_cleavages(x[0]) + diff_weight * x[1] -
+                                             0.5 * prior_weight * score_gp_prior(x[0], charge), x[1]))
+            observed_frags.append([paired[0][0]])
         return observed_frags
     observed_frags = [[] for _ in dc_names]
     order = sorted(range(len(dc_names)), key = lambda j: -intensities[j]) if intensities else list(range(len(dc_names)))
@@ -1485,7 +1539,7 @@ def create_glycopeptide_graph(peptide, glycans, glycosites):
     for pref, gsite, red_node in zip(prefixes[1:], glycosites, red_nodes):
         glyco_pep.add_edge(f'0-{gsite}', f'{pref}{red_node}')
         glyco_pep[f'0-{gsite}'][f'{pref}{red_node}']['bond_label'] = 'glycosite'
-    pep_gr = copy.deepcopy(glyco_pep.subgraph([x for x in glyco_pep.nodes() if '0-' in x]))
+    pep_gr = copy.deepcopy(glyco_pep.subgraph([x for x in glyco_pep.nodes() if x.startswith('0-')]))
     return glyco_pep, pep_gr
 
 
@@ -1505,12 +1559,12 @@ def input_to_graph(input_dict):
 
 def get_glycan_cleavages(gp, subg, glycosites):
     """Return Domon-Costello labels for all glycans on a glycopeptide"""
-    subg_glycan_prefixes = set([x[0] for x in subg.nodes() if x[0] != '0'])
+    subg_glycan_prefixes = {x.split('-')[0] for x in subg.nodes() if not x.startswith('0-')}
     subg_atom_dict = nx.get_node_attributes(subg, 'atomic_mod_dict')
     all_mods = []
     for prefix, glycosite in enumerate(glycosites, 1):
         if str(prefix) in subg_glycan_prefixes:
-            glyc = [x for x in gp.nodes() if f'{prefix}-' in x]
+            glyc = [x for x in gp.nodes() if x.split('-')[0] == str(prefix)]
             subg_glyc = subg.subgraph(glyc)
             full_glyc = gp.subgraph(glyc)
             glyc_dc = subgraphs_to_domon_costello(full_glyc, [subg_glyc])
@@ -1522,37 +1576,43 @@ def get_glycan_cleavages(gp, subg, glycosites):
     return all_mods
 
 
-def peptide_to_RF_nomenclature(peptide, pep_subg, iupac = False):
-    """Return Roepstorff and Fohlman peptide fragment nomenclature"""
+def peptide_to_RF_nomenclature(peptide, pep_subg, iupac = False, allowed_ion_types = None, allow_internal = False):
+    """Return Roepstorff and Fohlman peptide fragment nomenclature, or None if the fragment is rejected"""
     RF_cleavages = []
-    all_peptide_nodes = list(peptide.nodes)
-    remaining_peptide_nodes = [x for x in pep_subg.nodes if x in all_peptide_nodes]
-    if not remaining_peptide_nodes:
+    all_peptide_nodes = sorted(peptide.nodes, key = lambda x: int(x.split('-')[1]))
+    peptide_node_set = set(all_peptide_nodes)
+    if not any(x in peptide_node_set for x in pep_subg.nodes):
         return ['No Peptide']
-    pep_atom_dict = nx.get_node_attributes(pep_subg, 'atomic_mod_dict')
-    pep_atom_dict = {k: v for k, v in pep_atom_dict.items() if '0-' in k}
+    pep_atom_dict = {k: v for k, v in nx.get_node_attributes(pep_subg, 'atomic_mod_dict').items() if
+                     k in peptide_node_set}
     global_mods = nx.get_node_attributes(pep_subg, 'global_mod')
+    n_term_cuts, c_term_cuts = 0, 0
     for node, cleavages in pep_atom_dict.items():
-        for cleavage in [x for x in cleavages.values() if isinstance(x, str) and 'peptide' in x]:
-            if cleavage[-1] in ['x', 'y', 'z']:
+        for cleavage in [x for x in cleavages.values() if isinstance(x, str) and x.startswith('peptide_')]:
+            ion_type = cleavage[-1]
+            if allowed_ion_types is not None and ion_type not in allowed_ion_types:
+                return None
+            if ion_type in C_TERM_IONS:
+                c_term_cuts += 1
                 cut_site = all_peptide_nodes[::-1].index(node) + 1
-                RF_cleavages.append(f'{cleavage[-1]}_{cut_site}')
-            elif cleavage[-1] in ['a', 'b', 'c']:
+            elif ion_type in N_TERM_IONS:
+                n_term_cuts += 1
                 cut_site = all_peptide_nodes.index(node) + 1
-                RF_cleavages.append(f'{cleavage[-1]}_{cut_site}')
             else:
-                assert 1 == 2
+                raise ValueError(f"Unrecognized peptide cleavage type: {cleavage}")
+            RF_cleavages.append(f'{ion_type}_{cut_site}')
+    if n_term_cuts and c_term_cuts and not allow_internal:
+        return None
     if global_mods:
-        global_mods = list(global_mods.values())[0][0]
-        RF_cleavages.append(f"M_{global_mods}")
+        RF_cleavages.append(f"M_{list(global_mods.values())[0][0]}")
     if not RF_cleavages:
         RF_cleavages = ['Peptide']
-    if iupac == True:
-        subg_peptide_labels = {k: v for k, v in nx.get_node_attributes(pep_subg, 'string_labels').items() if '0-' in k}
+    if iupac:
+        subg_peptide_labels = {k: v for k, v in nx.get_node_attributes(pep_subg, 'string_labels').items() if
+                               k in peptide_node_set}
         return sorted(RF_cleavages), ''.join(
-            [x[1] for x in sorted(subg_peptide_labels.items(), key = lambda x: x[0][-1])])
-    else:
-        return sorted(RF_cleavages)
+            v for _, v in sorted(subg_peptide_labels.items(), key = lambda x: int(x[0].split('-')[1])))
+    return sorted(RF_cleavages)
 
 
 def nested_lazy_product_vect(perm_lists, atom_dict_lists, global_mods, indices):
@@ -1676,7 +1736,8 @@ def _build_composition_fragments(composition, re_bonus, sample_prep = 'underivat
 def composition_to_fragments(composition, fragment_masses, mass_threshold, max_cleavages = 3,
                              charge = -1, mass_tag = None, simplify = True, disable_global_mods = False,
                              disable_X_cross_rings = None, sample_prep = 'underivatized',
-                             peptide_seq = None, glycosites = None, glycan_class = None):
+                             peptide_seq = None, glycosites = None, glycan_class = None,
+                             fragmentation_method = None):
     """Calculates all possible fragment masses from a monosaccharide composition, optionally on a peptide\n
     | Arguments:
     | :-
@@ -1707,9 +1768,14 @@ def composition_to_fragments(composition, fragment_masses, mass_threshold, max_c
     frag_dict = {}
     if is_glycopeptide:
         compositions = [composition] if isinstance(composition, dict) else list(composition)
-        if glycosites is None:
+        if glycosites is None or not len(glycosites):
             glycosites = infer_glycosites(peptide_seq, glycan_class)[:len(compositions)]
         glycosites = list(glycosites)
+        if len(glycosites) != len(compositions):
+            raise ValueError(
+                f"Could not assign {len(compositions)} glycan composition(s) to {len(glycosites)} glycosylation site(s) on {peptide_seq}; pass 'glycosites' explicitly")
+        if any(not 0 <= gs < len(peptide_seq) for gs in glycosites):
+            raise ValueError(f"Glycosite index out of range for peptide of length {len(peptide_seq)}: {glycosites}")
         n_glycans = len(compositions)
         # Glycan fragment options per glycan (re_bonus=0: reducing end bonded to peptide)
         all_glycan_frags = [_build_composition_fragments(comp, 0, sample_prep, disable_X_cross_rings) for comp in
@@ -1722,62 +1788,45 @@ def composition_to_fragments(composition, fragment_masses, mass_threshold, max_c
         full_pep = sum(pep_res) + WATER_MASS
         cum_n = list(np.cumsum(pep_res))
         cum_c = list(np.cumsum(pep_res[::-1]))
+        allowed_ion_types = PEPTIDE_ION_TYPES[fragmentation_method] if isinstance(fragmentation_method,
+                                                                                  (str, type(None))) else set(
+            fragmentation_method)
         pep_ions = [('b', lambda i: cum_n[i - 1], 'n'),
                     ('a', lambda i: cum_n[i - 1] - 27.994915, 'n'),
                     ('c', lambda i: cum_n[i - 1] + 17.026549, 'n'),
                     ('y', lambda i: cum_c[i - 1] + WATER_MASS, 'c'),
                     ('z', lambda i: cum_c[i - 1] + WATER_MASS - 17.026549 + HYDROGEN_MASS, 'c')]
-
+        pep_ions = [x for x in pep_ions if x[0] in allowed_ion_types]
 
         def add(mass, label, nc):
             frag_dict.setdefault(round(mass, 5), []).append((label, nc))
 
-
         # Full molecule
         add(full_pep + total_glycan + mode_mass, [['Peptide']] + [['M'] for _ in range(n_glycans)], 0)
-        # Intact peptide + glycan sub-fragments
+        # Per-glycan states: intact, fully cleaved off, or sub-fragmented
+        glycan_options = []
         for g_idx in range(n_glycans):
-            other = total_glycan - glycan_totals[g_idx]
-            for gm, gl, gc in all_glycan_frags[g_idx]:
-                if gc == 0:
-                    continue
-                glyc = [['M']] * n_glycans
-                glyc[g_idx] = [gl]
-                add(full_pep + gm + other + mode_mass, [['Peptide']] + glyc, gc)
-        # Peptide backbone fragments
+            opts = [(['M'], glycan_totals[g_idx], 0), ([f'loss of glycan {g_idx + 1}'], 0.0, 1)]
+            opts += [([gl], gm, gc) for gm, gl, gc in all_glycan_frags[g_idx] if gc > 0]
+            glycan_options.append(opts)
+        # Intact peptide with any combination of glycan states
+        for combo in product(*glycan_options):
+            nc = sum(c[2] for c in combo)
+            if not 0 < nc <= max_cleavages:
+                continue
+            add(full_pep + sum(c[1] for c in combo) + mode_mass, [['Peptide']] + [list(c[0]) for c in combo], nc)
+        # Peptide backbone fragments; glycans outside the fragment are lost without costing a cleavage
         for ion_name, mass_fn, terminus in pep_ions:
             for i in range(1, n_aa):
                 pmass = mass_fn(i)
                 plabel = f'{ion_name}_{i}'
-                included = [j for j, gs in enumerate(glycosites)
-                            if (gs < i if terminus == 'n' else gs >= n_aa - i)]
-                # All glycans lost
-                lost = [[f'loss of glycan {j + 1}'] for j in range(n_glycans)]
-                add(pmass + mode_mass, [[plabel]] + lost, 1 + len(included))
-                if not included:
-                    continue
-                # Included glycans fully attached
-                att = [[f'loss of glycan {j + 1}'] for j in range(n_glycans)]
-                att_mass = 0
-                for j in included:
-                    att[j] = ['M']
-                    att_mass += glycan_totals[j]
-                add(pmass + att_mass + mode_mass, [[plabel]] + att, 1)
-                # Included glycans sub-fragmented
-                if max_cleavages >= 2:
-                    for j in included:
-                        for gm, gl, gc in all_glycan_frags[j]:
-                            if gl == 'M' or gl.startswith('loss') or 1 + gc > max_cleavages:
-                                continue
-                            fl = [[f'loss of glycan {k + 1}'] for k in range(n_glycans)]
-                            o_mass = 0
-                            for k in included:
-                                if k == j:
-                                    fl[k] = [gl]
-                                else:
-                                    fl[k] = ['M']
-                                    o_mass += glycan_totals[k]
-                            add(pmass + gm + o_mass + mode_mass, [[plabel]] + fl, 1 + gc)
+                opts = [glycan_options[j] if (gs < i if terminus == 'n' else gs >= n_aa - i)
+                        else [([f'loss of glycan {j + 1}'], 0.0, 0)] for j, gs in enumerate(glycosites)]
+                for combo in product(*opts):
+                    nc = 1 + sum(c[2] for c in combo)
+                    if nc > max_cleavages:
+                        continue
+                    add(pmass + sum(c[1] for c in combo) + mode_mass, [[plabel]] + [list(c[0]) for c in combo], nc)
         # Glycan-only (no peptide): oxonium / B-type ions
         for g_idx in range(n_glycans):
             # Full glycan B-ion (single cleavage: glycan detaches from peptide)
@@ -1788,7 +1837,7 @@ def composition_to_fragments(composition, fragment_masses, mass_threshold, max_c
             add(glycan_totals[g_idx] + mode_mass, [['No Peptide']] + glyc, 1)
             # Sub-composition glycan-only fragments
             for gm, gl, gc in all_glycan_frags[g_idx]:
-                if gc == 0 or gl.startswith('loss'):
+                if gc == 0 or gl.startswith('loss') or gl[0] in ('Y', 'Z'):
                     continue
                 glyc = [[f'loss of glycan {j + 1}'] for j in range(n_glycans)]
                 glyc[g_idx] = [gl]
@@ -1863,7 +1912,8 @@ def composition_to_fragments(composition, fragment_masses, mass_threshold, max_c
 def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
                 max_cleavages = 3, simplify = True, charge = -1, mass_tag = None,
                 iupac = False, intensities = None, disable_global_mods = False, disable_X_cross_rings = None,
-                disable_A_cross_rings = None, sample_prep = 'underivatized', prior_weight = 1.0, glycan_class = None):
+                disable_A_cross_rings = None, sample_prep = 'underivatized', prior_weight = 1.0, glycan_class = None,
+                fragmentation_method = None, allow_internal_peptide_fragments = False):
     """Basic wrapper for the annotation of observed masses with correct nomenclature given a glycan\n
     | Arguments:
     | :-
@@ -1878,7 +1928,9 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
     | disable_A_cross_rings (bool): whether to strip out any A-type cross-rings; default: False
     | sample_prep (string): underivatized/permethylated
     | prior_weight (float): weighting of prior-informed scoring in simplify=True
-    | glycan_class (string): "N" or "O" if relevant (only used to assign candidate sites in glycopeptides, nowhere else)\n
+    | glycan_class (string): "N" or "O" if relevant (only used to assign candidate sites in glycopeptides, nowhere else)
+    | fragmentation_method (string): 'CID'/'HCD'/'ETD'/'ECD'/'EThcD'/'ETciD' to restrict peptide backbone ion types; default:None (all)
+    | allow_internal_peptide_fragments (bool): whether to allow peptide fragments cleaved at both termini; default:False\n
     | Returns:
     | :-
     | Returns a list of tuples containing the observed mass and all of the possible fragment names within the threshold
@@ -1910,17 +1962,21 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
                     charge = charge, mass_tag = mass_tag, simplify = simplify,
                     disable_global_mods = disable_global_mods,
                     disable_X_cross_rings = disable_X_cross_rings,
-                    sample_prep = sample_prep, peptide_seq = input_string['peptide'],
-                    glycosites = list(input_string['glycosites']) if 'glycosites' in input_string else None)
+                    sample_prep = sample_prep, fragmentation_method = fragmentation_method,
+                    peptide_seq = input_string['peptide'],
+                    glycosites = list(input_string['glycosites']) if input_string.get('glycosites') is not None and len(
+                        input_string['glycosites']) else None, glycan_class = glycan_class)
             else:
                 glycans = input_string.get('glycans', [])
                 if not glycans:
                     return {m: None for m in fragment_masses}
                 peptide = input_string['peptide']
                 gc = glycan_class if glycan_class else get_class(glycans[0])
-                sites = list(input_string['glycosites']) if 'glycosites' in input_string else infer_glycosites(peptide,
-                                                                                                               gc)[
-                    :len(glycans)]
+                sites = list(input_string['glycosites']) if input_string.get('glycosites') is not None and len(
+                    input_string['glycosites']) else infer_glycosites(peptide, gc)[:len(glycans)]
+                if len(sites) != len(glycans):
+                    raise ValueError(
+                        f"Could not assign {len(glycans)} glycan(s) to {len(sites)} glycosylation site(s) on {peptide}; pass 'glycosites' explicitly")
                 for site, glycan in sorted(zip(sites, glycans), reverse = True):
                     peptide = peptide[:site + 1] + '*' + glycan + '*' + peptide[site + 1:]
                 input_string = peptide
@@ -1959,7 +2015,8 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
                 charge = charge, mass_tag = mass_tag, simplify = simplify,
                 disable_global_mods = disable_global_mods,
                 disable_X_cross_rings = disable_X_cross_rings,
-                sample_prep = sample_prep, peptide_seq = input_dict['peptide'],
+                sample_prep = sample_prep, fragmentation_method = fragmentation_method,
+                peptide_seq = input_dict['peptide'],
                 glycosites = list(input_dict['glycosites']), glycan_class = glycan_class)
     if intensities is not None:
         fragment_masses, intensities = map(list, zip(*sorted(zip(fragment_masses, intensities))))
@@ -1980,17 +2037,23 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
     downstream_values = []
     if input_dict['peptide']:
         peptide = True
+        allowed_ion_types = PEPTIDE_ION_TYPES[fragmentation_method] if isinstance(fragmentation_method,
+                                                                                  (str, type(None))) else set(
+            fragmentation_method)
         for observed_mass in fragment_masses:
-            all_gp_names = []
+            all_gp_names, keep = [], []
             fragment_properties = match_fragment_properties(subg_frags, observed_mass, mass_threshold, charge,
                                                             sorted_frag_keys, peptide = True)
-            for frag_subg in fragment_properties[-1]:
-                rf_names = peptide_to_RF_nomenclature(pep_gr, frag_subg)
+            for idx, frag_subg in enumerate(fragment_properties[-1]):
+                rf_names = peptide_to_RF_nomenclature(pep_gr, frag_subg, allowed_ion_types = allowed_ion_types,
+                                                      allow_internal = allow_internal_peptide_fragments)
+                if rf_names is None:
+                    continue
                 dc_names = get_glycan_cleavages(nx_mono, frag_subg, input_dict['glycosites'])
-                gp_names = [rf_names] + dc_names
-                all_gp_names.append(gp_names)
-            lability = [compute_fragment_lability(nx_mono, sg) for sg in fragment_properties[-1]] if \
-                fragment_properties[-1] else []
+                all_gp_names.append(merge_gp_global_mods([rf_names] + dc_names))
+                keep.append(idx)
+            fragment_properties = [[v[i] for i in keep] for v in fragment_properties]
+            lability = [compute_fragment_lability(nx_mono, sg) for sg in fragment_properties[-1]]
             downstream_values.append((*fragment_properties, all_gp_names, lability))
     else:
         peptide = False
@@ -2019,7 +2082,9 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
                                             'Domon-Costello nomenclatures': final_hits[5],
                                             'Fragment charges': final_hits[3]}
             if iupac:
-                hit_dict[fragment_masses[i]]['Fragment IUPAC'] = [mono_frag_to_string(x) for x in final_hits[4]]
+                hit_dict[fragment_masses[i]]['Fragment IUPAC'] = [
+                    glycopeptide_frag_to_string(pep_gr, x) if peptide else mono_frag_to_string(x) for x in
+                    final_hits[4]]
         else:
             hit_dict[fragment_masses[i]] = None
     return hit_dict
