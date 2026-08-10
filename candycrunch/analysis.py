@@ -2552,9 +2552,10 @@ def fragIUPAC_to_image(frag_iupac, padding = 4):
 def place_peak_label(ax, renderer, mz, rel_int, label, color, placed, bounds, fontsize, attempts, pad = 1.5):
     """Puts a label immediately above its peak, lifting it only as far as the neighbors require; if the
     axes run out of room above, the label is flipped to hang below the apex instead"""
-    for direction, alignment in ((1, 'left'), (-1, 'right')):
+    for direction, alignment, vertical, x_offset in ((1, 'left', 'center', 0.0), (-1, 'right', 'top', 2.0)):
+        # A flipped label runs down alongside its peak, so it is pushed off the line rather than centered on it
         text = ax.annotate(label, (mz, rel_int), textcoords = 'offset points',
-                           xytext = (0 if direction > 0 else 3, direction * 3.0), ha = alignment, va = 'center',
+                           xytext = (x_offset, direction * 3.0), ha = alignment, va = vertical,
                            fontsize = fontsize, rotation = 90, rotation_mode = 'anchor', color = color)
         for _ in range(attempts):
             box = text.get_window_extent(renderer)
@@ -2670,7 +2671,7 @@ def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_thr
     peptide, glycans, glycosites = resolve_spectrum_input(input_string)
     glycan_string = glycans[0] if glycans and isinstance(glycans[0], str) else None
     ladder_ax = None
-    cartoon_room = 0.30 if draw_glycans and glycan_string else 0.02
+    cartoon_room = 0.26 if draw_glycans and glycan_string else 0.02
     if ax is None:
         if peptide:
             _, (ladder_ax, ax) = plt.subplots(2, 1, figsize = figsize or (13, 5.6),
@@ -2702,8 +2703,8 @@ def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_thr
         peaks = [p for p in peaks if id(p) in keep]
     for mz, rel_int, _, kind, _ in peaks:
         ax.vlines([mz], 0, rel_int, colors = PEAK_COLORS.get(kind, 'tab:red'), linewidth = 1.3)
-        # Each label sits directly above its peak, lifted only as far as its neighbors require, with a dotted
-        # leader whenever it had to move; anything that cannot be placed at all is dropped rather than overlaid
+    # Each label sits directly above its peak, lifted only as far as its neighbors require, with a dotted
+    # leader whenever it had to move; anything that cannot be placed at all is dropped rather than overlaid
     figure = ax.figure
     figure.canvas.draw()
     renderer = figure.canvas.get_renderer()
@@ -2723,33 +2724,37 @@ def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_thr
                                           shrinkA = 0, shrinkB = 1))
     cartoons_drawn = False
     if draw_glycans and glycan_string:
-        blended, rows = ax.get_xaxis_transform(), [1.10, 1.30]
-        informative = [p for p in peaks if p[3] in ('oxonium', 'glycan') or
-                       any(str(y).split('_')[0] in cut_type_dict for sub in p[4] if isinstance(sub, list) for y in sub)]
-        gap = (mz_values.max() - mz_values.min()) / 14
-        row_ends, drawn = [-np.inf, -np.inf], set()
-        for mz, rel_int, _, _, dc_name in sorted(informative, key = lambda x: -x[1]):
-            if len(drawn) >= max_glycan_cartoons:
-                break
+        blended = ax.get_xaxis_transform()
+        # Only glycan-only ions get a cartoon; on a peptide-bearing fragment the picture would just repeat
+        # the intact glycan. One cartoon per distinct structure, anchored on its most intense member with a
+        # leader from every peak it explains: an oxonium series shares a structure and differs only by a
+        # neutral loss, so a box per loss repeats the same picture and drags them away from their peaks
+        groups = {}
+        for mz, rel_int, _, kind, dc_name in peaks:
+            if kind not in ('oxonium', 'glycan'):
+                continue
             frag_iupac = fragment_to_fragIUPAC(glycan_string, dc_name)
-            # One cartoon per distinct structure; the oxonium series otherwise draws the same picture repeatedly
-            if frag_iupac is None or frag_iupac in drawn:
-                continue
-            free_rows = [i for i, end in enumerate(row_ends) if mz - end >= gap]
-            if not free_rows:
-                continue
+            if frag_iupac is not None:
+                groups.setdefault(frag_iupac, []).append((rel_int, mz))
+        ranked = sorted(groups.items(), key = lambda group: -max(group[1])[0])[:max_glycan_cartoons]
+        mz_per_pixel = (ax.get_xlim()[1] - ax.get_xlim()[0]) / max(axes_box.width, 1)
+        rows, row_ends = [1.08, 1.26], [-np.inf, -np.inf]
+        for frag_iupac, members in sorted(ranked, key = lambda group: max(group[1])[1]):
             image = fragIUPAC_to_image(frag_iupac)
             if image is None:
                 continue
-            row = free_rows[0]
-            ax.add_artist(AnnotationBbox(OffsetImage(np.array(image), zoom = glycan_zoom), (mz, rows[row]),
+            half_width = (image.width * glycan_zoom * figure.dpi / 72 + 8) * mz_per_pixel / 2
+            anchor = max(members)[1]
+            row = min(range(len(rows)), key = lambda i: max(anchor, row_ends[i] + half_width))
+            x = max(anchor, row_ends[row] + half_width)
+            ax.add_artist(AnnotationBbox(OffsetImage(np.array(image), zoom = glycan_zoom), (x, rows[row]),
                                          xycoords = blended, frameon = True, annotation_clip = False,
                                          bboxprops = dict(boxstyle = 'round,pad=0.15', fc = 'white',
                                                           ec = '#cccccc', lw = 0.5)))
-            ax.plot([mz, mz], [rel_int / max(rel_intensities) * 0.95, rows[row] - 0.06], transform = blended,
-                    color = '#cccccc', lw = 0.5, ls = '--', clip_on = False)
-            row_ends[row] = mz
-            drawn.add(frag_iupac)
+            for rel_int, mz in members:
+                ax.plot([mz, x], [rel_int / max(rel_intensities) * 0.95, rows[row] - 0.05], transform = blended,
+                        color = '#cccccc', lw = 0.5, ls = '--', clip_on = False)
+            row_ends[row] = x + half_width
             cartoons_drawn = True
     ax.set_xlabel('m/z')
     ax.set_ylabel('Relative Intensity (%)')
@@ -2758,7 +2763,7 @@ def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_thr
     if ladder_ax is not None:
         ladder_ax.set_title(title, fontsize = title_size)
     else:
-        ax.set_title(title, fontsize = title_size, y = 1.46 if cartoons_drawn else 1.0)
+        ax.set_title(title, fontsize = title_size, y = 1.40 if cartoons_drawn else 1.0)
     ax.set_xlim(mz_values.min() - 20, mz_values.max() + 20)
     ax.set_ylim(0, 104)
     ax.set_yticks([0, 25, 50, 75, 100])
