@@ -151,7 +151,15 @@ WATER_MASS = 18.0105546
 HYDROGEN_MASS = 1.007825
 CH2_MASS = 14.01565
 bond_type_helper = {1: ['bond', 'no_bond'], 2: ['red_bond', 'red_no_bond'], 3: ['peptide_a', 'peptide_b', 'peptide_c'],
-                    4: ['peptide_y', 'peptide_z']}
+                    4: ['peptide_y', 'peptide_z', 'peptide_w']}
+# Neutral radical lost from a z. ion by Cbeta-Cgamma homolysis, giving the w ion; residues without a
+# gamma atom (G, A, P) cannot form w ions and are absent by design
+W_SIDE_CHAIN_LOSSES = {'C': 32.979896, 'D': 44.997655, 'E': 59.013305, 'F': 77.039125, 'H': 67.029623,
+                       'I': 29.039125, 'K': 58.065674, 'L': 43.054775, 'M': 61.011196, 'N': 44.013639,
+                       'Q': 58.029289, 'R': 86.071822, 'S': 17.002740, 'T': 15.023475, 'V': 15.023475,
+                       'W': 116.049024, 'Y': 93.034040}
+W_SIDE_CHAIN_LOSSES['c'] = 90.001360  # Carbamidomethyl Cys, cleaved at Cbeta-Sgamma
+W_SIDE_CHAIN_LOSSES['j'] = W_SIDE_CHAIN_LOSSES['k'] = W_SIDE_CHAIN_LOSSES['K']
 cut_type_dict = {'bond': 'Y', 'no_bond': 'Z', 'red_bond': 'C', 'red_no_bond': 'B',
                  '13A': '13A', '14A': '14A', '15A': '15A', '24A': '24A', '04A': '04A', '35A': '35A', '03A': '03A',
                  '25A': '25A', '02A': '02A',
@@ -171,16 +179,17 @@ MODIFICATION_TOKENS = {
     'Guanidinyl': {'K': 'j'},
 }
 N_TERM_IONS = {'a', 'b', 'c'}
-C_TERM_IONS = {'x', 'y', 'z'}
+C_TERM_IONS = {'w', 'x', 'y', 'z'}
 PEPTIDE_ION_TYPES = {'CID': {'b', 'y'}, 'HCD': {'a', 'b', 'y'}, 'ETD': {'c', 'z'}, 'ECD': {'c', 'z'},
-                     'EThcD': {'b', 'c', 'y', 'z'}, 'ETciD': {'b', 'c', 'y', 'z'},
+                     'EThcD': {'b', 'c', 'w', 'y', 'z'}, 'ETciD': {'b', 'c', 'w', 'y', 'z'},
                      None: N_TERM_IONS | C_TERM_IONS}
 tester_ma_addition = {k: {'mass': {k: v}, 'atoms': {k: [1, 2, 3, 4, 5, 6]}} for k, v in AA_masses.items()}
 mono_attributes = mono_attributes | tester_ma_addition
 bond_masses = {'red_bond': WATER_MASS, 'no_bond': -WATER_MASS, 'peptide_b': -WATER_MASS,
                'peptide_c': -(WATER_MASS - 17.026549),
                'peptide_z': -(17.026549 - 1.007825),
-               'peptide_a': -(WATER_MASS + 27.994915)}  # z here is from EThcD even-electron convention
+               'peptide_w': -(17.026549 - 1.007825),  # plus a residue-specific side-chain loss
+               'peptide_a': -(WATER_MASS + 27.994915)}  # z here is the EThcD radical z. convention
 # Atom positions carrying methylatable -OH (or -COOH) groups per base monosaccharide.
 # C1 is excluded: consumed by the glycosidic bond in the residue mass convention.
 # Amide N-H (e.g., C2 of HexNAc) is included: standard permethylation does
@@ -212,8 +221,8 @@ permethylated_bond_masses = {
     'red_bond': WATER_MASS,
     'peptide_b': -WATER_MASS,
     'peptide_c': -(WATER_MASS - 17.026549),
-    'peptide_z': -(17.026549 - 1.007825),  # z here is from EThcD even-electron convention
-    'peptide_a': -(WATER_MASS + 27.994915),
+    'peptide_z': -(17.026549 - 1.007825),  # z here is the EThcD radical z. convention
+    'peptide_w': -(17.026549 - 1.007825),
 }
 # to be updated with a more empirical estimation once we have clear-cut annotation data
 fragmentation_priors = {
@@ -594,6 +603,8 @@ def generate_mod_permutations(terminals, terminal_labels, mono_mods_list, atomic
         all_atom_dict_perms, all_mono_mod_perms = [], []
         for i, atom_dict in enumerate(possible_node_atoms):
             dict_perms = create_dict_perms(atom_dict)
+            if label not in W_SIDE_CHAIN_LOSSES:
+                dict_perms = [x for x in dict_perms if 'peptide_w' not in x.values()]
             all_atom_dict_perms.extend(dict_perms)
             all_mono_mod_perms.extend(len(dict_perms) * [mono_mods[i]])
         all_terminal_perms.append(all_atom_dict_perms)
@@ -632,10 +643,12 @@ def precalculate_mod_masses(all_mono_mods, all_terminal_perms, terminal_labels, 
         all_mono_mod_masses.append(masses)
     active_bond_masses = permethylated_bond_masses if permethylated else bond_masses
     all_atom_dict_masses = []
-    for node in all_terminal_perms:
+    for node, label in zip(all_terminal_perms, terminal_labels):
         node_dict_masses = []
         for mod in node:
             present_atom_mods = [active_bond_masses[x] for x in mod.values() if x in active_bond_masses]
+            if 'peptide_w' in mod.values():
+                present_atom_mods.append(-W_SIDE_CHAIN_LOSSES[label])
             node_dict_masses.append(sum(present_atom_mods))
         all_atom_dict_masses.append(node_dict_masses)
     adduct_mods = {'+Na', '+K', '+Acetate', '+Acetonitrile'}
@@ -874,7 +887,7 @@ def generate_atomic_frags(nx_mono, global_mods, special_residues, allowed_X_clea
         if sample_prep == 'permethylated':
             max_graph_mass += sum(
                 len(methyl_oh_atoms.get(node_dict_basic[m], set())) * CH2_MASS for m in terminals)
-        min_bond_mass = min(bond_masses.values())
+        min_bond_mass = min(bond_masses.values()) - max(W_SIDE_CHAIN_LOSSES.values())
         min_terminal_mass = sum(
             min(mono_attributes[node_dict_basic[m]]['mass'].values()) + min_bond_mass for m in terminals)
         min_graph_mass = inner_mass + min_terminal_mass + min_global_mass
