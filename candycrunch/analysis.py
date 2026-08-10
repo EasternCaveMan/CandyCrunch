@@ -7,6 +7,8 @@ from itertools import combinations_with_replacement, product
 from operator import neg
 import bisect
 import matplotlib.pyplot as plt
+from matplotlib.offsetbox import AnnotationBbox, OffsetImage
+from matplotlib.transforms import Bbox
 import networkx as nx
 import networkx.algorithms.isomorphism as iso
 import numpy as np
@@ -714,7 +716,7 @@ def preliminary_calculate_mass(mono_mods_mass, atom_mods_mass, global_mods_mass,
     | :-
     | Returns a list every single mass of each modification combination for each cross ring combination
     """
-    mode_mass = -HYDROGEN_MASS if charge < 0 else HYDROGEN_MASS
+    mode_mass = -PROTON_MASS if charge < 0 else PROTON_MASS
     bonus_pep_mass = WATER_MASS if [x for x in terminals if isinstance(x, str) if '0-' in x] else 0
     mono_arr = np.array(list(mono_mods_mass))
     atom_arr = np.array(list(atom_mods_mass))
@@ -1847,7 +1849,7 @@ def composition_to_fragments(composition, fragment_masses, mass_threshold, max_c
     is_glycopeptide = peptide_seq is not None
     if mass_tag is None:
         mass_tag = 0 if is_glycopeptide else 2 * HYDROGEN_MASS
-    mode_mass = -HYDROGEN_MASS if charge < 0 else HYDROGEN_MASS
+    mode_mass = -PROTON_MASS if charge < 0 else PROTON_MASS
     modifier = np.sign(charge)
     permethylated = sample_prep == 'permethylated'
     frag_dict = {}
@@ -2062,7 +2064,8 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
                     charge = charge, mass_tag = mass_tag, simplify = simplify,
                     disable_global_mods = disable_global_mods,
                     disable_X_cross_rings = disable_X_cross_rings,
-                    sample_prep = sample_prep, fragmentation_method = fragmentation_method, max_global_mods = max_global_mods,
+                    sample_prep = sample_prep, fragmentation_method = fragmentation_method,
+                    max_global_mods = max_global_mods,
                     peptide_seq = input_string['peptide'],
                     glycosites = list(input_string['glycosites']) if input_string.get('glycosites') is not None and len(
                         input_string['glycosites']) else None, glycan_class = glycan_class)
@@ -2116,7 +2119,7 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = 0.5,
                 disable_global_mods = disable_global_mods,
                 disable_X_cross_rings = disable_X_cross_rings,
                 sample_prep = sample_prep, fragmentation_method = fragmentation_method,
-                peptide_seq = input_dict['peptide'],
+                max_global_mods = max_global_mods, peptide_seq = input_dict['peptide'],
                 glycosites = list(input_dict['glycosites']), glycan_class = glycan_class)
     if intensities is not None:
         fragment_masses, intensities = map(list, zip(*sorted(zip(fragment_masses, intensities))))
@@ -2442,93 +2445,327 @@ def domon_costello_to_mpl(dc_name):
     return "/".join(mpl_parts)
 
 
-def plot_annotated_spectrum(input_string, df_out, spectra_out, mass_threshold,
-                            max_cleavages = 3, mass_tag = None,
-                            sample_prep = 'underivatized', disable_global_mods = False,
-                            prior_weight = 1.0, ax = None, annotate_top_n = None,
-                            annotation_threshold = 0.05, figsize = (12, 5)):
+# Diagnostic oxonium ions as named in the glycoproteomics literature; masses are the singly-protonated ions
+def _oxonium_mass(residues, losses = ()):
+    return sum(mono_attributes[r]['mass'][r] for r in residues) - sum(losses) + PROTON_MASS
+
+
+OXONIUM_IONS = {
+    'HexNAc': _oxonium_mass(['HexNAc']),
+    'HexNAc-H2O': _oxonium_mass(['HexNAc'], [WATER_MASS]),
+    'HexNAc-2H2O': _oxonium_mass(['HexNAc'], [2 * WATER_MASS]),
+    'HexNAc-C2H4O2': _oxonium_mass(['HexNAc'], [60.0211]),
+    'HexNAc-CH2O-2H2O': _oxonium_mass(['HexNAc'], [30.0106, 2 * WATER_MASS]),
+    'HexNAc-C2H4O2-H2O': _oxonium_mass(['HexNAc'], [60.0211, WATER_MASS]),
+    'Hex': _oxonium_mass(['Hex']),
+    'Hex-H2O': _oxonium_mass(['Hex'], [WATER_MASS]),
+    'dHex': _oxonium_mass(['dHex']),
+    'HexHexNAc': _oxonium_mass(['Hex', 'HexNAc']),
+    'HexHexNAc-H2O': _oxonium_mass(['Hex', 'HexNAc'], [WATER_MASS]),
+    'Neu5Ac': _oxonium_mass(['Neu5Ac']),
+    'Neu5Ac-H2O': _oxonium_mass(['Neu5Ac'], [WATER_MASS]),
+    'Neu5Gc': _oxonium_mass(['Neu5Gc']),
+    'Neu5Gc-H2O': _oxonium_mass(['Neu5Gc'], [WATER_MASS]),
+}
+PEAK_COLORS = {'oxonium': '#b8860b', 'backbone_n': '#1f77b4', 'backbone_c': '#2ca02c',
+               'glycopeptide': '#d62728', 'glycan': '#d62728'}
+
+
+def identify_oxonium(mz, tolerance_ppm = 20):
+    """Returns the conventional name of a diagnostic oxonium ion at this m/z, or None"""
+    for name, theoretical in OXONIUM_IONS.items():
+        if abs(mz - theoretical) <= theoretical * tolerance_ppm / 1e6:
+            return name
+    return None
+
+
+def resolve_spectrum_input(input_string):
+    """Splits any CandyCrumbs input into its peptide, glycan and glycosite components"""
+    if isinstance(input_string, dict) and 'peptide' in input_string:
+        return (input_string['peptide'], list(input_string.get('glycans', [])),
+                list(input_string.get('glycosites', [])))
+    if isinstance(input_string, str) and '*' in input_string:
+        parsed = glycopeptide_string_to_input(input_string)
+        return parsed['peptide'], list(parsed['glycans']), list(parsed['glycosites'])
+    return '', [input_string] if isinstance(input_string, str) else [], []
+
+
+def classify_fragment(dc_name):
+    """Labels a fragment as an oxonium, a peptide backbone, a glycan or an intact-peptide glycopeptide ion"""
+    if not dc_name:
+        return None
+    if not isinstance(dc_name[0], list):
+        return 'glycan'
+    peptide_part = [str(x) for x in dc_name[0]]
+    if 'No Peptide' in peptide_part:
+        return 'oxonium'
+    backbone = [x[0] for x in peptide_part if re.fullmatch(r'[abcwxyz]_\d+', x)]
+    if backbone:
+        return 'backbone_n' if backbone[0] in N_TERM_IONS else 'backbone_c'
+    return 'glycopeptide'
+
+
+def fragment_to_fragIUPAC(glycan_string, dc_name):
+    """Reduces the glycan part of a fragment label to the IUPAC-condensed structure it describes"""
+    flat = [y for sub in dc_name for y in sub] if dc_name and isinstance(dc_name[0], list) else list(dc_name)
+    chain_lengths = {rank: len(chain) for rank, chain in
+                     rank_chains(mono_graph_to_nx(glycan_to_graph_monos(glycan_string), directed = True))}
+    cuts = []
+    for cut in flat:
+        parts = str(cut).split('_')
+        if len(parts) != 3 or parts[2] not in ranks:
+            continue
+        # A cleavage at or beyond the end of a chain is the bond to the peptide, which the glycan alone lacks
+        limit = chain_lengths.get(parts[2], 0)
+        if parts[0][-1] in 'BCYZ' and int(parts[1]) >= limit:
+            continue
+        if parts[0][-1] in 'AX' and int(parts[1]) > limit:
+            continue
+        cuts.append(cut)
+    try:
+        return domon_costello_to_fragIUPAC(glycan_string, cuts) if cuts else glycan_string
+    except Exception:
+        return None
+
+
+def fragIUPAC_to_image(frag_iupac, padding = 4):
+    """Renders a glycan fragment as a cropped SNFG cartoon, or None if the drawing stack is unavailable"""
+    try:
+        from io import BytesIO
+        from glycowork.motif.draw import GlycoDraw
+        from glycorender.render import convert_svg_to_png
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        image = Image.open(BytesIO(convert_svg_to_png(GlycoDraw(frag_iupac, suppress = True, compact = True,
+                                                                dim = 30).as_svg(), None, return_bytes = True)))
+    except Exception:
+        return None
+    box = image.convert('RGBA').getbbox()
+    if box:
+        image = image.crop((max(0, box[0] - padding), max(0, box[1] - padding),
+                            min(image.width, box[2] + padding), min(image.height, box[3] + padding)))
+    return image
+
+
+def place_peak_label(ax, renderer, mz, rel_int, label, color, placed, bounds, fontsize, attempts, pad = 1.5):
+    """Puts a label immediately above its peak, lifting it only as far as the neighbors require; if the
+    axes run out of room above, the label is flipped to hang below the apex instead"""
+    for direction, alignment in ((1, 'left'), (-1, 'right')):
+        text = ax.annotate(label, (mz, rel_int), textcoords = 'offset points',
+                           xytext = (0 if direction > 0 else 3, direction * 3.0), ha = alignment, va = 'center',
+                           fontsize = fontsize, rotation = 90, rotation_mode = 'anchor', color = color)
+        for _ in range(attempts):
+            box = text.get_window_extent(renderer)
+            if box.y1 > bounds[1] or box.y0 < bounds[0]:
+                break
+            padded = Bbox.from_extents(box.x0 - pad, box.y0 - pad, box.x1 + pad, box.y1 + pad)
+            clashes = [other for other in placed if padded.overlaps(other)]
+            if not clashes:
+                placed.append(padded)
+                return text
+            shift = (max(other.y1 for other in clashes) - box.y0 + pad if direction > 0 else
+                     min(other.y0 for other in clashes) - box.y1 - pad)
+            text.xyann = (text.xyann[0], text.xyann[1] + shift)
+        text.remove()
+    return None
+
+
+def draw_peptide_ladder(peptide, hit_dict, glycosites = (), ax = None, fontsize = 9):
+    """Draws the peptide fragment ladder: N-terminal ions tick up-left, C-terminal ions tick down-right"""
+    n_cuts, c_cuts = {}, {}
+    for hit in hit_dict.values():
+        if not hit:
+            continue
+        dc_name = hit['Domon-Costello nomenclatures'][0]
+        if not dc_name or not isinstance(dc_name[0], list):
+            continue
+        for token in dc_name[0]:
+            match = re.fullmatch(r'([abcwxyz])_(\d+)', str(token))
+            if not match:
+                continue
+            series, index = match.group(1), int(match.group(2))
+            target = n_cuts if series in N_TERM_IONS else c_cuts
+            target.setdefault(index if series in N_TERM_IONS else len(peptide) - index, set()).add(
+                f'{series}{index}')
+    for cuts, sign, align in ((n_cuts, 1, 'right'), (c_cuts, -1, 'left')):
+        for bond, tokens in cuts.items():
+            x = bond - 0.5
+            color = PEAK_COLORS['backbone_n' if sign > 0 else 'backbone_c']
+            ax.plot([x, x, x - sign * 0.35], [sign * 0.22, sign * 0.55, sign * 0.55], color = color, lw = 1.1,
+                    solid_capstyle = 'round')
+            ax.text(x - sign * 0.4, sign * 0.62, '/'.join(sorted(tokens)), ha = align,
+                    va = 'bottom' if sign > 0 else 'top', fontsize = fontsize - 3, color = color)
+    for i, aa in enumerate(peptide):
+        ax.text(i, 0, aa, ha = 'center', va = 'center', fontsize = fontsize, family = 'monospace',
+                fontweight = 'bold' if i in glycosites else 'normal',
+                color = '#b8860b' if i in glycosites else 'black')
+    for site in glycosites:
+        ax.plot([site, site], [0.25, 0.95], color = '#b8860b', lw = 0.8, ls = '--')
+    ax.text(0.0, 1.0, f'{len(set(n_cuts) | set(c_cuts))}/{len(peptide) - 1} backbone bonds',
+            transform = ax.transAxes, ha = 'left', va = 'top', fontsize = fontsize - 2, color = '#666666')
+    ax.set_xlim(-1, len(peptide))
+    ax.set_ylim(-1.25, 1.25)
+    ax.axis('off')
+    return ax
+
+
+def plot_annotated_spectrum(input_string, spectrum, intensities = None, mass_threshold = 0.5,
+                            max_cleavages = 3, mass_tag = None, sample_prep = 'underivatized',
+                            disable_global_mods = False, prior_weight = 1.0, charge = None, ax = None,
+                            annotate_top_n = None, annotation_threshold = 0.05, figsize = None,
+                            draw_glycans = True, glycan_zoom = 0.25, max_glycan_cartoons = 8,
+                            label_fontsize = 6, max_label_levels = 6, filepath = '', **kwargs):
     """Plots an MS2 spectrum annotated with CandyCrumbs fragment assignments\n
     | Arguments:
     | :-
-    | input_string (string): glycan in IUPAC-condensed format, must match a top1 prediction in df_out
-    | df_out (dataframe): prediction dataframe from wrap_inference with spectra=True
-    | spectra_out (list): list of peak_d dicts from wrap_inference with spectra=True
-    | mass_threshold (float): maximum tolerated mass difference for fragment matching
+    | input_string (string/dict): anything CandyCrumbs accepts, i.e., a glycan, a peptide*glycan* string, or an input dict
+    | spectrum (dataframe/list): either the prediction dataframe from wrap_inference, or the observed m/z values
+    | intensities (list): the peak_d list from wrap_inference when spectrum is a dataframe, else the intensities
+    | mass_threshold (float): maximum tolerated mass difference for fragment matching; default:0.5
     | max_cleavages (int): maximum concurrent fragmentations per mass; default:3
     | mass_tag (float): mass of the glycan label or reducing end modification; default:None
     | sample_prep (string): underivatized/permethylated; default:'underivatized'
     | disable_global_mods (bool): whether to disable global modifications; default:False
     | prior_weight (float): weighting of prior-informed scoring; default:1.0
-    | ax (matplotlib axis): axis to plot on, creates new figure if None; default:None
+    | charge (int): charge state of the precursor ion; taken from the dataframe when available; default:None
+    | ax (matplotlib axis): axis to plot on, creates a new figure if None; default:None
     | annotate_top_n (int): only label the N most intense annotated peaks; default:None (label all)
     | annotation_threshold (float): minimum relative intensity (0-1) to annotate a peak; default:0.05
-    | figsize (tuple): figure size if creating a new figure; default:(12, 5)\n
+    | figsize (tuple): figure size if creating a new figure; default:None (chosen for the input type)
+    | draw_glycans (bool): whether to add SNFG cartoons for glycan fragments; default:True
+    | glycan_zoom (float): scale of the SNFG cartoons; default:0.25
+    | max_glycan_cartoons (int): how many cartoons to draw, most intense first; default:8
+    | label_fontsize (int): font size of the peak labels; default:6
+    | max_label_levels (int): how many times to push a label clear of its neighbors before dropping it; default:6
+    | filepath (string): where to save the figure; default:'' (not saved)
+    | **kwargs: passed straight to CandyCrumbs, e.g., mass_threshold_ppm, fragmentation_method, max_global_mods\n
     | Returns:
     | :-
     | (1) the CandyCrumbs hit_dict for downstream use
     | (2) the matplotlib axis object
     """
-    top1_preds = [p[0][0] if p else '' for p in df_out['predictions']]
-    matches = [i for i, pred in enumerate(top1_preds) if pred == input_string]
-    if not matches:
-        raise ValueError(f"'{input_string}' not found as a top1 prediction in df_out")
-    row_idx = matches[0]
-    charge = df_out.iloc[row_idx]['charge']
-    peak_d = spectra_out[row_idx]
-    mz_values = np.array(sorted(peak_d.keys()), dtype = float)
-    intensities = np.array([peak_d[mz] for mz in mz_values], dtype = float)
-    max_int = intensities.max()
-    rel_intensities = intensities / max_int * 100 if max_int > 0 else intensities.copy()
-    hit_dict = CandyCrumbs(input_string, mz_values.tolist(), mass_threshold,
-                           max_cleavages = max_cleavages, simplify = True, charge = charge,
-                           mass_tag = mass_tag, sample_prep = sample_prep,
-                           disable_global_mods = disable_global_mods, prior_weight = prior_weight)
-    annotated_peaks, unannotated_mz, unannotated_int = [], [], []
+    if isinstance(spectrum, pd.DataFrame):
+        top1_preds = [p[0][0] if p else '' for p in spectrum['predictions']]
+        matches = [i for i, pred in enumerate(top1_preds) if pred == input_string]
+        if not matches:
+            raise ValueError(f"'{input_string}' not found as a top1 prediction in the prediction dataframe")
+        peak_d = intensities[matches[0]]
+        charge = spectrum.iloc[matches[0]]['charge'] if charge is None else charge
+        mz_values = np.array(sorted(peak_d.keys()), dtype = float)
+        peak_intensities = np.array([peak_d[mz] for mz in mz_values], dtype = float)
+    else:
+        if intensities is None:
+            raise ValueError("intensities must be given alongside a list of m/z values")
+        mz_values, peak_intensities = np.asarray(spectrum, dtype = float), np.asarray(intensities, dtype = float)
+        order = np.argsort(mz_values)
+        mz_values, peak_intensities = mz_values[order], peak_intensities[order]
+        if charge is None:
+            raise ValueError("charge must be given when passing raw m/z values")
+    rel_intensities = peak_intensities / peak_intensities.max() * 100 if peak_intensities.max() > 0 else peak_intensities
+    hit_dict = CandyCrumbs(input_string, mz_values.tolist(), mass_threshold, max_cleavages = max_cleavages,
+                           simplify = True, charge = charge, mass_tag = mass_tag, sample_prep = sample_prep,
+                           disable_global_mods = disable_global_mods, prior_weight = prior_weight, **kwargs)
+    peptide, glycans, glycosites = resolve_spectrum_input(input_string)
+    glycan_string = glycans[0] if glycans and isinstance(glycans[0], str) else None
+    ladder_ax = None
+    cartoon_room = 0.30 if draw_glycans and glycan_string else 0.02
+    if ax is None:
+        if peptide:
+            _, (ladder_ax, ax) = plt.subplots(2, 1, figsize = figsize or (13, 5.6),
+                                              gridspec_kw = {'height_ratios': [1, 3.4],
+                                                             'hspace': 0.15 + cartoon_room})
+        else:
+            _, ax = plt.subplots(figsize = figsize or (12, 4.6))
+            ax.figure.subplots_adjust(top = 0.96 - cartoon_room)
+    elif peptide:
+        ladder_ax = ax.inset_axes([0.28, 0.58, 0.70, 0.30])
+    ax.vlines(mz_values, 0, rel_intensities, colors = 'grey', linewidth = 0.8, alpha = 0.4)
+    peaks = []
     for mz, rel_int in zip(mz_values, rel_intensities):
         hit = hit_dict.get(mz)
-        if hit is not None:
-            dc_names = hit['Domon-Costello nomenclatures']
-            label = domon_costello_to_mpl(dc_names[0])
-            z = hit['Fragment charges'][0]
-            if abs(z) > 1:
-                label += f" [{'+' if z > 0 else ''}{z}]"
-            annotated_peaks.append((mz, rel_int, label))
-        else:
-            unannotated_mz.append(mz)
-            unannotated_int.append(rel_int)
+        if not hit:
+            continue
+        dc_name = hit['Domon-Costello nomenclatures'][0]
+        kind = classify_fragment(dc_name)
+        oxonium = identify_oxonium(mz) if kind in ('oxonium', 'glycan') else None
+        flat = [y for sub in dc_name for y in sub] if dc_name and isinstance(dc_name[0], list) else list(dc_name)
+        shown = [x for x in flat if x != 'No Peptide' and not str(x).startswith('loss of')]
+        label = oxonium if oxonium else domon_costello_to_mpl(shown or ['M'])
+        z = hit['Fragment charges'][0]
+        if abs(z) > 1:
+            label += f" [{'+' if z > 0 else ''}{z}]"
+        peaks.append((mz, rel_int, label, kind, dc_name))
     if annotate_top_n is not None:
-        annotated_peaks.sort(key = lambda x: x[1], reverse = True)
-        label_peaks = annotated_peaks[:annotate_top_n]
-        demoted = annotated_peaks[annotate_top_n:]
-        unannotated_mz.extend([p[0] for p in demoted])
-        unannotated_int.extend([p[1] for p in demoted])
-        annotated_peaks = label_peaks
-    ann_mz = [p[0] for p in annotated_peaks]
-    ann_int = [p[1] for p in annotated_peaks]
-    ann_labels = [p[2] for p in annotated_peaks]
-    if ax is None:
-        fig, ax = plt.subplots(figsize = figsize)
-    ax.vlines(unannotated_mz, 0, unannotated_int, colors = 'grey', linewidth = 0.8, alpha = 0.4)
-    ax.vlines(ann_mz, 0, ann_int, colors = 'tab:red', linewidth = 1.2)
-    sorted_ann = sorted(zip(ann_mz, ann_int, ann_labels), key = lambda x: x[0])
-    min_mz_gap = (mz_values.max() - mz_values.min()) * 0.025
-    offsets = [0] * len(sorted_ann)
-    for i in range(1, len(sorted_ann)):
-        if sorted_ann[i][0] - sorted_ann[i - 1][0] < min_mz_gap:
-            offsets[i] = (offsets[i - 1] + 1) % 5
-        else:
-            offsets[i] = 0
-    y_offset_map = {0: 4, 1: 14, 2: 24, 3: 34, 4: 44}
-    for (mz, rel_int, label), offset in zip(sorted_ann, offsets):
-        if rel_int >= annotation_threshold * 100:
-            ax.annotate(label, (mz, rel_int), textcoords = 'offset points',
-                        xytext = (0, y_offset_map[offset]), ha = 'center', fontsize = 6,
-                        rotation = 90, rotation_mode = 'anchor')
+        keep = {id(p) for p in sorted(peaks, key = lambda x: -x[1])[:annotate_top_n]}
+        peaks = [p for p in peaks if id(p) in keep]
+    for mz, rel_int, _, kind, _ in peaks:
+        ax.vlines([mz], 0, rel_int, colors = PEAK_COLORS.get(kind, 'tab:red'), linewidth = 1.3)
+        # Each label sits directly above its peak, lifted only as far as its neighbors require, with a dotted
+        # leader whenever it had to move; anything that cannot be placed at all is dropped rather than overlaid
+    figure = ax.figure
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    axes_box = ax.get_window_extent(renderer)
+    placed = []
+    for mz, rel_int, label, kind, _ in sorted(peaks, key = lambda x: -x[1]):
+        if rel_int < annotation_threshold * 100:
+            continue
+        color = PEAK_COLORS.get(kind, 'tab:red')
+        text = place_peak_label(ax, renderer, mz, rel_int, label, color, placed,
+                                (axes_box.y0, axes_box.y1), label_fontsize, max_label_levels)
+        if text is not None and abs(text.xyann[1]) > 8:
+            ax.annotate('', xy = (mz, rel_int),
+                        xytext = (text.xyann[0], text.xyann[1] - np.sign(text.xyann[1])),
+                        textcoords = 'offset points',
+                        arrowprops = dict(arrowstyle = '-', lw = 0.4, ls = ':', color = color,
+                                          shrinkA = 0, shrinkB = 1))
+    cartoons_drawn = False
+    if draw_glycans and glycan_string:
+        blended, rows = ax.get_xaxis_transform(), [1.10, 1.30]
+        informative = [p for p in peaks if p[3] in ('oxonium', 'glycan') or
+                       any(str(y).split('_')[0] in cut_type_dict for sub in p[4] if isinstance(sub, list) for y in sub)]
+        gap = (mz_values.max() - mz_values.min()) / 14
+        row_ends, drawn = [-np.inf, -np.inf], set()
+        for mz, rel_int, _, _, dc_name in sorted(informative, key = lambda x: -x[1]):
+            if len(drawn) >= max_glycan_cartoons:
+                break
+            frag_iupac = fragment_to_fragIUPAC(glycan_string, dc_name)
+            # One cartoon per distinct structure; the oxonium series otherwise draws the same picture repeatedly
+            if frag_iupac is None or frag_iupac in drawn:
+                continue
+            free_rows = [i for i, end in enumerate(row_ends) if mz - end >= gap]
+            if not free_rows:
+                continue
+            image = fragIUPAC_to_image(frag_iupac)
+            if image is None:
+                continue
+            row = free_rows[0]
+            ax.add_artist(AnnotationBbox(OffsetImage(np.array(image), zoom = glycan_zoom), (mz, rows[row]),
+                                         xycoords = blended, frameon = True, annotation_clip = False,
+                                         bboxprops = dict(boxstyle = 'round,pad=0.15', fc = 'white',
+                                                          ec = '#cccccc', lw = 0.5)))
+            ax.plot([mz, mz], [rel_int / max(rel_intensities) * 0.95, rows[row] - 0.06], transform = blended,
+                    color = '#cccccc', lw = 0.5, ls = '--', clip_on = False)
+            row_ends[row] = mz
+            drawn.add(frag_iupac)
+            cartoons_drawn = True
     ax.set_xlabel('m/z')
     ax.set_ylabel('Relative Intensity (%)')
-    ax.set_title(f'Annotated MS² spectrum: {input_string}')
+    title = f'Annotated MS\u00b2 spectrum: {peptide + "*" + str(glycan_string) if peptide else input_string}'
+    title_size = 9 if len(title) > 90 else 'large'
+    if ladder_ax is not None:
+        ladder_ax.set_title(title, fontsize = title_size)
+    else:
+        ax.set_title(title, fontsize = title_size, y = 1.46 if cartoons_drawn else 1.0)
     ax.set_xlim(mz_values.min() - 20, mz_values.max() + 20)
-    ax.set_ylim(0, max(rel_intensities) * 1.3)
+    ax.set_ylim(0, 104)
+    ax.set_yticks([0, 25, 50, 75, 100])
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
+    if ladder_ax is not None:
+        draw_peptide_ladder(peptide, hit_dict, glycosites, ax = ladder_ax)
+    if filepath:
+        plt.savefig(filepath, dpi = 300, bbox_inches = 'tight')
     return hit_dict, ax
