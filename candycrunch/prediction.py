@@ -188,8 +188,8 @@ def get_adduct_list(mode):
     return NEGATIVE_ADDUCTS if mode == 'negative' else POSITIVE_ADDUCTS
 
 
-def process_mzML_stack(filepath, num_peaks = 1000,
-                       ms_level = 2, intensity = False, extract_ms1 = False):
+def process_mzML_stack(filepath, num_peaks=1000,
+                       ms_level=2, intensity=False, extract_ms1=False):
     """function extracting all MS/MS spectra from .mzML file\n
    | Arguments:
    | :-
@@ -218,7 +218,7 @@ def process_mzML_stack(filepath, num_peaks = 1000,
                 temp = spectrum.highest_peaks(2)
             except:
                 continue
-            if detected_mode is None or detected_trap is None:
+            if detected_mode is None:
                 ns_uri = '{http://psi.hupo.org/ms/mzml}'
                 for cv in spectrum.element.iter(f'{ns_uri}cvParam'):
                     acc = cv.get('accession', '')
@@ -232,9 +232,6 @@ def process_mzML_stack(filepath, num_peaks = 1000,
                             detected_trap = 'linear'
                         elif filt.startswith('FTMS'):
                             detected_trap = 'orbitrap'
-                    elif acc in ('MS:1000484', 'MS:1000079'):
-                        # orbitrap / FT-ICR analyzer terms; vendor-neutral fallback when no Thermo filter string is present
-                        detected_trap = 'orbitrap'
             mz_i_dict = {}
             num_actual_peaks = min(num_peaks, len(spectrum.peaks("raw")))
             for mz, i in spectrum.highest_peaks(num_actual_peaks):
@@ -257,7 +254,7 @@ def process_mzML_stack(filepath, num_peaks = 1000,
                     intensities.append(inty)
     # Sort the highest_i_dict by values
     for key in highest_i_dict.keys():
-        highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key = lambda x: x[1], reverse = True))
+        highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key=lambda x: x[1], reverse=True))
     df_out = pd.DataFrame({
         'm/z': mzs,
         'peak_d': list(highest_i_dict.values()),
@@ -311,7 +308,7 @@ def process_mzXML_stack(filepath, num_peaks=1000, ms_level=2, intensity=False):
                         intensities.append(inty)
     # Sort the highest_i_dict by values
     for key in highest_i_dict.keys():
-        highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key = lambda x: x[1], reverse = True))
+        highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key=lambda x: x[1], reverse=True))
     df_out = pd.DataFrame({
         'm/z': mzs,
         'peak_d': list(highest_i_dict.values()),
@@ -323,7 +320,7 @@ def process_mzXML_stack(filepath, num_peaks=1000, ms_level=2, intensity=False):
     return df_out
 
 
-def average_dicts(dicts, mode = 'mean', round_dp = False):
+def average_dicts(dicts, mode='mean', round_dp=False):
     """averages a list of dictionaries containing spectra\n
    | Arguments:
    | :-
@@ -358,9 +355,9 @@ def bin_intensities(peak_d, frames):
     num_frames = len(frames)
     binned_intensities = np.zeros(num_frames)
     mz_diff = np.zeros(num_frames)
-    mzs = np.array(list(peak_d.keys()), dtype = 'float32')
+    mzs = np.array(list(peak_d.keys()), dtype='float32')
     intensities = np.array(list(peak_d.values()))
-    bin_indices = np.digitize(mzs, frames, right = True)
+    bin_indices = np.digitize(mzs, frames, right=True)
     mz_remainder = mzs - frames[bin_indices - 1]
     max_intensities = npi.group_by(bin_indices - 1).max(intensities)
     mz_remainder = mz_remainder * np.isin(intensities, max_intensities)
@@ -412,13 +409,13 @@ def extract_xic_areas(ms1_rts, ms1_scans, target_mzs, rt_centers, rt_window= 2.0
     | :-
     | Returns a list of integrated XIC areas, one per target m/z
     """
-    target_mzs = np.asarray(target_mzs, dtype = np.float64)
-    rt_centers = np.asarray(rt_centers, dtype = np.float64)
+    target_mzs = np.asarray(target_mzs, dtype=np.float64)
+    rt_centers = np.asarray(rt_centers, dtype=np.float64)
     mz_lo = target_mzs - mz_tolerance
     mz_hi = target_mzs + mz_tolerance
     # Binary search for RT window boundaries instead of boolean masking all scans per target
     scan_starts = np.searchsorted(ms1_rts, rt_centers - rt_window)
-    scan_ends = np.searchsorted(ms1_rts, rt_centers + rt_window, side = 'right')
+    scan_ends = np.searchsorted(ms1_rts, rt_centers + rt_window, side='right')
     areas = np.zeros(len(target_mzs))
     for t in range(len(target_mzs)):
         s0, s1 = scan_starts[t], scan_ends[t]
@@ -430,7 +427,7 @@ def extract_xic_areas(ms1_rts, ms1_scans, target_mzs, rt_centers, rt_window= 2.0
         for j, si in enumerate(range(s0, s1)):
             mzs, scan_ints = ms1_scans[si]
             lo = np.searchsorted(mzs, lo_mz)
-            hi = np.searchsorted(mzs, hi_mz, side = 'right')
+            hi = np.searchsorted(mzs, hi_mz, side='right')
             ints_arr[j] = np.sum(scan_ints[lo:hi]) if hi > lo else 0.0
         areas[t] = _trapezoid(ints_arr, rts)
     return areas.tolist()
