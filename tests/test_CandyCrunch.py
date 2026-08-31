@@ -16,16 +16,16 @@ import time
 BASE_DIR = pathlib.Path(__file__).parent.parent  # Go up one level from the test file
 TEST_DATA_DIR = BASE_DIR / "tests" / "data"
 TEST_DICTS = [
-    # {'name':'milk','args': {'glycan_class':'free'}, 'mass_threshold':0.5, 'RT_threshold':1},
-    # {'name':'GPST000350','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'O.' in x]},
-    # {'name':'GPST000350','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'N' in x]},
-    # {'name':'GPST000017','args': {'glycan_class':'O'}, 'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000017/") if 'PGMb' not in x if 'JC' in x]},
-    # {'name':'GPST000029','args': {'glycan_class':'O'}},
-    # {'name':'PMC8950484_CHO','args': {'glycan_class':'O'}},
-    # {'name':'GPST000307','args': {'glycan_class':'O'}},
-    # {'name':'GPST000487','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000487/")]},
+    {'name':'milk','args': {'glycan_class':'free'}, 'mass_threshold':0.5, 'RT_threshold':1},
+    {'name':'GPST000350','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'O.' in x]},
+    {'name':'GPST000350','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'N' in x]},
+    {'name':'GPST000017','args': {'glycan_class':'O'}, 'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000017/") if 'PGMb' not in x if 'JC' in x]},
+    {'name':'GPST000029','args': {'glycan_class':'O'}},
+    {'name':'PMC8950484_CHO','args': {'glycan_class':'O'}},
+    {'name':'GPST000307','args': {'glycan_class':'O'}},
+    {'name':'GPST000487','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000487/")]},
    # {'name':'GPST000134','args': {'glycan_class':'N', 'mode':'positive'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/") if 'glycans_1' in x][:1]}
-    {'name':'TissueSection4874','args': {'glycan_class':'O'}},
+    #{'name':'TissueSection4874','args': {'glycan_class':'O'}},
 ]
 AVG_THRESHOLD = 0.05
 MASS_TOLERANCE = 0.5

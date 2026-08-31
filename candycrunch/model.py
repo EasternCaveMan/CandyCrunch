@@ -196,10 +196,10 @@ class ResUnit(nn.Module):
         x = nn.functional.leaky_relu(self.ln3(x))
         x = self.conv_out(x)
         if self.se:
-            s = x.mean(dim=2, keepdim=True)
-            s = nn.functional.leaky_relu(self.se_fc1(s))
-            s = torch.sigmoid(self.se_fc2(s))
-            x = x * s
+            s = x.mean(dim=2, keepdim=True) # (B, 64, L) -> (B, 64, 1)
+            s = nn.functional.leaky_relu(self.se_fc1(s)) # (B, 64, 1) -> (B, 8, 1)
+            s = torch.sigmoid(self.se_fc2(s)) # (B, 8, 1) -> (B, 64, 1)
+            x = x * s # (B, 64, L) -> (B, 64, L)
         # 8. Residual connection
         out = x + inp
         return out

@@ -44,7 +44,7 @@ MODEL_CLASSES = {
 MODEL_DIR = "/Users/xatava/CandyCrunch/training/models"
 
 DEFAULT_MODEL_PATHS = {
-    "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_GShS_org.pt"),
+    "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_GShS_DSS4.0.pt"),
     "Transformer": os.path.join(MODEL_DIR, "CandyCrunch_Transformer_DENSE_GShS_H4L2FFD512MP512_PE(fourier)_N(rms)_ACT(leaky_relu)_RU(False)_org.pt"),
 }
 
