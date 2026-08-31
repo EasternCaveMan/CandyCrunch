@@ -43,3 +43,4 @@ htmlcov/
 
 # Test files
 tests/data/*/*.mzML
+/training/full_dataset_20260717.pkl
