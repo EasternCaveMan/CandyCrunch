@@ -7,7 +7,6 @@ import wandb
 import logging
 import warnings
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
 import os
 
 from sklearn.metrics import f1_score, matthews_corrcoef

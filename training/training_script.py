@@ -3,7 +3,6 @@ import pandas as pd
 from candycrunch.model import (SimpleDataset, TransDataset, CandyCrunch_CNN, transform_mz, transform_rt,
                                CandyCrunch_Transformer)
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
-from glycowork.motif.processing import get_lib
 from glycowork.motif.tokenization import get_stem_lib, glycan_to_composition
 from training_utils import *
 from sklearn.metrics import pairwise_distances
