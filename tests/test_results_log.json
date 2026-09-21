@@ -1,50 +1,51 @@
 {
     "milk": {
         "scores": {
-            "(True, True, 'xlsx')": 0.8636363583275941
+            "('CNN', True, True, 'xlsx')": 0.8114754046123355,
+            "('Transformer', True, True, 'xlsx')": 0.7173292970815593
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     },
     "GPST000350": {
         "scores": {
-            "(True, True, 'mzML')": 0.6539944535829314,
-            "(True, True, 'xlsx')": 0.6539944535829314
+            "('CNN', True, True, 'xlsx')": 0.666354945022696,
+            "('Transformer', True, True, 'xlsx')": 0.6271146502422686
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     },
     "GPST000017": {
         "scores": {
-            "(True, True, 'mzML')": 0.6512521812741686,
-            "(True, True, 'xlsx')": 0.6392567599769529
+            "('CNN', True, True, 'xlsx')": 0.6418114380306398,
+            "('Transformer', True, True, 'xlsx')": 0.6204609316632637
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     },
     "GPST000029": {
         "scores": {
-            "(True, True, 'mzML')": 0.7043458779452084,
-            "(True, True, 'xlsx')": 0.7045358029266595
+            "('CNN', True, True, 'xlsx')": 0.6760336926671627,
+            "('Transformer', True, True, 'xlsx')": 0.6912321754353176
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     },
     "PMC8950484_CHO": {
         "scores": {
-            "(True, True, 'mzML')": 0.8239464086989747,
-            "(True, True, 'xlsx')": 0.865666197519405
+            "('CNN', True, True, 'xlsx')": 0.8500861534262923,
+            "('Transformer', True, True, 'xlsx')": 0.835817168861628
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     },
     "GPST000307": {
         "scores": {
-            "(True, True, 'mzML')": 0.8561010793275879,
-            "(True, True, 'xlsx')": 0.8607740299899077
+            "('CNN', True, True, 'xlsx')": 0.7656431942505303,
+            "('Transformer', True, True, 'xlsx')": 0.7344267530333345
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     },
     "GPST000487": {
         "scores": {
-            "(True, True, 'mzML')": 0.5887091033430432,
-            "(True, True, 'xlsx')": 0.5960535607181848
+            "('CNN', True, True, 'xlsx')": 0.3953238361914877,
+            "('Transformer', True, True, 'xlsx')": 0.2795502334413497
         },
-        "timestamp": "2026-07-27 15:45:09"
+        "timestamp": "2026-09-14 22:52:38"
     }
 }
