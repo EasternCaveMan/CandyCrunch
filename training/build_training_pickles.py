@@ -3,8 +3,6 @@ Helper script to convert a condensed spectra table (e.g. full_dataset.xlsx) and
 its metadata into CandyCrunch-ready training pickles.  Adjust the paths in the
 configuration block before running.
 """
-
-import ast
 import pickle
 from pathlib import Path
 import torch
@@ -16,26 +14,18 @@ import numpy_indexed as npi
 import numpy as np
 import sys
 import numpy.core.numeric
-# Create the alias that the pickle expects
 np._core = np.core
 np._core.numeric = np.core.numeric
-# Register the module so pickle can find it
 sys.modules['numpy._core.numeric'] = np.core.numeric
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.model_selection import GroupShuffleSplit
-from datasail.sail import datasail
-from glycowork.motif.tokenization import get_stem_lib, glycan_to_composition
+from glycowork.motif.tokenization import glycan_to_composition, get_stem_lib
+from glycowork.motif.processing import canonicalize_composition
 import hashlib
 import ast
 import gc
 import argparse
-from downsample_representative_spectra import downsample_representative_spectra
-from downsample_representative_spectra_V2 import downsample_representative_spectra_V2
 from downsample_representative_spectra_V3 import downsample_representative_spectra_V3
-# from candycrunch.prediction import bin_intensities
-full_dataset_path = Path("full_dataset_20260717.pkl")
 metadata_path = Path("file_checklist_template.csv")
 test_size = 0.20
 random_state = 42
@@ -58,6 +48,16 @@ FEATURE_COLUMNS = [
     "trap",
 ]
 
+
+def iupac_to_composition_string(glycan: str) -> str:
+    comp_dict = glycan_to_composition(glycan)
+    if not comp_dict:
+        raise ValueError(f"Could not derive a valid composition from: {glycan}")
+
+    # Turn {'Hex': 5, 'HexNAc': 4, 'dHex': 1, 'Neu5Ac': 2}
+    # into a format canonicalize_composition understands
+    expanded = ''.join(f'{k}{v}' for k, v in comp_dict.items())
+    return canonicalize_composition(expanded, as_string=True)
 
 def bin_intensities(peak_d, frames):
     """sums up intensities for each bin across a spectrum\n
@@ -386,6 +386,8 @@ def split_one_glycan_group_with_datasail(
     output_dir=None,
     batch_size=3482,
 ):
+    from datasail.sail import datasail
+
     group_df = group_df.reset_index(drop=False).rename(columns={"index": "_combined_index"})
 
     if len(group_df) <= 2:
@@ -535,6 +537,8 @@ def split_one_glycan_group_with_datasail_max_peaks(
     max_mz=3000.0,
     intensity_weight=1.0,
 ):
+    from datasail.sail import datasail
+
     group_df = group_df.reset_index(drop=False).rename(columns={"index": "_combined_index"})
 
     if len(group_df) <= 2:
@@ -600,6 +604,8 @@ def split_one_glycan_group_with_datasail_max_peaks(
 
 def main(args):
     print("Loading condensed spectra")
+    full_dataset_path = Path(f"{args.dataset_name}_dataset_20260908.pkl")
+    date = full_dataset_path.stem.rsplit("_", maxsplit=1)[-1]
     full_df = pd.read_pickle(full_dataset_path)
     counts = []
     for x in full_df["peak_d"]:
@@ -636,19 +642,20 @@ def main(args):
     combined = combined.dropna(subset=["filename"])
     combined = filter_data_exceptions_v1(combined)
     combined.reset_index(drop=True, inplace=True)
-    glycans = sorted(set(combined["glycan"]))
+    # glycans = sorted(set(combined["glycan"]))
+    combined["glycan_comp"] = combined["glycan"].apply(iupac_to_composition_string)
+    combined.sort_values(by="glycan", inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+    glycans = combined[["glycan", "glycan_comp"]].drop_duplicates().reset_index(drop=True)
     glycan_dict = dict(zip(glycans, range(len(glycans))))
-
     combined["glycan_ids"] = "GID" + combined["glycan"].map(glycan_dict).astype(str)
-    # combined.to_csv("combined.csv", index = False)
-    with open("./glycans.pkl", "wb") as fh:
-        pickle.dump(glycans, fh)
+    print(f"Total unique glycan composition: {len(glycans["glycan_comp"].unique())}")
 
-    if args.data_processing == "DS":
+    if args.downsampling:
         policy_tag = {"sqrt": "S", "log2": "L", "fraction": "F"}.get(args.keep_policy)
         #output_dir = Path(f"prepared_datasets_DS{args.nclusters}{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}")
         output_dir = Path(
-            f"prepared_datasets_DS{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}")
+            f"prepared_datasets_DS{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}_{date}")
         output_dir.mkdir(parents = True, exist_ok = True)
 
         # combined = downsample_representative_spectra(
@@ -702,7 +709,7 @@ def main(args):
         )
         combined.reset_index(drop = True, inplace = True)
     else:
-        output_dir = Path(f"prepared_datasets_{args.data_processing}")
+        output_dir = Path(f"prepared_datasets_{args.dataset_name}{date}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
 ########################################################################################################################
@@ -729,104 +736,106 @@ def main(args):
         pickle.dump(y_train_GShS, fh)
     with open(output_dir / "y_test_GShS.pkl", "wb") as fh:
         pickle.dump(y_test_GShS, fh)
+    with open(output_dir/"glycans.pkl", "wb") as fh:
+        pickle.dump(glycans, fh)
 
 ########################################################################################################################
     # Random Group-similarity-split
 ########################################################################################################################
 
-    # print("Random Group-similarity-split with DataSAIL")
-    # train_parts_CNN = []
-    # test_parts_CNN = []
-    # train_parts_TRN = []
-    # test_parts_TRN = []
-    # for old_file in output_dir.glob("datasail_sim_glycan_*.tsv"):
-    #     old_file.unlink()
-    #
-    # for glycan_name, group_df in combined.groupby("glycan", sort=False):
-    #     print(f"Splitting glycan {glycan_name}: {len(group_df)} rows")
-    #
-    #     train_part_CNN, test_part_CNN = split_one_glycan_group_with_datasail(
-    #         group_df,
-    #         glycan_name=glycan_name,
-    #         test_size=test_size,
-    #         random_state=random_state,
-    #         output_dir=output_dir,
-    #         batch_size=3482,
-    #     )
-    #
-    #     train_part_TRN, test_part_TRN = split_one_glycan_group_with_datasail_max_peaks(
-    #         group_df,
-    #         glycan_name = glycan_name,
-    #         test_size = test_size,
-    #         random_state = random_state,
-    #         output_dir = output_dir,
-    #     )
-    #
-    #     train_parts_CNN.append(train_part_CNN)
-    #     test_parts_CNN.append(test_part_CNN)
-    #     train_parts_TRN.append(train_part_TRN)
-    #     test_parts_TRN.append(test_part_TRN)
-    #
-    #
-    # train_df_CGSiS = pd.concat(train_parts_CNN, ignore_index=True)
-    # test_df_CGSiS = pd.concat(test_parts_CNN, ignore_index=True)
-    #
-    # train_df_TGSiS = pd.concat(train_parts_TRN, ignore_index=True)
-    # test_df_TGSiS = pd.concat(test_parts_TRN, ignore_index=True)
-    #
-    # drop_temp_cols = ["_combined_index", "_datasail_id", "split"]
-    # train_df_CGSiS = train_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_CGSiS.columns])
-    # test_df_CGSiS = test_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_CGSiS.columns])
-    #
-    # train_df_TGSiS = train_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_TGSiS.columns])
-    # test_df_TGSiS = test_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_TGSiS.columns])
-    #
-    # print(
-    #     "Final DataSAIL glycan-wise split for CNN:",
-    #     f"train rows={len(train_df_CGSiS)},",
-    #     f"test rows={len(test_df_CGSiS)},",
-    #     f"test fraction={len(test_df_CGSiS) / (len(train_df_CGSiS) + len(test_df_CGSiS)):.3f}",
-    # )
-    #
-    # print(
-    #     "Final DataSAIL glycan-wise split for Transformer:",
-    #     f"train rows={len(train_df_TGSiS)},",
-    #     f"test rows={len(test_df_TGSiS)},",
-    #     f"test fraction={len(test_df_TGSiS) / (len(train_df_TGSiS) + len(test_df_TGSiS)):.3f}",
-    # )
-    #
-    # train_df_CGSiS = downcast_numeric(train_df_CGSiS)
-    # test_df_CGSiS = downcast_numeric(test_df_CGSiS)
-    # X_train_CGSiS = tupleify(train_df_CGSiS, FEATURE_COLUMNS)
-    # X_test_CGSiS = tupleify(test_df_CGSiS, FEATURE_COLUMNS)
-    # y_train_CGSiS = train_df_CGSiS["glycan"].tolist()
-    # y_test_CGSiS = test_df_CGSiS["glycan"].tolist()
-    #
-    # train_df_TGSiS = downcast_numeric(train_df_TGSiS)
-    # test_df_TGSiS = downcast_numeric(test_df_TGSiS)
-    # X_train_TGSiS = tupleify(train_df_TGSiS, FEATURE_COLUMNS)
-    # X_test_TGSiS = tupleify(test_df_TGSiS, FEATURE_COLUMNS)
-    # y_train_TGSiS = train_df_TGSiS["glycan"].tolist()
-    # y_test_TGSiS = test_df_TGSiS["glycan"].tolist()
-    #
-    # with open(output_dir / "X_train_CGSiS.pkl", "wb") as fh:
-    #     pickle.dump(X_train_CGSiS, fh)
-    # with open(output_dir / "X_test_CGSiS.pkl", "wb") as fh:
-    #     pickle.dump(X_test_CGSiS, fh)
-    # with open(output_dir / "y_train_CGSiS.pkl", "wb") as fh:
-    #     pickle.dump(y_train_CGSiS, fh)
-    # with open(output_dir / "y_test_CGSiS.pkl", "wb") as fh:
-    #     pickle.dump(y_test_CGSiS, fh)
-    #
-    #
-    # with open(output_dir / "X_train_TGSiS.pkl", "wb") as fh:
-    #     pickle.dump(X_train_TGSiS, fh)
-    # with open(output_dir / "X_test_TGSiS.pkl", "wb") as fh:
-    #     pickle.dump(X_test_TGSiS, fh)
-    # with open(output_dir / "y_train_TGSiS.pkl", "wb") as fh:
-    #     pickle.dump(y_train_TGSiS, fh)
-    # with open(output_dir / "y_test_TGSiS.pkl", "wb") as fh:
-    #     pickle.dump(y_test_TGSiS, fh)
+    print("Random Group-similarity-split with DataSAIL")
+    train_parts_CNN = []
+    test_parts_CNN = []
+    train_parts_TRN = []
+    test_parts_TRN = []
+    for old_file in output_dir.glob("datasail_sim_glycan_*.tsv"):
+        old_file.unlink()
+
+    for glycan_name, group_df in combined.groupby("glycan", sort=False):
+        print(f"Splitting glycan {glycan_name}: {len(group_df)} rows")
+
+        train_part_CNN, test_part_CNN = split_one_glycan_group_with_datasail(
+            group_df,
+            glycan_name=glycan_name,
+            test_size=test_size,
+            random_state=random_state,
+            output_dir=output_dir,
+            batch_size=3482,
+        )
+
+        train_part_TRN, test_part_TRN = split_one_glycan_group_with_datasail_max_peaks(
+            group_df,
+            glycan_name = glycan_name,
+            test_size = test_size,
+            random_state = random_state,
+            output_dir = output_dir,
+        )
+
+        train_parts_CNN.append(train_part_CNN)
+        test_parts_CNN.append(test_part_CNN)
+        train_parts_TRN.append(train_part_TRN)
+        test_parts_TRN.append(test_part_TRN)
+
+
+    train_df_CGSiS = pd.concat(train_parts_CNN, ignore_index=True)
+    test_df_CGSiS = pd.concat(test_parts_CNN, ignore_index=True)
+
+    train_df_TGSiS = pd.concat(train_parts_TRN, ignore_index=True)
+    test_df_TGSiS = pd.concat(test_parts_TRN, ignore_index=True)
+
+    drop_temp_cols = ["_combined_index", "_datasail_id", "split"]
+    train_df_CGSiS = train_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_CGSiS.columns])
+    test_df_CGSiS = test_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_CGSiS.columns])
+
+    train_df_TGSiS = train_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_TGSiS.columns])
+    test_df_TGSiS = test_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_TGSiS.columns])
+
+    print(
+        "Final DataSAIL glycan-wise split for CNN:",
+        f"train rows={len(train_df_CGSiS)},",
+        f"test rows={len(test_df_CGSiS)},",
+        f"test fraction={len(test_df_CGSiS) / (len(train_df_CGSiS) + len(test_df_CGSiS)):.3f}",
+    )
+
+    print(
+        "Final DataSAIL glycan-wise split for Transformer:",
+        f"train rows={len(train_df_TGSiS)},",
+        f"test rows={len(test_df_TGSiS)},",
+        f"test fraction={len(test_df_TGSiS) / (len(train_df_TGSiS) + len(test_df_TGSiS)):.3f}",
+    )
+
+    train_df_CGSiS = downcast_numeric(train_df_CGSiS)
+    test_df_CGSiS = downcast_numeric(test_df_CGSiS)
+    X_train_CGSiS = tupleify(train_df_CGSiS, FEATURE_COLUMNS)
+    X_test_CGSiS = tupleify(test_df_CGSiS, FEATURE_COLUMNS)
+    y_train_CGSiS = train_df_CGSiS["glycan"].tolist()
+    y_test_CGSiS = test_df_CGSiS["glycan"].tolist()
+
+    train_df_TGSiS = downcast_numeric(train_df_TGSiS)
+    test_df_TGSiS = downcast_numeric(test_df_TGSiS)
+    X_train_TGSiS = tupleify(train_df_TGSiS, FEATURE_COLUMNS)
+    X_test_TGSiS = tupleify(test_df_TGSiS, FEATURE_COLUMNS)
+    y_train_TGSiS = train_df_TGSiS["glycan"].tolist()
+    y_test_TGSiS = test_df_TGSiS["glycan"].tolist()
+
+    with open(output_dir / "X_train_CGSiS.pkl", "wb") as fh:
+        pickle.dump(X_train_CGSiS, fh)
+    with open(output_dir / "X_test_CGSiS.pkl", "wb") as fh:
+        pickle.dump(X_test_CGSiS, fh)
+    with open(output_dir / "y_train_CGSiS.pkl", "wb") as fh:
+        pickle.dump(y_train_CGSiS, fh)
+    with open(output_dir / "y_test_CGSiS.pkl", "wb") as fh:
+        pickle.dump(y_test_CGSiS, fh)
+
+
+    with open(output_dir / "X_train_TGSiS.pkl", "wb") as fh:
+        pickle.dump(X_train_TGSiS, fh)
+    with open(output_dir / "X_test_TGSiS.pkl", "wb") as fh:
+        pickle.dump(X_test_TGSiS, fh)
+    with open(output_dir / "y_train_TGSiS.pkl", "wb") as fh:
+        pickle.dump(y_train_TGSiS, fh)
+    with open(output_dir / "y_test_TGSiS.pkl", "wb") as fh:
+        pickle.dump(y_test_TGSiS, fh)
 ########################################################################################################################
     # Random split
 ########################################################################################################################
@@ -972,8 +981,10 @@ def main(args):
     print(f"Saved processed datasets to {output_dir.resolve()}")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = 'Data Processing')
-    parser.add_argument('--data_processing', type = str, required = True, choices = ["org", "DS"])
+    parser.add_argument('--dataset_name', type = str, required = True, choices = ["full", "HC","XPF","GMS","OP","DSXXX"])
     # parser.add_argument('--nclusters', type = int, required = False, default = 5)
+    parser.add_argument("--downsampling", action="store_true",
+                        help=("down_sampling or not."))
     parser.add_argument('--keep_scale', type = float, required = False, default = 9.0)
     parser.add_argument('--keep_fraction', type = float, required = False, default = 0.1)
     parser.add_argument('--keep_policy', type = str, required = False, choices = ["sqrt", "log2","fraction"], default = "sqrt")
