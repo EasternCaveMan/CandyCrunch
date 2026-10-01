@@ -290,7 +290,8 @@ def main(args):
     # Model
     # ============================================================
     print("Preparing the model")
-    loss_tag = LOSS_TAGS.get(args.loss_function, "") + ("_CS" if args.candidate_sets else "")
+    candidate_sets_tag = "_CS" if args.candidate_sets else "_NoCS"
+    loss_tag = LOSS_TAGS.get(args.loss_function, "") + candidate_sets_tag
     pretraining_tag = (f"_SupConPtE{args.pretraining_epochs}T{args.supcon_temperature}" if args.pretraining else "")
     combine_loss_tag = (f"_CombSupConW{args.contrastive_loss_weight:g}T{args.supcon_temperature:g}" if args.combine_loss else "")
     if args.model == "CNN":
@@ -467,7 +468,8 @@ if __name__ == "__main__":
         help="Non-negative focal-loss focusing exponent; 0 gives standard cross-entropy (default: 2).")
     parser.add_argument("--candidate-sets","--candidate_sets",dest="candidate_sets",action=argparse.BooleanOptionalAction,default=True,
         help=("Let ambiguous labels (e.g., Gal(b1-3/4)GlcNAc) also accept every more specific class in all losses and metrics "
-              "(default: True; --no-candidate-sets trains on single-class targets)."))
+              "(default: True; pass --candidate-sets to enable or --no-candidate-sets to train on single-class targets; "
+              "setting names include _CS or _NoCS after the loss tag)."))
     parser.add_argument("--pretraining",type=str_to_bool,nargs="?",const=True,default=False,
         help="If True, run SupCon pretraining first, then fine-tune with --loss_function (default: False).")
     parser.add_argument("--combine-loss",type=str_to_bool,nargs="?",const=True,default=False,
