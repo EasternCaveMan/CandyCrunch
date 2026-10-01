@@ -24,6 +24,7 @@ dependencies = [
     "networkx",
     "scipy",
     "torch~=2.1",
+    "pytorch-focalloss>=1.2.0,<2",
     "torchmetrics",
     "numpy_indexed",
     "seaborn",

@@ -7,6 +7,8 @@ import json
 import os
 from datetime import datetime
 
+from tests.leaderboard import LEADERBOARD_TEXT_PATH, update_leaderboard_from_collector
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -37,12 +39,94 @@ class ResultCollector:
         self.dict_full_results = defaultdict(lambda: defaultdict(list))
         self.log_file = "test_results_log.json"
         self.previous_results = self.load_previous_results()
+        self.node_expected_param_keys = defaultdict(set)
+        self.node_recorded_param_keys = defaultdict(set)
+        self.node_test_dict_names = {}
+        self.param_expected_datasets = defaultdict(set)
+        self.param_recorded_datasets = defaultdict(set)
+        self.param_passed_datasets = defaultdict(set)
+        self.param_failed_datasets = defaultdict(set)
 
     def load_previous_results(self):
         if os.path.exists(self.log_file):
             with open(self.log_file, 'r') as f:
                 return json.load(f)
         return {}
+
+    def _full_param_key(self, params):
+        return tuple(
+            params[key] if key != 'test_dict' else params['test_dict']['name']
+            for key in self.param_names.keys()
+        )
+
+    def _leaderboard_param_key(self, params):
+        return self._full_param_key(params)[1:]
+
+    def _expected_formats(self, input_format, test_files):
+        has_mzml = any(filename.lower().endswith('.mzml') for filename in test_files)
+        has_xlsx = any(not filename.lower().endswith('.mzml') for filename in test_files)
+
+        if input_format == 'xlsx':
+            return ['xlsx'] if has_xlsx else []
+        if input_format == 'mzml':
+            if has_mzml:
+                return ['mzML']
+            return ['xlsx'] if has_xlsx else []
+
+        formats = []
+        if has_xlsx:
+            formats.append('xlsx')
+        if has_mzml:
+            formats.append('mzML')
+        return formats
+
+    def start_test_case(self, params, input_format, test_files, test_nodeid):
+        if self.param_names is None:
+            return
+
+        test_dict_name = params['test_dict']['name']
+        expected_keys = set()
+        for file_format in self._expected_formats(input_format, test_files):
+            params_with_format = dict(params)
+            params_with_format['format'] = file_format
+            leaderboard_key = self._leaderboard_param_key(params_with_format)
+            expected_keys.add(leaderboard_key)
+            self.param_expected_datasets[leaderboard_key].add(test_dict_name)
+
+        self.node_expected_param_keys[test_nodeid] = expected_keys
+        self.node_test_dict_names[test_nodeid] = test_dict_name
+
+    def record_test_outcome(self, test_nodeid, passed):
+        test_dict_name = self.node_test_dict_names.get(test_nodeid)
+        if test_dict_name is None:
+            return
+
+        affected_keys = (
+            self.node_expected_param_keys.get(test_nodeid, set())
+            | self.node_recorded_param_keys.get(test_nodeid, set())
+        )
+        if not affected_keys:
+            return
+
+        outcome_map = self.param_passed_datasets if passed else self.param_failed_datasets
+        for leaderboard_key in affected_keys:
+            outcome_map[leaderboard_key].add(test_dict_name)
+
+    def get_leaderboard_eligible_params(self):
+        candidate_keys = set(self.param_expected_datasets.keys())
+        for param_results in self.dict_results.values():
+            candidate_keys.update(param_results.keys())
+
+        eligible_keys = set()
+        for leaderboard_key in candidate_keys:
+            expected = self.param_expected_datasets.get(leaderboard_key, set())
+            recorded = self.param_recorded_datasets.get(leaderboard_key, set())
+            passed = self.param_passed_datasets.get(leaderboard_key, set())
+            failed = self.param_failed_datasets.get(leaderboard_key, set())
+            if expected and expected == recorded == passed and not failed:
+                eligible_keys.add(leaderboard_key)
+
+        return eligible_keys
 
     def save_current_results(self):
         # Calculate final averages for each test_dict
@@ -59,7 +143,7 @@ class ResultCollector:
         # Save to log file
         with open(self.log_file, 'w') as f:
             json.dump(final_results, f, indent=4)
-    
+
     def check_performance(self, test_dict_name, param_key, current_score):
         """Check if current score is at least as good as previous best"""
         if test_dict_name in self.previous_results:
@@ -74,21 +158,22 @@ class ResultCollector:
                         f"\nCurrent score: {current_score:.3f}"
                         f"\nParameters: {param_key}")
 
-    def add_result(self, params, score, full_scores = None):
+    def add_result(self, params, score, full_scores=None, test_nodeid=None):
         test_dict_name = params['test_dict']['name']
-        param_key = tuple(
-            params[key] if key != 'test_dict' else params['test_dict']['name']
-            for key in self.param_names.keys()
-        )
+        param_key = self._full_param_key(params)
+        leaderboard_key = param_key[1:]
         # Append the individual score to the list of scores for this parameter combination
-        self.dict_results[test_dict_name][param_key[1:]].append(score)
+        self.dict_results[test_dict_name][leaderboard_key].append(score)
         if full_scores is not None:
-            self.dict_full_results[test_dict_name][param_key[1:]].append(full_scores)
+            self.dict_full_results[test_dict_name][leaderboard_key].append(full_scores)
+        self.param_recorded_datasets[leaderboard_key].add(test_dict_name)
+        if test_nodeid is not None:
+            self.node_recorded_param_keys[test_nodeid].add(leaderboard_key)
         # If we've switched to a new test_dict, print the results for the previous one
         if self.current_dict != test_dict_name and self.current_dict is not None:
             self.print_dict_results(self.current_dict)
         self.current_dict = test_dict_name
-    
+
     def print_dict_results(self, dict_name):
         print(f"\n=== Results for {dict_name} ===")
         # Get results for this test_dict
@@ -112,9 +197,9 @@ class ResultCollector:
             avg_fp = np.mean([s[6] for s in full]) if full else float('nan')
             row = list(params) + [f"{avg_f1:.3f}", f"{avg_prec:.3f}", f"{avg_rec:.3f}", f"{avg_np:.1f}", f"{avg_wrong:.1f}", f"{avg_fp:.1f}"]
             table_data.append(row)
-        print(tabulate(table_data, headers = headers, tablefmt = 'grid'))
+        print(tabulate(table_data, headers=headers, tablefmt='grid'))
         print()
-    
+
     def get_table(self):
         if not self.dict_results:
             return "No results collected!"
@@ -142,7 +227,7 @@ class ResultCollector:
             params: np.mean(scores)
             for params, scores in overall_results.items()
         }
-        for params, avg_f1 in sorted(averaged_overall.items(), key = lambda x: x[1], reverse = True):
+        for params, avg_f1 in sorted(averaged_overall.items(), key=lambda x: x[1], reverse=True):
             full = overall_full.get(params, [])
             avg_prec = np.mean([s[1] for s in full]) if full else float('nan')
             avg_rec = np.mean([s[2] for s in full]) if full else float('nan')
@@ -162,21 +247,22 @@ class ResultCollector:
         for params, data in sorted(param_scores.items()):
             means = np.array(data['means'])
             weights = np.array(data['weights'])
-            weighted_mean = np.average(means, weights = weights)
+            weighted_mean = np.average(means, weights=weights)
             n = len(means)
-            se = np.std(means, ddof = 1) / np.sqrt(n) if n > 1 else float('nan')
+            se = np.std(means, ddof=1) / np.sqrt(n) if n > 1 else float('nan')
             param_label = ', '.join(
                 f"{list(self.param_names.values())[i + 1]}={p}"
                 for i, p in enumerate(params)
             )
             line = f"[{param_label}]  score={weighted_mean:.4f}  ±{1.96 * se:.4f} (95% CI, n={n} datasets)"
             print(line)
-        return tabulate(table_data, headers = headers, tablefmt = 'grid')
+        return tabulate(table_data, headers=headers, tablefmt='grid')
 
-# Rest remains the same
+
 collector = ResultCollector()
 
-@pytest.fixture(scope = "session")
+
+@pytest.fixture(scope="session")
 def result_collector():
     return collector
 
@@ -189,6 +275,20 @@ def pytest_configure(config):
     )
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when != 'call':
+        return
+
+    callspec = getattr(item, 'callspec', None)
+    if callspec is None or 'test_params' not in callspec.params:
+        return
+
+    collector.record_test_outcome(item.nodeid, report.outcome == 'passed')
+
+
 def pytest_sessionfinish():
     print("\n=== Final Summary ===")
     # Print tables for each test_dict
@@ -198,6 +298,11 @@ def pytest_sessionfinish():
     print("\n=== Overall Performance Results ===")
     print(collector.get_table())
     print()
+
+    leaderboard_entries = update_leaderboard_from_collector(collector)
+    if leaderboard_entries:
+        print(f"Leaderboard updated: {LEADERBOARD_TEXT_PATH}")
+
     if collector.previous_results:
         print("\n=== Comparison with Previous Run ===")
         for dict_name in collector.dict_results.keys():

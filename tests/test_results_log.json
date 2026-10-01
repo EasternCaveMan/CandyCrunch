@@ -1,51 +1,100 @@
 {
     "milk": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.8114754046123355,
-            "('Transformer', True, True, 'xlsx')": 0.7173292970815593
+            "('CNN', True, True, 'mzML')": 0.5993111318262524,
+            "('Transformer', True, True, 'mzML')": 0.6801722670781494
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
     },
     "GPST000350": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.666354945022696,
-            "('Transformer', True, True, 'xlsx')": 0.6271146502422686
+            "('CNN', True, True, 'mzML')": 0.6602765175833856,
+            "('Transformer', True, True, 'mzML')": 0.6293967461692834
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
     },
     "GPST000017": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.6418114380306398,
-            "('Transformer', True, True, 'xlsx')": 0.6204609316632637
+            "('CNN', True, True, 'mzML')": 0.6411770646095221,
+            "('Transformer', True, True, 'mzML')": 0.6327374638965625
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
     },
     "GPST000029": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.6760336926671627,
-            "('Transformer', True, True, 'xlsx')": 0.6912321754353176
+            "('CNN', True, True, 'mzML')": 0.712536481076223,
+            "('Transformer', True, True, 'mzML')": 0.6970728199293517
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
     },
     "PMC8950484_CHO": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.8500861534262923,
-            "('Transformer', True, True, 'xlsx')": 0.835817168861628
+            "('CNN', True, True, 'mzML')": 0.7794879895166893,
+            "('Transformer', True, True, 'mzML')": 0.7570318260997002
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
     },
     "GPST000307": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.7656431942505303,
-            "('Transformer', True, True, 'xlsx')": 0.7344267530333345
+            "('CNN', True, True, 'mzML')": 0.7462783855744339,
+            "('Transformer', True, True, 'mzML')": 0.742648145980485
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
     },
     "GPST000487": {
         "scores": {
-            "('CNN', True, True, 'xlsx')": 0.3953238361914877,
-            "('Transformer', True, True, 'xlsx')": 0.2795502334413497
+            "('CNN', True, True, 'mzML')": 0.5137987932079887,
+            "('Transformer', True, True, 'mzML')": 0.24649452527049776
         },
-        "timestamp": "2026-09-14 22:52:38"
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "2312134776_N_CD14": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.7149199073306233,
+            "('Transformer', True, True, 'mzML')": 0.6540150781859206
+        },
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "2312184776_O_CD7": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.5147993891339989,
+            "('Transformer', True, True, 'mzML')": 0.4490954383618867
+        },
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "240529_4962_5b": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.6559347533422166,
+            "('Transformer', True, True, 'mzML')": 0.6291731282851979
+        },
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "JC_220302DN2": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.7593863649874804,
+            "('Transformer', True, True, 'mzML')": 0.6685696526673476
+        },
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "JC_220302DO3": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.7280575486255163,
+            "('Transformer', True, True, 'mzML')": 0.5984685144228747
+        },
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "JC_221028MeO2": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.8156242837306374,
+            "('Transformer', True, True, 'mzML')": 0.8110223351625876
+        },
+        "timestamp": "2026-09-30 19:39:21"
+    },
+    "JC_221028MeN4": {
+        "scores": {
+            "('CNN', True, True, 'mzML')": 0.6777442727195571,
+            "('Transformer', True, True, 'mzML')": 0.597751441641954
+        },
+        "timestamp": "2026-09-30 19:39:21"
     }
 }

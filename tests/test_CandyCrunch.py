@@ -15,6 +15,20 @@ import time
 
 BASE_DIR = pathlib.Path(__file__).parent.parent  # Go up one level from the test file
 TEST_DATA_DIR = BASE_DIR / "tests" / "data"
+# TEST_DICTS = [
+#     {'name':'milk','args': {'glycan_class':'free'}, 'mass_threshold':0.5, 'RT_threshold':1},
+#     {'name':'GPST000350','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'O.' in x]},
+#     {'name':'GPST000350','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'N' in x]},
+#     {'name':'GPST000017','args': {'glycan_class':'O'}, 'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000017/") if 'PGMb' not in x if 'JC' in x]},
+#     {'name':'GPST000029','args': {'glycan_class':'O'}},
+#     {'name':'PMC8950484_CHO','args': {'glycan_class':'O'}},
+#     {'name':'GPST000307','args': {'glycan_class':'O'}},
+#     {'name':'GPST000487','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000487/")]},
+#     {'name':'2312134776_N_CD14','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/2312134776_N_CD14/")]},
+#     {'name':'2312184776_O_CD7','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/2312184776_O_CD7/")]},
+#     {'name':'240529_4962_5b','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/240529_4962_5b/")]},
+#
+# ]
 TEST_DICTS = [
     {'name':'milk','args': {'glycan_class':'free'}, 'mass_threshold':0.5, 'RT_threshold':1},
     {'name':'GPST000350','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000350/") if 'O.' in x]},
@@ -24,8 +38,17 @@ TEST_DICTS = [
     {'name':'PMC8950484_CHO','args': {'glycan_class':'O'}},
     {'name':'GPST000307','args': {'glycan_class':'O'}},
     {'name':'GPST000487','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000487/")]},
-   # {'name':'GPST000134','args': {'glycan_class':'N', 'mode':'positive'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/") if 'glycans_1' in x][:1]}
-    #{'name':'TissueSection4874','args': {'glycan_class':'O'}},
+    {'name':'2312134776_N_CD14','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/2312134776_N_CD14/")]},
+    {'name':'2312184776_O_CD7','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/2312184776_O_CD7/")]},
+    {'name':'240529_4962_5b','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/240529_4962_5b/")]},
+    {'name':'JC_220302DN2','args': {'glycan_class':'N'}},
+    {'name':'JC_220302DO3','args': {'glycan_class':'O'}},
+    {'name':'JC_221028MeO2','args': {'glycan_class':'O'}},
+    {'name':'JC_221028MeN4','args': {'glycan_class':'N'}},
+
+    # {'name': 'JC_211214_24N', 'args': {'glycan_class': 'N'}},
+    # {'name':'240410_4812_pool','args': {'glycan_class':'O'}},
+    # {'name':'GPST000134','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/")]},
 ]
 AVG_THRESHOLD = 0.05
 MASS_TOLERANCE = 0.5
@@ -155,7 +178,7 @@ test_params = [
 ]
 
 @pytest.mark.parametrize("test_params", test_params)
-def test_candycrunch_accuracy(test_params, result_collector, input_format, verbose, test_files = None):
+def test_candycrunch_accuracy(test_params, result_collector, input_format, verbose, request, test_files = None):
     if result_collector.param_names is None:
         result_collector.param_names = {k: k for k in list(extra_param_dict.keys()) + ['format']}
     start_time = time.time()  # Start timing
@@ -170,6 +193,7 @@ def test_candycrunch_accuracy(test_params, result_collector, input_format, verbo
     elif input_format == "mzml":
         mzml = [x for x in test_files if x.endswith(".mzML")]
         test_files = mzml if mzml else test_files  # fall back to xlsx if no mzML present
+    result_collector.start_test_case(test_params, input_format, test_files, request.node.nodeid)
     for filename in test_files:
         inference_params = {k: v for k,v in test_params.items() if 'posthoc' not in k if k not in ('test_dict', 'format')}
         posthoc_params = {k: v for k,v in test_params.items() if 'posthoc' in k}
@@ -196,7 +220,7 @@ def test_candycrunch_accuracy(test_params, result_collector, input_format, verbo
         file_format = 'mzML' if filename.endswith('.mzML') else 'xlsx'
         print(f'file_score:{eval_scores[0]} ({file_format})')
         test_params['format'] = file_format
-        result_collector.add_result(test_params, eval_scores[0], eval_scores)
+        result_collector.add_result(test_params, eval_scores[0], eval_scores, test_nodeid=request.node.nodeid)
         param_key = tuple(
             test_params[key] if key != 'test_dict' else test_params['test_dict']['name']
             for key in test_params

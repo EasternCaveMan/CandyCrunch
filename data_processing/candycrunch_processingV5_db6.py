@@ -2,6 +2,8 @@ import os
 import time
 import argparse
 import subprocess
+import sys
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import pymzml
 import numpy as np
@@ -13,6 +15,11 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from scipy.signal import find_peaks, peak_widths
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 MASS_TOLERANCE = 0.5
 RT_TOLERANCE = 1.0
 XIC_MZ_TOLERANCE = 0.2
@@ -603,36 +610,33 @@ def download_and_process(download_base_url=None, output_dir=None, file_names=Non
     all_mzml_files = []
     output_dir = os.path.abspath(os.fspath(output_dir))
     os.makedirs(output_dir, exist_ok=True)
-    original_cwd = os.getcwd()
     download_base_url = download_base_url.rstrip('/')
-    try:
-        os.chdir(output_dir)
-        for file_name in file_names:
-            url = f"{download_base_url}/{urllib.parse.quote(file_name)}"
-            print(f"\n{'=' * 60}")
-            print(f"Processing {file_name}")
-            print(f"{'=' * 60}")
-            print(f"1. Downloading {file_name}...")
-            try:
-                subprocess.run(["wget", "-c", url, "-O", file_name], check=True)
-                print(f"✓ Successfully downloaded {file_name}")
-            except subprocess.CalledProcessError as e:
-                print(f"✗ Failed to download {file_name}: {e}")
-                continue
-            downloaded_file_path = os.path.abspath(file_name)
-            print(f"2. Processing {file_name}...")
-            mzml_files = _process_downloaded_file(downloaded_file_path, output_dir)
+    for file_name in file_names:
+        url = f"{download_base_url}/{urllib.parse.quote(file_name)}"
+        download_target = os.path.join(output_dir, file_name)
+        os.makedirs(os.path.dirname(download_target), exist_ok=True)
+        print(f"\n{'=' * 60}")
+        print(f"Processing {file_name}")
+        print(f"{'=' * 60}")
+        print(f"1. Downloading {file_name}...")
+        try:
+            subprocess.run(["wget", "-c", url, "-O", download_target], check=True)
+            print(f"✓ Successfully downloaded {file_name}")
+        except subprocess.CalledProcessError as e:
+            print(f"✗ Failed to download {file_name}: {e}")
+            continue
+        downloaded_file_path = os.path.abspath(download_target)
+        print(f"2. Processing {file_name}...")
+        mzml_files = _process_downloaded_file(downloaded_file_path, output_dir)
 
-            if mzml_files:
-                all_mzml_files.extend(mzml_files)
-                for mzml_file in mzml_files:
-                    print(f"  ✓ Final mzML file: {mzml_file}")
-            else:
-                print(f"  ✗ No mzML files generated from {file_name}")
+        if mzml_files:
+            all_mzml_files.extend(mzml_files)
+            for mzml_file in mzml_files:
+                print(f"  ✓ Final mzML file: {mzml_file}")
+        else:
+            print(f"  ✗ No mzML files generated from {file_name}")
 
-            time.sleep(1)
-    finally:
-        os.chdir(original_cwd)
+        time.sleep(1)
     return all_mzml_files
 
 
@@ -845,7 +849,12 @@ def _process_mzML_stack(filepath, num_peaks= None,
                     intensities.append(inty)
     for key in highest_i_dict.keys():
         highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key=lambda x: x[1], reverse=True))
-    df_out = pd.DataFrame({'m/z': mzs, 'peak_d': list(highest_i_dict.values()), 'RT': rts, 'precursor_charge': charges})
+    df_out = pd.DataFrame({
+        'm/z': mzs,
+        'peak_d': list(highest_i_dict.values()),
+        'RT': rts,
+        'precursor_charge': charges,
+    })
     if intensity:
         df_out['intensity'] = intensities
     metadata["mode"] = metadata.get("mode") or detected_mode
@@ -860,7 +869,12 @@ def _process_mzML_stack(filepath, num_peaks= None,
             xic_results = []
             for r in range(len(df_out)):
                 xic_results.append(
-                    extract_xic_peak(df_out['m/z'].values[r], df_out.RT.values[r], df_out.attrs['ms1_rts'], ms1_scans)
+                    extract_xic_peak(
+                        df_out['m/z'].values[r],
+                        df_out.RT.values[r],
+                        df_out.attrs['ms1_rts'],
+                        ms1_scans
+                    )
                 )
             for column in xic_results[0]:
                 df_out[column] = [result[column] for result in xic_results]
@@ -1193,7 +1207,6 @@ def data_extraction(mzml_files, glycopost_id, df_mz_total, out_path, glycan_clas
     if xic_mode not in XIC_MODES:
         raise ValueError(f"xic_mode must be one of {sorted(XIC_MODES)}, got {xic_mode!r}")
     os.makedirs(out_path, exist_ok=True)
-    # For training
     print("\n" + "=" * 60)
     print("DATA EXTRACTION - TRAINING")
     print("=" * 60)
