@@ -132,7 +132,8 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
                     torch.tensor(arrays["mz_remainder"][index], dtype=torch.float32),*shared)
         peak_list = arrays["peak_list"][index]
         if self.max_peaks is not None:
-            peak_list = peak_list[: self.max_peaks]
+            # Peak lists are sorted by m/z, so keep the most intense peaks (in m/z order, padding last), as spectrum_to_peak_list does at inference
+            peak_list = peak_list[np.sort(np.argsort(-peak_list[:, 1], kind="stable")[: self.max_peaks])]
         peak_list = torch.tensor(peak_list, dtype=torch.float32)
         peak_padding_mask = peak_list.abs().sum(dim=-1) == 0
         return peak_list, peak_padding_mask, *shared

@@ -60,7 +60,7 @@ def iupac_to_composition_string(glycan: str) -> str:
     return canonicalize_composition(expanded, as_string=True)
 
 def bin_intensities(peak_d, frames):
-    """sums up intensities for each bin across a spectrum\n
+    """sums up intensities for each bin across a spectrum, ignoring peaks outside the binned m/z range; must stay identical to bin_intensities in candycrunch/prediction.py\n
    | Arguments:
    | :-
    | peak_d (dict): dictionary of form (fragment) m/z : intensity
@@ -68,7 +68,7 @@ def bin_intensities(peak_d, frames):
    | Returns:
    | :-
    | (1) a list of binned intensities
-   | (2) a list of the difference (bin edge - m/z of highest peak in bin) for each bin
+   | (2) a list of the difference (m/z of highest peak in bin - lower bin edge) for each bin
    """
     num_frames = len(frames)
     binned_intensities = np.zeros(num_frames)
@@ -76,9 +76,13 @@ def bin_intensities(peak_d, frames):
     mzs = np.array(list(peak_d.keys()), dtype='float32')
     intensities = np.array(list(peak_d.values()))
     bin_indices = np.digitize(mzs, frames, right=True)
+    in_range = (bin_indices > 0) & (bin_indices < num_frames)
+    mzs, intensities, bin_indices = mzs[in_range], intensities[in_range], bin_indices[in_range]
+    if not len(mzs):
+        return binned_intensities, mz_diff
     mz_remainder = mzs - frames[bin_indices - 1]
-    max_intensities = npi.group_by(bin_indices - 1).max(intensities)
-    mz_remainder = mz_remainder * np.isin(intensities, max_intensities)
+    unique_bins, max_intensities = npi.group_by(bin_indices).max(intensities)
+    mz_remainder = mz_remainder * (intensities == max_intensities[np.searchsorted(unique_bins, bin_indices)])
     unique_bins, summed_intensities = npi.group_by(bin_indices).sum(intensities)
     _, max_mz_remainder = npi.group_by(bin_indices).max(mz_remainder)
     binned_intensities[unique_bins - 1] = summed_intensities

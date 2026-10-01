@@ -18,7 +18,7 @@ from candycrunch.model import CandyCrunch_CNN, CandyCrunch_Transformer, MemmapSp
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
 from sklearn.metrics import pairwise_distances
-from training_utils import train_model
+from training_utils import seed_worker, train_model
 
 warnings.filterwarnings("ignore",category=RuntimeWarning,module="sklearn.utils.extmath")
 
@@ -221,6 +221,7 @@ def main(args):
                 persistent_workers=args.persistent_workers,
                 prefetch_factor=args.prefetch_factor,
                 multiprocessing_context=args.multiprocessing_context,
+                worker_init_fn=seed_worker,
             )
         return torch.utils.data.DataLoader(dataset, **loader_kwargs)
 
@@ -361,10 +362,11 @@ def main(args):
     # ============================================================
     # Optimizer
     # ============================================================
-    def make_training_components(current_model):
+    def make_training_components(current_model, patience):
+        # ReduceLROnPlateau only cuts the LR after lr_patience + 1 bad epochs, while EarlyStopping stops after patience bad epochs, so lr_patience must stay well below patience
         return training_setup(current_model,
                               lr = 0.0001,
-                              lr_patience = 4,
+                              lr_patience = max(1, patience // 2 - 1),
                               factor=0.2,
                               weight_decay = 0.00002,
                               mode = 'multiclass',
@@ -393,7 +395,8 @@ def main(args):
     # Runs with several seeds share one setting_name, so each seed gets its own folder instead of overwriting the previous seed's checkpoint and metrics
     model_dir = Path("./models") if len(args.random_seeds) == 1 else Path("./models") / f"seed{args.current_seed}"
     if args.pretraining:
-        pretrain_optimizer, pretrain_scheduler, _ = make_training_components(model)
+        pretrain_optimizer, pretrain_scheduler, _ = make_training_components(model,
+                                                                             args.pretraining_patience if args.pretraining_patience is not None else args.patience)
         pretrain_criterion = SupConLoss(temperature=args.supcon_temperature,cand_mask=cand_mask).to(device)
         pretrain_metadata = dict(checkpoint_metadata)
         pretrain_metadata["setting_name"] = pretrain_setting_name
@@ -418,7 +421,7 @@ def main(args):
         checkpoint_metadata["pretraining_loss_function"] = "supcon"
         print(f"Loaded SupCon pretrained weights from {pretrain_model_path}")
 
-    optimizer_ft, scheduler, _ = make_training_components(model)
+    optimizer_ft, scheduler, _ = make_training_components(model, args.patience)
     criterion = make_finetuning_criterion()
     contrastive_criterion = SupConLoss(temperature=args.supcon_temperature,cand_mask=cand_mask).to(device) if args.combine_loss else None
     print("Fine-tuning loss:", args.loss_function)
@@ -484,7 +487,7 @@ if __name__ == "__main__":
         help="Distinct original examples sampled per class for SupCon pretraining (default: 4).")
     parser.add_argument("--supcon-views-per-example",type=int,default=2,
         help="Independent augmented views per original example for SupCon pretraining (default: 2).")
-    parser.add_argument("--patience", type=int,default=4)
+    parser.add_argument("--patience", type = int, default = 6)
     parser.add_argument("--max_peaks",type=int,default=None)
     parser.add_argument("--num-workers",type=int,default=2,help="Training DataLoader workers.")
     parser.add_argument("--val-num-workers",type=int,default=0,help="Validation DataLoader workers.")
@@ -506,7 +509,8 @@ if __name__ == "__main__":
     parser.add_argument( "--nlayers",type=int,default=None)
     parser.add_argument( "--ff_dim",type=int,default=None)
     parser.add_argument("--peak_hidden_dim",type=int,default=None,help=("Transformer model width. If omitted, it defaults to ff_dim//2 when ff_dim is given, otherwise nheads * 64."))
-    parser.add_argument("--peak_encoder",type=str, default="linear", choices=["linear","fourier"])
+    parser.add_argument("--peak_encoder",type=str, default="fourier", choices=["linear","fourier"],
+        help="Peak encoder for the Transformer; 'linear' feeds raw m/z into a LayerNorm, which cancels its scale and leaves peaks nearly indistinguishable (default: fourier).")
     parser.add_argument("--use_transformer_ff",action=argparse.BooleanOptionalAction,default=True,help=(
             "Enable the Transformer feed-forward block. When disabled(--no-use_transformer_ff), the encoder uses attention only and ignores --encoder_type for the token FF path."))
     parser.add_argument("--encoder_type",type=str,default="dense",choices=["dense","moe"])

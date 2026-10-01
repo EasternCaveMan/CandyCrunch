@@ -15,9 +15,17 @@ import seaborn as sns
 import os
 from sklearn.metrics import f1_score, matthews_corrcoef
 from sklearn.exceptions import UndefinedMetricWarning
+import random
 from glycowork.ml.model_training import EarlyStopping, disable_running_stats, enable_running_stats
 warnings.filterwarnings("ignore", category = UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category = UserWarning, module = "sklearn")
+
+
+def seed_worker(worker_id):
+    """Seed numpy and random in a DataLoader worker from its torch seed, which the loader derives from its seeded generator, so augmentations are reproducible and differ between workers."""
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
 
 device = "cpu"
 if torch.cuda.is_available():

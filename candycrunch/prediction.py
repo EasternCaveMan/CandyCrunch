@@ -384,38 +384,33 @@ def average_dicts(dicts, mode='mean', round_dp=False):
 
 
 def bin_intensities(peak_d, frames):
-    """
-    Select the highest-intensity peak in each non-overlapping m/z bin.
-    Arguments
-    ---------
-    peak_d : dict
-        Dictionary of {fragment m/z: intensity}
-    frames : array-like
-        m/z boundaries separating each bin
-    Returns
-    -------
-    binned_intensities : np.ndarray
-        Maximum peak intensity in each bin.
-    mz_diff : np.ndarray
-        m/z remainder of the selected maximum-intensity peak
-        relative to the lower bin edge.
-    """
-
+    """sums up intensities for each bin across a spectrum, ignoring peaks outside the binned m/z range; must stay identical to bin_intensities in training/build_training_pickles.py\n
+   | Arguments:
+   | :-
+   | peak_d (dict): dictionary of form (fragment) m/z : intensity
+   | frames (list): m/z boundaries separating each bin\n
+   | Returns:
+   | :-
+   | (1) a list of binned intensities
+   | (2) a list of the difference (m/z of highest peak in bin - lower bin edge) for each bin
+   """
     num_frames = len(frames)
     binned_intensities = np.zeros(num_frames)
     mz_diff = np.zeros(num_frames)
-    mzs = np.array(list(peak_d.keys()), dtype="float32")
+    mzs = np.array(list(peak_d.keys()), dtype='float32')
     intensities = np.array(list(peak_d.values()))
     bin_indices = np.digitize(mzs, frames, right=True)
-    for bin_idx in np.unique(bin_indices):
-        if bin_idx == 0 or bin_idx > num_frames:
-            continue
-        mask = bin_indices == bin_idx
-        bin_mzs = mzs[mask]
-        bin_intensities = intensities[mask]
-        max_idx = np.argmax(bin_intensities)
-        binned_intensities[bin_idx - 1] = bin_intensities[max_idx]
-        mz_diff[bin_idx - 1] = (bin_mzs[max_idx] - frames[bin_idx - 1])
+    in_range = (bin_indices > 0) & (bin_indices < num_frames)
+    mzs, intensities, bin_indices = mzs[in_range], intensities[in_range], bin_indices[in_range]
+    if not len(mzs):
+        return binned_intensities, mz_diff
+    mz_remainder = mzs - frames[bin_indices - 1]
+    unique_bins, max_intensities = npi.group_by(bin_indices).max(intensities)
+    mz_remainder = mz_remainder * (intensities == max_intensities[np.searchsorted(unique_bins, bin_indices)])
+    unique_bins, summed_intensities = npi.group_by(bin_indices).sum(intensities)
+    _, max_mz_remainder = npi.group_by(bin_indices).max(mz_remainder)
+    binned_intensities[unique_bins - 1] = summed_intensities
+    mz_diff[unique_bins - 1] = max_mz_remainder
     return binned_intensities, mz_diff
 
 
