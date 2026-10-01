@@ -7,11 +7,41 @@ import torch
 import torch.nn.functional as F
 from torch_focalloss import MultiClassFocalLoss
 
+
+def merge_candidates(logits, target, cand_mask):
+    """Fold every class an (ambiguous) label allows into the target logit via logsumexp and drop the others, so any softmax loss on the target index scores their summed probability; a no-op for unambiguous labels."""
+    allowed = cand_mask.index_select(0, target.reshape(-1))
+    merged = torch.logsumexp(logits.masked_fill(~allowed, float("-inf")), dim=1, keepdim=True)
+    return logits.masked_fill(allowed, float("-inf")).scatter(1, target.reshape(-1, 1), merged)
+
+
+class CandidateSetLoss(torch.nn.Module):
+    """Poly1 cross entropy with label smoothing on the summed probability of every class a label allows (cand_mask[target]).
+
+    Identical to glycowork's Poly1CrossEntropyLoss for unambiguous labels, and to plain cross entropy with
+    epsilon=0 and label_smoothing=0. An ambiguous label such as Gal(b1-3/4)GlcNAc is satisfied by probability
+    on itself or on any more specific class (Gal(b1-4)GlcNAc), instead of penalizing those as wrong.
+    """
+
+    def __init__(self, cand_mask, epsilon=1.0, label_smoothing=0.1):
+        super().__init__()
+        self.register_buffer("cand_mask", cand_mask)
+        self.epsilon = epsilon
+        self.label_smoothing = label_smoothing
+
+    def forward(self, output, target):
+        log_probs = F.log_softmax(output, dim=1)
+        log_p_set = torch.logsumexp(log_probs.masked_fill(~self.cand_mask.index_select(0, target.reshape(-1)), float("-inf")), dim=1)
+        loss = -(1 - self.label_smoothing) * log_p_set - self.label_smoothing * log_probs.mean(dim=1) + self.epsilon * (1 - log_p_set.exp())
+        return loss.mean()
+
+
 class FocalLoss(torch.nn.Module):
     """Adapt torch_focalloss to batch reduction and finite fractional-gamma gradients."""
 
-    def __init__(self, gamma=2.0, reduction="mean"):
+    def __init__(self, gamma=2.0, reduction="mean", cand_mask=None):
         super().__init__()
+        self.register_buffer("cand_mask", cand_mask)
         if not math.isfinite(gamma) or gamma < 0:
             raise ValueError("gamma must be finite and non-negative.")
         if reduction not in {"none", "mean", "sum"}:
@@ -23,6 +53,8 @@ class FocalLoss(torch.nn.Module):
     def forward(self, output, target):
         if output.ndim != 2 or target.ndim != 1:
             raise ValueError("Expected logits [batch, classes] and targets [batch].")
+        if self.cand_mask is not None:
+            output = merge_candidates(output, target, self.cand_mask)
         if 0 < self.gamma < 1:
             target_probabilities = output.softmax(dim=1).gather(1, target.unsqueeze(1)).squeeze(1)
             saturated = target_probabilities == 1
@@ -53,11 +85,12 @@ class SupConLoss(torch.nn.Module):
 
     uses_embeddings = True
 
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.07, cand_mask=None):
         super().__init__()
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and positive.")
         self.temperature = temperature
+        self.register_buffer("cand_mask", cand_mask)
 
     def _gather_distributed(self, features, labels):
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -92,6 +125,10 @@ class SupConLoss(torch.nn.Module):
         logits_mask = torch.ones_like(logits, dtype=torch.bool)
         logits_mask[local_rows, local_columns] = False
         positive_mask = labels.unsqueeze(1) == all_labels.unsqueeze(0)
+        if self.cand_mask is not None:
+            # A different label that one of the two labels allows (Gal(b1-4)GlcNAc for Gal(b1-3/4)GlcNAc) may be the same glycan, so it is neither a positive nor a negative
+            maybe_same = self.cand_mask[labels.unsqueeze(1), all_labels.unsqueeze(0)] | self.cand_mask[all_labels.unsqueeze(0), labels.unsqueeze(1)]
+            logits_mask = logits_mask & ~(maybe_same & ~positive_mask)
         positive_mask = positive_mask & logits_mask
 
         positive_counts = positive_mask.sum(dim=1)
@@ -231,9 +268,10 @@ class CompositionConstraint(torch.nn.Module):
 class xyz_loss(torch.nn.Module):
     """Restrict standard cross entropy to classes matching the target composition."""
 
-    def __init__(self, class_compositions, logit_norm=False, t=1.0):
+    def __init__(self, class_compositions, logit_norm=False, t=1.0, cand_mask=None):
         super().__init__()
         self.primary_loss = torch.nn.CrossEntropyLoss()
+        self.register_buffer("cand_mask", cand_mask)
         self.logit_norm = logit_norm
         self.t = t
         self.composition_constraint = CompositionConstraint(class_compositions)
@@ -252,7 +290,7 @@ class xyz_loss(torch.nn.Module):
             norms = torch.norm(compatible, p=2, dim=-1, keepdim=True) + 1e-7
             normalized = torch.div(compatible, norms) / self.t
             masked = normalized.masked_fill(~allowed, float("-inf"))
-        return masked
+        return masked if self.cand_mask is None else merge_candidates(masked, target, self.cand_mask)
 
     def forward(self, output, target):
         return self.primary_loss(self.prepare_logits(output, target), target)

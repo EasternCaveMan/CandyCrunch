@@ -16,7 +16,6 @@ import os
 from sklearn.metrics import f1_score, matthews_corrcoef
 from sklearn.exceptions import UndefinedMetricWarning
 from glycowork.ml.model_training import EarlyStopping, disable_running_stats, enable_running_stats
-from torchmetrics.functional import accuracy
 warnings.filterwarnings("ignore", category = UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category = UserWarning, module = "sklearn")
 
@@ -272,13 +271,13 @@ def prepare_batch(data, model_type):
         mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
         inputs = [mz_features,precursor,glycan_type,rt,mode_in,lc,modification,trap]
         inputs = [x.to(device) for x in inputs]
-        y = y.squeeze().to(device)
+        y = y.reshape(-1).to(device)
 
     elif model_type == "Transformer":
         peak_list,peak_padding_mask,precursor,glycan_type,rt,mode_in,lc,modification,trap,y= data
         inputs = [peak_list,peak_padding_mask,precursor,glycan_type,rt,mode_in,lc,modification,trap]
         inputs = [x.to(device) for x in inputs]
-        y = y.squeeze().to(device)
+        y = y.reshape(-1).to(device)
     else:
         raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN' or 'Transformer'.")
     return inputs, y
@@ -334,21 +333,11 @@ def calculate_metrics_sklearn_from_classes(
     }
 
 
-def calculate_metrics_sklearn(pred, y, num_classes, batch_size_small=True, present_labels_only=False):
-    return calculate_metrics_sklearn_from_classes(
-        torch.argmax(pred, dim=1),
-        y,
-        num_classes,
-        batch_size_small=batch_size_small,
-        present_labels_only=present_labels_only,
-    )
-
-
 def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epochs=None,
                 patience=None,log_to_wandb=True,num_classes=None,model_type=None,setting_name=None,
                 transformer_moe_aux_loss_weight=0.0,classifier_moe_aux_loss_weight=0.0,checkpoint_metadata=None,
                 memory_reporter=None,glycan_compositions=None,save_dir="./models",wandb_prefix=None,
-                contrastive_criterion=None,contrastive_loss_weight=0.0,):
+                contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,):
     """
     Train a CNN or Transformer with SAM.
 
@@ -375,7 +364,7 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
     since = time.time()
     early_stopping = EarlyStopping(patience=patience,verbose=True)
     best_model_wts = copy.deepcopy(model.state_dict())
-    best_loss = 100.0
+    best_loss = float("inf")
     best_acc = 0.0
     val_losses = []
     val_acc = []
@@ -393,6 +382,8 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
     start = time.time_ns()
     if num_classes is None:
         num_classes = len(glycans)
+    # cand_mask[i, j]: a prediction of class j counts as correct for label i (only j == i without candidate sets)
+    cand_mask = torch.eye(num_classes, dtype=torch.bool, device=device) if cand_mask is None else cand_mask.to(device)
     output_dir = Path(save_dir)
 
     def prefix_wandb_payload(payload):
@@ -627,11 +618,14 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
                         optimizer.second_step(zero_grad=True)
                 if mask_predictions is not None:
                     pred = mask_predictions(pred.detach(), y)
+                # A prediction of any class the label allows counts as the label itself
+                pred_classes = pred.detach().argmax(dim=1)
+                pred_classes = torch.where(cand_mask[y, pred_classes], y, pred_classes)
                 # ====================================================
                 # Validation prediction accumulation
                 # ====================================================
                 if phase == "val":
-                    all_preds_epoch.append(pred.detach().argmax(dim=1).cpu())
+                    all_preds_epoch.append(pred_classes.cpu())
                     all_labels_epoch.append(y.detach().cpu())
                 # ====================================================
                 # Batch-level losses
@@ -645,10 +639,11 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
                 # ====================================================
                 # Batch metrics
                 # ====================================================
-                running_acc.append(accuracy(pred,y,task="multiclass",num_classes=num_classes).detach().item())
-                running_topk.append(accuracy(pred, y, task="multiclass", num_classes=num_classes, top_k=5).detach().item())
-                running_topk10.append(accuracy(pred, y, task="multiclass", num_classes=num_classes, top_k=10).detach().item())
-                sklearn_metrics = (calculate_metrics_sklearn(pred, y, num_classes, batch_size_small=True))
+                hits = cand_mask[y].gather(1, pred.detach().topk(10, dim=1).indices).cumsum(dim=1) > 0
+                running_acc.append(hits[:, 0].float().mean().item())
+                running_topk.append(hits[:, 4].float().mean().item())
+                running_topk10.append(hits[:, 9].float().mean().item())
+                sklearn_metrics = calculate_metrics_sklearn_from_classes(pred_classes, y, num_classes, batch_size_small=True)
                 running_mcc.append(sklearn_metrics["mcc"])
                 running_f1_macro.append(sklearn_metrics["f1_macro"])
                 running_f1_weighted.append(sklearn_metrics["f1_weighted"])

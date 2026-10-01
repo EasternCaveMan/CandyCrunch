@@ -28,6 +28,7 @@ HIDDEN_PARAMETER_COLUMNS = {
 DISPLAY_PARAMETER_ORDER = [
     "model",
     "loss_function",
+    "candidate_sets",
     "pretraining",
     "pretraining_epochs",
     "supcon_temperature",
@@ -56,6 +57,7 @@ DISPLAY_PARAMETER_ORDER = [
 DISPLAY_COLUMN_NAMES = {
     "Test Datasets": "TestSets",
     "loss_function": "LossFun",
+    "candidate_sets": "CandSets",
     "pretraining": "Pretrain",
     "pretraining_epochs": "PtEpochs",
     "supcon_temperature": "SupConTemp",
@@ -86,6 +88,7 @@ LOSS_TAGS = {
     "FOLLOSS": "focal_loss",
     "FOCALLOSS": "focal_loss",
     "POLOSS": "PolyCrEnr",
+    "CMLOSS": "custom_loss",
 }
 PRETRAINING_TAG_PATTERN = re.compile(
     r"_(?P<tag>SupConPtE|PretrainE)(?P<pretraining_epochs>\d+)T(?P<supcon_temperature>[0-9.eE+-]+)(?=_)"
@@ -320,6 +323,7 @@ def _parse_cnn_stem(stem: str) -> dict[str, str]:
         if loss_tag in tokens:
             parsed["loss_function"] = loss_function
             tokens = [token for token in tokens if token != loss_tag]
+    tokens = [token for token in tokens if token != "CS"]
     if len(tokens) >= 2:
         parsed["split"] = tokens[-2]
         parsed["dataset"] = tokens[-1]
@@ -394,6 +398,7 @@ def _checkpoint_model_parameters(checkpoint_path: str) -> dict[str, str]:
             model_name = "CNN"
     _set_if_present(parsed, "model", model_name)
     _set_if_present(parsed, "loss_function", payload.get("loss_function"), training_args.get("loss_function"))
+    _set_if_present(parsed, "candidate_sets", training_args.get("candidate_sets"))
     _set_if_present(parsed, "combine_loss", payload.get("combine_loss"), training_args.get("combine_loss"))
     _set_if_present(
         parsed,

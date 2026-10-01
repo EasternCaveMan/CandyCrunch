@@ -5,9 +5,10 @@ import random
 from pathlib import Path
 import numpy as np
 import torch
-from candycrunch.losses import ClassAwareContrastiveBatchSampler, FocalLoss, SupConLoss, custom_loss, xyz_loss
+from candycrunch.losses import CandidateSetLoss, ClassAwareContrastiveBatchSampler, FocalLoss, SupConLoss, custom_loss, xyz_loss
 from glycowork.ml.models import init_weights
-from glycowork.ml.model_training import training_setup, Poly1CrossEntropyLoss
+from glycowork.ml.model_training import training_setup
+from glycowork.motif.graph import compare_glycans
 from memmap_dataset import ensure_memmap_cache
 from memory_utils import report_process_tree_memory
 import pandas as pd
@@ -137,6 +138,18 @@ def main(args):
     glycan_indices = {glycan: index for index, glycan in enumerate(glycans)}
     y_train = np.fromiter((glycan_indices[glycan] for glycan in y_train),dtype=np.int64,count=len(y_train))
     y_test = np.fromiter((glycan_indices[glycan] for glycan in y_test),dtype=np.int64,count=len(y_test))
+    # Ambiguous labels (Gal(b1-3/4)GlcNAc, Hex, floating parts) also accept every more specific class: cand_mask[i, j] is True if class j is class i or a more specific version of it
+    cand_mask = torch.eye(len(glycans), dtype=torch.bool)
+    if args.candidate_sets:
+        comp_groups = {}
+        for index, composition in enumerate(composition_vectors):
+            comp_groups.setdefault(composition.tobytes(), []).append(index)
+        for group in comp_groups.values():
+            for i in group:
+                for j in group:
+                    if i != j and compare_glycans(glycans[i], glycans[j], subsumes=True):
+                        cand_mask[i, j] = True
+        print(f"Candidate sets: {int((cand_mask.sum(dim=1) > 1).sum())} ambiguous classes also accept more specific classes")
 
     # ## For SimpleDataset and TransDataset and deactivate for MemmapSpectrumDataset
     # X_train = [(*sample[:3], composition_vectors[target], *sample[4:]) for sample, target in zip(X_train, y_train, strict=True)]
@@ -198,7 +211,7 @@ def main(args):
             loader_kwargs.update(
                 batch_size=256,
                 shuffle=shuffle,
-                drop_last=True,
+                drop_last=shuffle,
                 generator=generator,
             )
         else:
@@ -262,6 +275,8 @@ def main(args):
         embs = embs.loc[:, ~embs.T.reset_index().duplicated().to_numpy()]
         embs = (embs.apply(pd.to_numeric,errors="coerce").fillna(0).astype(np.float32))
         dist = pairwise_distances(embs,metric="cosine")
+        # The structural distance to an ambiguous label is the distance to its closest candidate
+        dist = np.stack([dist[row].min(axis=0) for row in cand_mask.numpy()])
         dist = dist * 1000 * 20
         dist2 = torch.as_tensor(dist, dtype=torch.float32, device=device)
         comps = [glycan_to_composition(k)for k in glycans]
@@ -274,7 +289,7 @@ def main(args):
     # Model
     # ============================================================
     print("Preparing the model")
-    loss_tag = LOSS_TAGS.get(args.loss_function, "")
+    loss_tag = LOSS_TAGS.get(args.loss_function, "") + ("_CS" if args.candidate_sets else "")
     pretraining_tag = (f"_SupConPtE{args.pretraining_epochs}T{args.supcon_temperature}" if args.pretraining else "")
     combine_loss_tag = (f"_CombSupConW{args.contrastive_loss_weight:g}T{args.supcon_temperature:g}" if args.combine_loss else "")
     if args.model == "CNN":
@@ -361,24 +376,25 @@ def main(args):
     # ============================================================
     def make_finetuning_criterion():
         if args.loss_function == "cross_entropy":
-            return torch.nn.CrossEntropyLoss().to(device)
+            return CandidateSetLoss(cand_mask,epsilon=0,label_smoothing=0).to(device)
         if args.loss_function == "focal_loss":
-            return FocalLoss(gamma=args.focal_gamma).to(device)
+            return FocalLoss(gamma=args.focal_gamma,cand_mask=cand_mask).to(device)
         if args.loss_function == "PolyCrEnr":
-            return Poly1CrossEntropyLoss(num_classes=len(glycans),epsilon=1,reduction="mean").to(device)
+            return CandidateSetLoss(cand_mask).to(device)
         if args.loss_function == "xyz_loss":
-            return xyz_loss(composition_vectors).to(device)
+            return xyz_loss(composition_vectors,cand_mask=cand_mask).to(device)
         if args.loss_function == "custom_loss":
-            primary_loss = Poly1CrossEntropyLoss(num_classes=len(glycans),epsilon=1,reduction="mean").to(device)
-            return custom_loss(primary_loss,dist2,dist3).to(device)
+            return custom_loss(CandidateSetLoss(cand_mask),dist2,dist3).to(device)
         raise ValueError(f"Unknown fine-tuning loss_function={args.loss_function!r}.")
 
     wandb.init(
         project="CandyCrunch_3",
         entity=("vahid-atabaigielmi-university-of-gothenburg"),name=setting_name,save_code=True)
+    # Runs with several seeds share one setting_name, so each seed gets its own folder instead of overwriting the previous seed's checkpoint and metrics
+    model_dir = Path("./models") if len(args.random_seeds) == 1 else Path("./models") / f"seed{args.current_seed}"
     if args.pretraining:
         pretrain_optimizer, pretrain_scheduler, _ = make_training_components(model)
-        pretrain_criterion = SupConLoss(temperature=args.supcon_temperature).to(device)
+        pretrain_criterion = SupConLoss(temperature=args.supcon_temperature,cand_mask=cand_mask).to(device)
         pretrain_metadata = dict(checkpoint_metadata)
         pretrain_metadata["setting_name"] = pretrain_setting_name
         pretrain_metadata["loss_function"] = "supcon"
@@ -388,13 +404,13 @@ def main(args):
         pretrain_metadata["training_args"]["loss_function"] = "supcon"
         pretrain_metadata["training_args"]["fine_tune_loss_function"] = args.loss_function
         print("Start SupCon pretraining")
-        pretrain_model_dir = Path("./models") / "pretrained"
+        pretrain_model_dir = model_dir / "pretrained"
         model = train_model(model,pretrain_dataloaders,pretrain_criterion,pretrain_optimizer,pretrain_scheduler,glycans,
             num_epochs=args.pretraining_epochs,patience=args.pretraining_patience if args.pretraining_patience is not None else args.patience,
             model_type=args.model,setting_name=pretrain_setting_name,transformer_moe_aux_loss_weight=args.transformer_moe_aux_loss_weight,
             classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=pretrain_metadata,
             memory_reporter=memory_reporter,glycan_compositions=glycan_compositions,save_dir=pretrain_model_dir,
-            wandb_prefix="pretrain")
+            wandb_prefix="pretrain",cand_mask=cand_mask)
         pretrain_model_path = pretrain_model_dir / f"CandyCrunch_{pretrain_setting_name}.pt"
         checkpoint = torch.load(pretrain_model_path,map_location=device)
         model.load_state_dict(checkpoint["state_dict"])
@@ -404,7 +420,7 @@ def main(args):
 
     optimizer_ft, scheduler, _ = make_training_components(model)
     criterion = make_finetuning_criterion()
-    contrastive_criterion = SupConLoss(temperature=args.supcon_temperature).to(device) if args.combine_loss else None
+    contrastive_criterion = SupConLoss(temperature=args.supcon_temperature,cand_mask=cand_mask).to(device) if args.combine_loss else None
     print("Fine-tuning loss:", args.loss_function)
     if args.combine_loss:
         print(
@@ -424,7 +440,8 @@ def main(args):
         patience=args.patience,model_type=args.model,setting_name=setting_name, transformer_moe_aux_loss_weight=args.transformer_moe_aux_loss_weight,
         classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=checkpoint_metadata,
         memory_reporter=memory_reporter,glycan_compositions=glycan_compositions,
-        contrastive_criterion=contrastive_criterion,contrastive_loss_weight=args.contrastive_loss_weight)
+        contrastive_criterion=contrastive_criterion,contrastive_loss_weight=args.contrastive_loss_weight,
+        save_dir=model_dir,cand_mask=cand_mask)
     wandb.finish()
 # ================================================================
 # Command-line interface
@@ -445,6 +462,9 @@ if __name__ == "__main__":
         help="Fine-tuning loss: custom_loss (default), xyz_loss, cross_entropy, PolyCrEnr, or focal_loss.")
     parser.add_argument("--focal_gamma",type=float,default=2.0,
         help="Non-negative focal-loss focusing exponent; 0 gives standard cross-entropy (default: 2).")
+    parser.add_argument("--candidate-sets","--candidate_sets",dest="candidate_sets",action=argparse.BooleanOptionalAction,default=True,
+        help=("Let ambiguous labels (e.g., Gal(b1-3/4)GlcNAc) also accept every more specific class in all losses and metrics "
+              "(default: True; --no-candidate-sets trains on single-class targets)."))
     parser.add_argument("--pretraining",type=str_to_bool,nargs="?",const=True,default=False,
         help="If True, run SupCon pretraining first, then fine-tune with --loss_function (default: False).")
     parser.add_argument("--combine-loss",type=str_to_bool,nargs="?",const=True,default=False,

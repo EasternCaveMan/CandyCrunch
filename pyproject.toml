@@ -18,14 +18,13 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "glycowork[ml]>=1.9.0",
+    "glycowork[ml]>=1.10.2",
     "requests",
     "regex",
     "networkx",
     "scipy",
     "torch~=2.1",
     "pytorch-focalloss>=1.2.0,<2",
-    "torchmetrics",
     "numpy_indexed",
     "seaborn",
     "pandas",
@@ -33,7 +32,6 @@ dependencies = [
     "pymzml", 
     "pyteomics",
     "lxml",
-    "torchvision",
     "openpyxl",
     "tabulate",
     "matplotlib",

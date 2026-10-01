@@ -1,13 +1,11 @@
 
 from torch import flatten
 import torch.nn.functional as F
-from torchvision import transforms
 import torch.nn as nn
 import copy
 import json
 import random
 from pathlib import Path
-from functools import partial
 import numpy as np
 import torch
 import inspect
@@ -34,21 +32,16 @@ def new_peak_addition(array, n_noise_peaks, max_noise_intensity):
   return noisy_array
 
 
-transform_mz = transforms.Compose([
-  partial(remove_low_intensity_peaks, removal_threshold = 0.008, removal_percentage = 0.1),
-  partial(peak_intensity_jitter, augment_intensity = 0.25),
-  partial(new_peak_addition, n_noise_peaks = 10, max_noise_intensity = 0.005)
-])
+def transform_mz(x):
+  return new_peak_addition(peak_intensity_jitter(remove_low_intensity_peaks(x, removal_threshold = 0.008, removal_percentage = 0.1),
+                                                 augment_intensity = 0.25), n_noise_peaks = 10, max_noise_intensity = 0.005)
 
 
 def rt_jitter(RT):
   return max(0, RT + random.uniform(-0.1, 0.1))
 
 
-transform_rt = transforms.Compose([
-    rt_jitter
-])
-
+transform_rt = rt_jitter
 
 
 class MemmapSpectrumDataset(torch.utils.data.Dataset):

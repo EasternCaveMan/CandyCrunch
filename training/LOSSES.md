@@ -50,6 +50,26 @@ python training_script.py --dataset OP20260908 --split GShS --model CNN \
 uses SupCon before classification fine-tuning, and the second uses SupCon inside
 the fine-tuning objective.
 
+## Ambiguous labels (candidate sets)
+
+Many classes leave linkages, monosaccharides or substituent positions open
+(`Gal(b1-3/4)GlcNAc`, `Hex`, `GalOS`, floating `{Fuc(a1-?)}`). With
+`--candidate-sets` (the default), the training script marks for every class the
+classes that are the same glycan or a more specific version of it
+(`compare_glycans(..., subsumes=True)` from glycowork, within each composition).
+Every loss then treats an ambiguous label as satisfied by probability on any of
+them: `CandidateSetLoss` (used by `custom_loss`, `PolyCrEnr`, and
+`cross_entropy`) scores the summed probability of the candidates, `focal_loss`
+and `xyz_loss` fold the candidates into the target logit before their usual
+computation, the structure-distance term of `custom_loss` uses the closest
+candidate, and SupCon treats such pairs as neither positives nor negatives.
+Unambiguous labels keep a single target, so the model is still pushed towards
+the most specific class a spectrum supports, and ambiguous classes remain
+ordinary outputs. Accuracy, top-k, F1 and MCC count a candidate as a hit, so
+they are not comparable to runs without candidate sets. These runs carry a
+`_CS` filename tag. `--no-candidate-sets` restores single-class targets and is
+identical to the previous behaviour. Inference is unchanged.
+
 ## Classification loss options
 
 Add one of these options to an existing `training_script.py` command:
