@@ -9,7 +9,6 @@ from candycrunch.losses import CandidateSetLoss, ClassAwareContrastiveBatchSampl
 from glycowork.ml.models import init_weights
 from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
-from memmap_dataset import ensure_memmap_cache
 from memory_utils import report_process_tree_memory
 import pandas as pd
 import wandb
@@ -83,20 +82,8 @@ def main(args):
     # Load data
     # ============================================================
     dataset_dir = Path(f"./prepared_datasets_{args.dataset}")
-    train_feature_path = dataset_dir / f"X_train_{args.split}.pkl"
-    val_feature_path = dataset_dir / f"X_test_{args.split}.pkl"
-    train_cache = ensure_memmap_cache(
-        train_feature_path,
-        dataset_dir / ".candycrunch_memmap" / f"train_{args.split}",
-        args.model,
-        memory_reporter=memory_reporter,
-    )
-    val_cache = ensure_memmap_cache(
-        val_feature_path,
-        dataset_dir / ".candycrunch_memmap" / f"val_{args.split}",
-        args.model,
-        memory_reporter=memory_reporter,
-    )
+    train_cache = dataset_dir / f"train_{args.split}"
+    val_cache = dataset_dir / f"test_{args.split}"
 
     # with open(dataset_dir / f"X_train_{args.split}.pkl", "rb") as file:
     #     X_train = pickle.load(file)

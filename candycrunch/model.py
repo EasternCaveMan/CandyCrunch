@@ -55,9 +55,11 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
             raise ValueError("repeats must be a positive integer.")
         self.cache_dir = str(cache_dir) if cache_dir is not None else None
         self._arrays = None
+        self.manifest = None
         if arrays is None:
             with (Path(cache_dir) / "manifest.json").open() as file:
-                sample_count = json.load(file)["samples"]
+                self.manifest = json.load(file)
+            sample_count = self.manifest["samples"]
         else:
             array_names = ["metadata", "sample_compositions"]
             array_names.extend(["binned_intensities", "mz_remainder"] if model_type == "CNN" else ["peak_list"])
@@ -93,15 +95,9 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
     def _open_arrays(self):
         if self._arrays is not None:
             return self._arrays
-        cache_dir = Path(self.cache_dir)
-        arrays = {"metadata": np.load(cache_dir / "metadata.npy", mmap_mode="r")}
-        if self.model_type == "CNN":
-            arrays["binned_intensities"] = np.load(cache_dir / "binned_intensities.npy", mmap_mode="r")
-            arrays["mz_remainder"] = np.load(cache_dir / "mz_remainder.npy", mmap_mode="r")
-        else:
-            arrays["peak_list"] = np.load(cache_dir / "peak_list.npy", mmap_mode="r")
-        self._arrays = arrays
-        return arrays
+        names = ["bin_offsets", "bin_index", "bin_intensity", "bin_remainder"] if self.model_type == "CNN" else ["peak_offsets", "peak_mz", "peak_intensity"]
+        self._arrays = {name: np.load(Path(self.cache_dir) / f"{name}.npy", mmap_mode="r") for name in ["metadata", *names]}
+        return self._arrays
 
     def __getitem__(self, index):
         index = index // self.repeats
@@ -114,7 +110,17 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
         if self.transform_rt is not None:
             retention_time = self.transform_rt(retention_time)
         if self.model_type == "CNN":
-            mz = np.asarray(arrays["binned_intensities"][index])
+            if self.manifest is None:
+                mz = np.asarray(arrays["binned_intensities"][index])
+                mz_remainder = arrays["mz_remainder"][index]
+            else:
+                # Training stores keep only occupied bins (float16 intensities, m/z remainders as uint16 fractions of a bin), densified here
+                start, end = arrays["bin_offsets"][index], arrays["bin_offsets"][index + 1]
+                occupied = arrays["bin_index"][start:end]
+                mz = np.zeros(self.manifest["num_bins"], dtype=np.float32)
+                mz[occupied] = arrays["bin_intensity"][start:end]
+                mz_remainder = np.zeros(self.manifest["num_bins"], dtype=np.float32)
+                mz_remainder[occupied] = arrays["bin_remainder"][start:end] * self.manifest["remainder_scale"]
             if self.transform_mz is not None:
                 mz = self.transform_mz(np.copy(mz))
 
@@ -129,8 +135,15 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
         if self.model_type == "CNN":
             return (torch.tensor(mz, dtype=torch.float32),
                     torch.empty(0, dtype=torch.float32),
-                    torch.tensor(arrays["mz_remainder"][index], dtype=torch.float32),*shared)
-        peak_list = arrays["peak_list"][index]
+                    torch.tensor(mz_remainder, dtype = torch.float32), *shared)
+            if self.manifest is None:
+                peak_list = arrays["peak_list"][index]
+            else:
+                # Training stores keep only the real m/z-sorted peaks, so the zero padding is restored here
+                start, end = arrays["peak_offsets"][index], arrays["peak_offsets"][index + 1]
+                peak_list = np.zeros((self.manifest["peak_list_length"], 2), dtype = np.float32)
+                peak_list[:end - start, 0] = arrays["peak_mz"][start:end]
+                peak_list[:end - start, 1] = arrays["peak_intensity"][start:end]
         if self.max_peaks is not None:
             # Peak lists are sorted by m/z, so keep the most intense peaks (in m/z order, padding last), as spectrum_to_peak_list does at inference
             peak_list = peak_list[np.sort(np.argsort(-peak_list[:, 1], kind="stable")[: self.max_peaks])]

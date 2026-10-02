@@ -22,6 +22,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from glycowork.motif.tokenization import glycan_to_composition, get_stem_lib
 from glycowork.motif.processing import canonicalize_composition
 import hashlib
+import json
 import ast
 import gc
 import argparse
@@ -275,6 +276,28 @@ def downcast_numeric(df):
 
 def tupleify(df, columns):
     return list(df[list(columns)].itertuples(index=False, name=None))
+
+def write_spectrum_store(df, output_dir, num_bins=2048, bin_width=(3000.0 - 39.714) / 2047):
+    """writes spectra sparsely for training: only occupied bins (float16 intensities, m/z remainders as uint16 fractions of a bin) and real peaks (float32), ~20x smaller than dense features with unchanged CandyCrunch predictions"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bins, peaks = [], []
+    for binned, mz_remainder, peak_list in zip(df["binned_intensities"], df["mz_remainder"], df["peak_list"]):
+        occupied = np.flatnonzero((binned > 0) | (mz_remainder > 0))
+        bins.append((occupied, binned[occupied], mz_remainder[occupied]))
+        peaks.append(peak_list[peak_list[:, 0] > 0])
+    arrays = {"metadata": df[["glycan_type", "RT", "mode", "lc", "modification", "trap"]].to_numpy(dtype=np.float32),
+              "bin_offsets": np.cumsum([0] + [len(b[0]) for b in bins], dtype=np.int64),
+              "bin_index": np.concatenate([b[0] for b in bins]).astype(np.uint16),
+              "bin_intensity": np.concatenate([b[1] for b in bins]).astype(np.float16),
+              "bin_remainder": np.round(np.clip(np.concatenate([b[2] for b in bins]) / bin_width, 0, 1) * 65535).astype(np.uint16),
+              "peak_offsets": np.cumsum([0] + [len(p) for p in peaks], dtype=np.int64),
+              "peak_mz": np.concatenate([p[:, 0] for p in peaks]).astype(np.float32),
+              "peak_intensity": np.concatenate([p[:, 1] for p in peaks]).astype(np.float32)}
+    for name, values in arrays.items():
+        np.save(output_dir / f"{name}.npy", values)
+    with (output_dir / "manifest.json").open("w") as file:
+        json.dump({"samples": len(df), "num_bins": num_bins, "remainder_scale": bin_width / 65535,
+                   "peak_list_length": len(df["peak_list"].iloc[0]), "arrays": list(arrays)}, file, indent=2)
 
 
 def gpu_cosine_similarity_unique(matrix, ids, output_file, batch_size = 3482, desc = "Computing similarity"):
@@ -785,15 +808,10 @@ def main(args):
     print("Random Group-shuffle-split")
     train_df_GShS = downcast_numeric(train_df_GShS)
     test_df_GShS = downcast_numeric(test_df_GShS)
-    X_train_GShS = tupleify(train_df_GShS, FEATURE_COLUMNS)
-    X_test_GShS = tupleify(test_df_GShS, FEATURE_COLUMNS)
+    write_spectrum_store(train_df_GShS, output_dir / "train_GShS")
+    write_spectrum_store(test_df_GShS, output_dir / "test_GShS")
     y_train_GShS = train_df_GShS["glycan"].tolist()
     y_test_GShS = test_df_GShS["glycan"].tolist()
-
-    with open(output_dir / "X_train_GShS.pkl", "wb") as fh:
-        pickle.dump(X_train_GShS, fh)
-    with open(output_dir / "X_test_GShS.pkl", "wb") as fh:
-        pickle.dump(X_test_GShS, fh)
     with open(output_dir / "y_train_GShS.pkl", "wb") as fh:
         pickle.dump(y_train_GShS, fh)
     with open(output_dir / "y_test_GShS.pkl", "wb") as fh:
