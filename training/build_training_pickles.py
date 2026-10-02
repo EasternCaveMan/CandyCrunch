@@ -32,7 +32,7 @@ test_size = 0.20
 random_state = 42
 
 MODE_MAP = {"negative": 0, "positive": 1}
-LC_MAP = {"PGC": 0, "C18": 1}
+LC_MAP = {"pgc": 0, "c18": 1}
 MOD_MAP = {"reduced": 0, "permethylated": 1}
 TRAP_MAP = {"linear": 0, "orbitrap": 1, "amazon": 2}
 
@@ -164,31 +164,26 @@ def _spectrum_to_peak_list(spec, max_peaks=None, min_mz=None, max_mz=None):
     if total_intensity <= 0:
         return None
     peaks = sorted(peaks, key=lambda x: x[0])
-    while len(peaks) < max_peaks:
-        peaks.append((0.0, 0.0))
-
     return np.asarray(peaks, dtype=np.float32)
 
 def _process_peaks(df, min_mz=39.714, max_mz=3000.0, bin_num=2048, max_peaks=2048):
     frames = np.linspace(min_mz, max_mz, bin_num)
-    parsed = df["peak_d"].map(_safe_peak_parse)
-    parsed = parsed.map(lambda spec: None if spec is None else _normalise_spectrum(spec))
-    keep_mask = parsed.notnull()
-    df = df.loc[keep_mask].copy()
-    parsed = parsed.loc[keep_mask]
-    binned, remainders = zip(*(bin_intensities(spec, frames) for spec in parsed))
-
-    peak_lists = parsed.map(lambda spec: _spectrum_to_peak_list( spec, max_peaks=max_peaks, min_mz=min_mz, max_mz=max_mz,))
-    keep_mask = peak_lists.notnull()
-    df = df.loc[keep_mask].copy()
-    binned = [vec for vec, keep in zip(binned, keep_mask) if keep]
-    remainders = [vec for vec, keep in zip(remainders, keep_mask) if keep]
-    peak_lists = peak_lists.loc[keep_mask]
-
-    df["binned_intensities"] = [np.asarray(vec, dtype=np.float32) for vec in binned]
-    df["mz_remainder"] = [np.asarray(vec, dtype=np.float32) for vec in remainders]
-    df["peak_list"] = [np.asarray(vec, dtype=np.float32) for vec in peak_lists]
-
+    bin_width = (max_mz - min_mz) / (bin_num - 1)
+    # One spectrum at a time straight to sparse features (occupied bins: float16 intensities, m/z remainders as uint16 fractions of a bin; real peaks only), so parsed dicts and dense arrays never pile up and 500k spectra fit in laptop RAM
+    rows = []
+    for peak_d in df["peak_d"]:
+        spec = _safe_peak_parse(peak_d)
+        spec = None if spec is None else _normalise_spectrum(spec)
+        peak_list = None if spec is None else _spectrum_to_peak_list(spec, max_peaks=max_peaks, min_mz=min_mz, max_mz=max_mz)
+        if peak_list is None:
+            rows.append(None)
+            continue
+        binned, mz_remainder = bin_intensities(spec, frames)
+        occupied = np.flatnonzero((binned > 0) | (mz_remainder > 0))
+        rows.append((occupied.astype(np.uint16), binned[occupied].astype(np.float16),
+                     np.round(np.clip(mz_remainder[occupied] / bin_width, 0, 1) * 65535).astype(np.uint16), peak_list))
+    df = df.loc[[row is not None for row in rows]].copy()
+    df["bin_index"], df["bin_intensity"], df["bin_remainder"], df["peak_list"] = [list(column) for column in zip(*(row for row in rows if row is not None))]
     return df
 
 def _process_retention_times(df):
@@ -244,7 +239,7 @@ def _attach_metadata(df, checklist):
         if column in df.columns:
             values = df[column]
         else:
-            values = pd.Series(np.nan, index=df.index)
+            values = pd.Series(np.nan, index = df.index, dtype = object)
 
         values = fill_from_checklist(df["GlycoPost_ID"], values, source_dict)
         return values.map(lambda x: lookup(mapping, x, fallback)).astype(int)
@@ -277,27 +272,22 @@ def downcast_numeric(df):
 def tupleify(df, columns):
     return list(df[list(columns)].itertuples(index=False, name=None))
 
-def write_spectrum_store(df, output_dir, num_bins=2048, bin_width=(3000.0 - 39.714) / 2047):
-    """writes spectra sparsely for training: only occupied bins (float16 intensities, m/z remainders as uint16 fractions of a bin) and real peaks (float32), ~20x smaller than dense features with unchanged CandyCrunch predictions"""
+def write_spectrum_store(df, output_dir, num_bins=2048, bin_width=(3000.0 - 39.714) / 2047, peak_list_length=2048):
+    """concatenates the sparse spectra from _process_peaks into one training store (occupied bins with float16 intensities and m/z remainders as uint16 fractions of a bin, real peaks in float32), ~20x smaller than dense features with unchanged CandyCrunch predictions"""
     output_dir.mkdir(parents=True, exist_ok=True)
-    bins, peaks = [], []
-    for binned, mz_remainder, peak_list in zip(df["binned_intensities"], df["mz_remainder"], df["peak_list"]):
-        occupied = np.flatnonzero((binned > 0) | (mz_remainder > 0))
-        bins.append((occupied, binned[occupied], mz_remainder[occupied]))
-        peaks.append(peak_list[peak_list[:, 0] > 0])
     arrays = {"metadata": df[["glycan_type", "RT", "mode", "lc", "modification", "trap"]].to_numpy(dtype=np.float32),
-              "bin_offsets": np.cumsum([0] + [len(b[0]) for b in bins], dtype=np.int64),
-              "bin_index": np.concatenate([b[0] for b in bins]).astype(np.uint16),
-              "bin_intensity": np.concatenate([b[1] for b in bins]).astype(np.float16),
-              "bin_remainder": np.round(np.clip(np.concatenate([b[2] for b in bins]) / bin_width, 0, 1) * 65535).astype(np.uint16),
-              "peak_offsets": np.cumsum([0] + [len(p) for p in peaks], dtype=np.int64),
-              "peak_mz": np.concatenate([p[:, 0] for p in peaks]).astype(np.float32),
-              "peak_intensity": np.concatenate([p[:, 1] for p in peaks]).astype(np.float32)}
+              "bin_offsets": np.cumsum([0, *df["bin_index"].map(len)], dtype=np.int64),
+              "bin_index": np.concatenate(df["bin_index"].tolist()),
+              "bin_intensity": np.concatenate(df["bin_intensity"].tolist()),
+              "bin_remainder": np.concatenate(df["bin_remainder"].tolist()),
+              "peak_offsets": np.cumsum([0, *df["peak_list"].map(len)], dtype=np.int64),
+              "peak_mz": np.concatenate([peaks[:, 0] for peaks in df["peak_list"]]),
+              "peak_intensity": np.concatenate([peaks[:, 1] for peaks in df["peak_list"]])}
     for name, values in arrays.items():
         np.save(output_dir / f"{name}.npy", values)
     with (output_dir / "manifest.json").open("w") as file:
         json.dump({"samples": len(df), "num_bins": num_bins, "remainder_scale": bin_width / 65535,
-                   "peak_list_length": len(df["peak_list"].iloc[0]), "arrays": list(arrays)}, file, indent=2)
+                   "peak_list_length": peak_list_length, "arrays": list(arrays)}, file, indent=2)
 
 
 def gpu_cosine_similarity_unique(matrix, ids, output_file, batch_size = 3482, desc = "Computing similarity"):
@@ -679,9 +669,9 @@ def split_one_glycan_group_with_datasail_max_peaks(
 
 def main(args):
     print("Loading condensed spectra")
-    full_dataset_path = Path(f"{args.dataset_name}20260929.pkl")
+    full_dataset_path = Path(args.dataset_path) if args.dataset_path else Path(f"{args.dataset_name}20260929.pkl")
     date = full_dataset_path.stem[-8:]
-    full_df = pd.read_pickle(full_dataset_path)
+    full_df = pd.read_excel(full_dataset_path) if full_dataset_path.suffix == ".xlsx" else pd.read_pickle(full_dataset_path)
     counts = []
     for x in full_df["peak_d"]:
         if pd.isna(x):
@@ -698,7 +688,7 @@ def main(args):
     full_df.drop(columns = ["n_keys"], inplace = True)
 
 
-    meta_df = pd.read_csv(metadata_path)
+    meta_df = pd.read_csv(args.metadata_path, encoding_errors="replace")
     processed = process_full_dataset(full_df, meta_df)
     frames = [processed]
     combined = pd.concat(frames, ignore_index=True)
@@ -792,10 +782,10 @@ def main(args):
         )
         combined.reset_index(drop = True, inplace = True)
     else:
-        output_dir = Path(f"prepared_datasets_{args.dataset_name}{date}")
+        output_dir = Path(f"prepared_datasets_{full_dataset_path.stem}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    glycansGT_input.to_csv(output_dir/f"glycansGT_input_{args.dataset_name}{date}.csv", index=False)
+    glycansGT_input.to_csv(output_dir/f"glycansGT_input_{full_dataset_path.stem}.csv", index=False)
 
 ########################################################################################################################
     # Random Group-shuffle-split
@@ -1061,7 +1051,11 @@ def main(args):
     print(f"Saved processed datasets to {output_dir.resolve()}")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = 'Data Processing')
-    parser.add_argument('--dataset_name', type = str, required = True, choices = ["full", "HC","XPF","GMS","OP","OPS","DSXXX"])
+    parser.add_argument('--dataset_name', type = str, required = False, choices = ["full", "HC","XPF","GMS","OP","OPS","DSXXX"])
+    parser.add_argument('--dataset_path', type = str, required = False, default = None,
+                        help = "spectra table (.xlsx or .pkl) with peak_d, RT, glycan, filename, GlycoPost_ID; overrides --dataset_name, output goes to prepared_datasets_<file stem>")
+    parser.add_argument('--metadata_path', type = str, required = False, default = metadata_path,
+                        help = "checklist csv mapping GlycoPOST_ID to LC_type, mode, modification, trap")
     # parser.add_argument('--nclusters', type = int, required = False, default = 5)
     parser.add_argument("--downsampling", action="store_true",
                         help=("down_sampling or not."))

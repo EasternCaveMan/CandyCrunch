@@ -136,14 +136,14 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
             return (torch.tensor(mz, dtype=torch.float32),
                     torch.empty(0, dtype=torch.float32),
                     torch.tensor(mz_remainder, dtype = torch.float32), *shared)
-            if self.manifest is None:
-                peak_list = arrays["peak_list"][index]
-            else:
-                # Training stores keep only the real m/z-sorted peaks, so the zero padding is restored here
-                start, end = arrays["peak_offsets"][index], arrays["peak_offsets"][index + 1]
-                peak_list = np.zeros((self.manifest["peak_list_length"], 2), dtype = np.float32)
-                peak_list[:end - start, 0] = arrays["peak_mz"][start:end]
-                peak_list[:end - start, 1] = arrays["peak_intensity"][start:end]
+        if self.manifest is None:
+            peak_list = arrays["peak_list"][index]
+        else:
+            # Training stores keep only the real m/z-sorted peaks, so the zero padding is restored here
+            start, end = arrays["peak_offsets"][index], arrays["peak_offsets"][index + 1]
+            peak_list = np.zeros((self.manifest["peak_list_length"], 2), dtype = np.float32)
+            peak_list[:end - start, 0] = arrays["peak_mz"][start:end]
+            peak_list[:end - start, 1] = arrays["peak_intensity"][start:end]
         if self.max_peaks is not None:
             # Peak lists are sorted by m/z, so keep the most intense peaks (in m/z order, padding last), as spectrum_to_peak_list does at inference
             peak_list = peak_list[np.sort(np.argsort(-peak_list[:, 1], kind="stable")[: self.max_peaks])]
