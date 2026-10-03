@@ -344,7 +344,7 @@ def calculate_metrics_sklearn_from_classes(
 def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epochs=None,
                 patience=None,log_to_wandb=True,num_classes=None,model_type=None,setting_name=None,
                 transformer_moe_aux_loss_weight=0.0,classifier_moe_aux_loss_weight=0.0,checkpoint_metadata=None,
-                memory_reporter=None,glycan_compositions=None,save_dir="./models",wandb_prefix=None,
+                glycan_compositions=None,save_dir="./models",wandb_prefix=None,
                 contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,):
     """
     Train a CNN or Transformer with SAM.
@@ -475,8 +475,7 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
     if contrastive_enabled:
         print("Fine-tuning contrastive loss enabled:", contrastive_criterion.__class__.__name__)
         print("Fine-tuning contrastive-loss weight:", contrastive_loss_weight)
-    if memory_reporter is not None:
-        memory_reporter("before first epoch")
+
     # ============================================================
     # Training loop
     # ============================================================
@@ -749,8 +748,6 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
                 train_losses.append(epoch_loss)
                 train_acc.append(epoch_acc)
             torch.cuda.empty_cache()
-            if memory_reporter is not None:
-                memory_reporter(f"epoch {epoch + 1} {phase}")
         # ============================================================
         # Early stopping
         # ============================================================
