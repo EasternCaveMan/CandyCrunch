@@ -221,9 +221,10 @@ def _attach_metadata(df, checklist):
     df["trap"] = map_metadata("trap", trap_dict, TRAP_MAP, 3)
     return df
 
-def process_full_dataset(full_df, checklist):
+def process_full_dataset(full_df, checklist,dataset_name=None):
     df = _process_retention_times(full_df)
-    df = _infer_glycan_types(df)
+    if dataset_name != "PreOP":
+        df = _infer_glycan_types(df)
     df = _process_peaks(df)
     df = _attach_metadata(df, checklist)
     return df
@@ -237,9 +238,6 @@ def downcast_numeric(df):
     for col in float_cols:
         result[col] = pd.to_numeric(result[col], downcast="float")
     return result
-
-def tupleify(df, columns):
-    return list(df[list(columns)].itertuples(index=False, name=None))
 
 def write_spectrum_store(df, output_dir, num_bins=2048, bin_width=(3000.0 - 39.714) / 2047, peak_list_length=2048):
     """concatenates the sparse spectra from _process_peaks into one training store (occupied bins with float16 intensities and m/z remainders as uint16 fractions of a bin, real peaks in float32), ~20x smaller than dense features with unchanged CandyCrunch predictions"""
@@ -645,7 +643,7 @@ def main(args):
 
 
     meta_df = pd.read_csv(args.metadata_path, encoding_errors="replace")
-    processed = process_full_dataset(full_df, meta_df)
+    processed = process_full_dataset(full_df, meta_df, dataset_name=args.dataset_name)
     frames = [processed]
     combined = pd.concat(frames, ignore_index=True)
     del full_df
@@ -661,201 +659,218 @@ def main(args):
     print(f"Total rows: {total_count}")
     print(f"Rows with NaN in filename: {nan_count}")
     combined = combined.dropna(subset=["filename"])
-    combined = filter_data_exceptions_v1(combined)
-    combined.reset_index(drop=True, inplace=True)
-    # glycans = sorted(set(combined["glycan"]))
-    combined["glycan_comp"] = combined["glycan"].apply(iupac_to_composition_string)
-    combined.sort_values(by="glycan", inplace=True)
-    combined.reset_index(drop=True, inplace=True)
-    glycans = combined[["glycan", "glycan_comp"]].drop_duplicates().reset_index(drop=True)
-    glycan_dict = dict(zip(glycans, range(len(glycans))))
-    combined["glycan_ids"] = "GID" + combined["glycan"].map(glycan_dict).astype(str)
-    glycansGT_input = combined[["glycan", "glycan_ids"]]
-    print("saved")
-    print(f"Total unique glycan composition: {len(glycans["glycan_comp"].unique())}")
 
-    if args.downsampling:
-        policy_tag = {"sqrt": "S", "log2": "L", "fraction": "F"}.get(args.keep_policy)
-        #output_dir = Path(f"prepared_datasets_DS{args.nclusters}{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}")
-        output_dir = Path(
-            f"prepared_datasets_DS{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}_{date}")
-        output_dir.mkdir(parents = True, exist_ok = True)
-
-        # combined = downsample_representative_spectra(
-        #     combined,
-        #     group_cols=["glycan", "mode", "lc", "modification", "trap", "precursor_charge"],
-        #     keep_policy="sqrt",
-        #     min_keep=1,
-        #     keep_scale=7.0,
-        #     rel_intensity_min=0.005,
-        #     min_consensus_similarity=0.20,
-        #     mad_multiplier=2,
-        #     diversity_similarity=0.80,
-        #     report_prefix=output_dir / "representative_downsample",
-        #     verbose=True,
-        # )
-
-        # combined = downsample_representative_spectra_V2(
-        #     combined,
-        #     group_cols=("glycan",),
-        #     n_clusters=args.nclusters,
-        #     keep_policy=args.keep_policy,
-        #     keep_scale=args.keep_scale,
-        #     keep_fraction=args.keep_fraction,
-        #     rel_intensity_min=args.rel_intensity_min,
-        #     min_clean_peaks=args.min_clean_peaks,
-        #     random_state=42,
-        #     n_jobs=24,
-        #     parallel_backend="loky",
-        #     inner_threads=1,
-        #     report_prefix=output_dir / "representative_kmeans",
-        #     verbose=True,
-        # )
-
-        combined = downsample_representative_spectra_V3(
-            combined,
-            group_cols = ("glycan",),
-            k_min = 2,
-            k_max = 10,
-            silhouette_sample_size = 1000,
-            keep_policy = args.keep_policy,
-            keep_scale = args.keep_scale,
-            keep_fraction = args.keep_fraction,
-            rel_intensity_min = args.rel_intensity_min,
-            min_clean_peaks = args.min_clean_peaks,
-            random_state = 42,
-            n_jobs = 24,
-            parallel_backend = "loky",
-            inner_threads = 1,
-            report_prefix = output_dir / "representative_kmeans_silhouette",
-            verbose = True,
-        )
-        combined.reset_index(drop = True, inplace = True)
-    else:
+    if args.dataset_name == "PreOP":
         output_dir = Path(f"prepared_datasets_{full_dataset_path.stem}")
         output_dir.mkdir(parents=True, exist_ok=True)
+        combined = downcast_numeric(combined)
+        write_spectrum_store(combined, output_dir / "pretrain_data")
+        with open(output_dir / "pretrain_data.pkl", "wb") as fh:
+            pickle.dump(combined, fh)
+    elif args.dataset_name != "PreOP":
+        combined = filter_data_exceptions_v1(combined)
+        combined.reset_index(drop=True, inplace=True)
+        combined["glycan_comp"] = combined["glycan"].apply(iupac_to_composition_string)
+        combined.sort_values(by="glycan", inplace=True)
+        combined.reset_index(drop=True, inplace=True)
+        glycans = combined[["glycan", "glycan_comp"]].drop_duplicates().reset_index(drop=True)
+        glycan_dict = dict(zip(glycans, range(len(glycans))))
+        combined["glycan_ids"] = "GID" + combined["glycan"].map(glycan_dict).astype(str)
+        glycansGT_input = combined[["glycan", "glycan_ids"]]
 
-    glycansGT_input.to_csv(output_dir/f"glycansGT_input_{full_dataset_path.stem}.csv", index=False)
+        print("saved")
+        print(f"Total unique glycan composition: {len(glycans["glycan_comp"].unique())}")
+
+        if args.downsampling:
+            policy_tag = {"sqrt": "S", "log2": "L", "fraction": "F"}.get(args.keep_policy)
+            #output_dir = Path(f"prepared_datasets_DS{args.nclusters}{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}")
+            output_dir = Path(
+                f"prepared_datasets_DS{policy_tag}{args.keep_scale if policy_tag in ('S', 'L') else args.keep_fraction}_{date}")
+            output_dir.mkdir(parents = True, exist_ok = True)
+
+            # combined = downsample_representative_spectra(
+            #     combined,
+            #     group_cols=["glycan", "mode", "lc", "modification", "trap", "precursor_charge"],
+            #     keep_policy="sqrt",
+            #     min_keep=1,
+            #     keep_scale=7.0,
+            #     rel_intensity_min=0.005,
+            #     min_consensus_similarity=0.20,
+            #     mad_multiplier=2,
+            #     diversity_similarity=0.80,
+            #     report_prefix=output_dir / "representative_downsample",
+            #     verbose=True,
+            # )
+
+            # combined = downsample_representative_spectra_V2(
+            #     combined,
+            #     group_cols=("glycan",),
+            #     n_clusters=args.nclusters,
+            #     keep_policy=args.keep_policy,
+            #     keep_scale=args.keep_scale,
+            #     keep_fraction=args.keep_fraction,
+            #     rel_intensity_min=args.rel_intensity_min,
+            #     min_clean_peaks=args.min_clean_peaks,
+            #     random_state=42,
+            #     n_jobs=24,
+            #     parallel_backend="loky",
+            #     inner_threads=1,
+            #     report_prefix=output_dir / "representative_kmeans",
+            #     verbose=True,
+            # )
+
+            combined = downsample_representative_spectra_V3(
+                combined,
+                group_cols = ("glycan",),
+                k_min = 2,
+                k_max = 10,
+                silhouette_sample_size = 1000,
+                keep_policy = args.keep_policy,
+                keep_scale = args.keep_scale,
+                keep_fraction = args.keep_fraction,
+                rel_intensity_min = args.rel_intensity_min,
+                min_clean_peaks = args.min_clean_peaks,
+                random_state = 42,
+                n_jobs = 24,
+                parallel_backend = "loky",
+                inner_threads = 1,
+                report_prefix = output_dir / "representative_kmeans_silhouette",
+                verbose = True,
+            )
+            combined.reset_index(drop = True, inplace = True)
+
+
+
+        else:
+            output_dir = Path(f"prepared_datasets_{full_dataset_path.stem}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+
+
+        glycansGT_input.to_csv(output_dir / f"glycansGT_input_{full_dataset_path.stem}.csv", index=False)
+
+
 
 ########################################################################################################################
     # Random Group-shuffle-split
 # ########################################################################################################################
-    splitter = GroupShuffleSplit(test_size=test_size, n_splits=1, random_state=random_state)
-    train_idx, test_idx = next(splitter.split(combined, groups=combined["filename"]))
-    train_df_GShS = combined.iloc[train_idx].reset_index(drop=True)
-    test_df_GShS = combined.iloc[test_idx].reset_index(drop=True)
+        splitter = GroupShuffleSplit(test_size=test_size, n_splits=1, random_state=random_state)
+        train_idx, test_idx = next(splitter.split(combined, groups=combined["filename"]))
+        train_df_GShS = combined.iloc[train_idx].reset_index(drop=True)
+        test_df_GShS = combined.iloc[test_idx].reset_index(drop=True)
 
-    print("Random Group-shuffle-split")
-    train_df_GShS = downcast_numeric(train_df_GShS)
-    test_df_GShS = downcast_numeric(test_df_GShS)
-    write_spectrum_store(train_df_GShS, output_dir / "train_GShS")
-    write_spectrum_store(test_df_GShS, output_dir / "test_GShS")
-    y_train_GShS = train_df_GShS["glycan"].tolist()
-    y_test_GShS = test_df_GShS["glycan"].tolist()
-    with open(output_dir / "y_train_GShS.pkl", "wb") as fh:
-        pickle.dump(y_train_GShS, fh)
-    with open(output_dir / "y_test_GShS.pkl", "wb") as fh:
-        pickle.dump(y_test_GShS, fh)
-    with open(output_dir/"glycans.pkl", "wb") as fh:
-        pickle.dump(glycans, fh)
+        print("Random Group-shuffle-split")
+        train_df_GShS = downcast_numeric(train_df_GShS)
+        test_df_GShS = downcast_numeric(test_df_GShS)
+        write_spectrum_store(train_df_GShS, output_dir / "train_GShS")
+        write_spectrum_store(test_df_GShS, output_dir / "test_GShS")
+        y_train_GShS = train_df_GShS["glycan"].tolist()
+        y_test_GShS = test_df_GShS["glycan"].tolist()
+        with open(output_dir / "y_train_GShS.pkl", "wb") as fh:
+            pickle.dump(y_train_GShS, fh)
+        with open(output_dir / "y_test_GShS.pkl", "wb") as fh:
+            pickle.dump(y_test_GShS, fh)
+        with open(output_dir/"glycans.pkl", "wb") as fh:
+            pickle.dump(glycans, fh)
+
 
 # ########################################################################################################################
 #     # Random Group-similarity-split
 # ########################################################################################################################
 #
-#     print("Random Group-similarity-split with DataSAIL")
-#     train_parts_CNN = []
-#     test_parts_CNN = []
-#     train_parts_TRN = []
-#     test_parts_TRN = []
-#     for old_file in output_dir.glob("datasail_sim_glycan_*.tsv"):
-#         old_file.unlink()
+#         print("Random Group-similarity-split with DataSAIL")
+#         train_parts_CNN = []
+#         test_parts_CNN = []
+#         train_parts_TRN = []
+#         test_parts_TRN = []
+#         for old_file in output_dir.glob("datasail_sim_glycan_*.tsv"):
+#             old_file.unlink()
 #
-#     for glycan_name, group_df in combined.groupby("glycan", sort=False):
-#         print(f"Splitting glycan {glycan_name}: {len(group_df)} rows")
+#         for glycan_name, group_df in combined.groupby("glycan", sort=False):
+#             print(f"Splitting glycan {glycan_name}: {len(group_df)} rows")
 #
-#         train_part_CNN, test_part_CNN = split_one_glycan_group_with_datasail(
-#             group_df,
-#             glycan_name=glycan_name,
-#             test_size=test_size,
-#             random_state=random_state,
-#             output_dir=output_dir,
-#             batch_size=3482,
+#             train_part_CNN, test_part_CNN = split_one_glycan_group_with_datasail(
+#                 group_df,
+#                 glycan_name=glycan_name,
+#                 test_size=test_size,
+#                 random_state=random_state,
+#                 output_dir=output_dir,
+#                 batch_size=3482,
+#             )
+#
+#             train_part_TRN, test_part_TRN = split_one_glycan_group_with_datasail_max_peaks(
+#                 group_df,
+#                 glycan_name = glycan_name,
+#                 test_size = test_size,
+#                 random_state = random_state,
+#                 output_dir = output_dir,
+#             )
+#
+#             train_parts_CNN.append(train_part_CNN)
+#             test_parts_CNN.append(test_part_CNN)
+#             train_parts_TRN.append(train_part_TRN)
+#             test_parts_TRN.append(test_part_TRN)
+#
+#
+#         train_df_CGSiS = pd.concat(train_parts_CNN, ignore_index=True)
+#         test_df_CGSiS = pd.concat(test_parts_CNN, ignore_index=True)
+#
+#         train_df_TGSiS = pd.concat(train_parts_TRN, ignore_index=True)
+#         test_df_TGSiS = pd.concat(test_parts_TRN, ignore_index=True)
+#
+#         drop_temp_cols = ["_combined_index", "_datasail_id", "split"]
+#         train_df_CGSiS = train_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_CGSiS.columns])
+#         test_df_CGSiS = test_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_CGSiS.columns])
+#
+#         train_df_TGSiS = train_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_TGSiS.columns])
+#         test_df_TGSiS = test_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_TGSiS.columns])
+#
+#         print(
+#             "Final DataSAIL glycan-wise split for CNN:",
+#             f"train rows={len(train_df_CGSiS)},",
+#             f"test rows={len(test_df_CGSiS)},",
+#             f"test fraction={len(test_df_CGSiS) / (len(train_df_CGSiS) + len(test_df_CGSiS)):.3f}",
 #         )
 #
-#         train_part_TRN, test_part_TRN = split_one_glycan_group_with_datasail_max_peaks(
-#             group_df,
-#             glycan_name = glycan_name,
-#             test_size = test_size,
-#             random_state = random_state,
-#             output_dir = output_dir,
+#         print(
+#             "Final DataSAIL glycan-wise split for Transformer:",
+#             f"train rows={len(train_df_TGSiS)},",
+#             f"test rows={len(test_df_TGSiS)},",
+#             f"test fraction={len(test_df_TGSiS) / (len(train_df_TGSiS) + len(test_df_TGSiS)):.3f}",
 #         )
 #
-#         train_parts_CNN.append(train_part_CNN)
-#         test_parts_CNN.append(test_part_CNN)
-#         train_parts_TRN.append(train_part_TRN)
-#         test_parts_TRN.append(test_part_TRN)
+#         train_df_CGSiS = downcast_numeric(train_df_CGSiS)
+#         test_df_CGSiS = downcast_numeric(test_df_CGSiS)
+#         write_spectrum_store(train_df_CGSiS, output_dir / "train_CGSiS")
+#         write_spectrum_store(test_df_CGSiS, output_dir / "test_CGSiS")
+#         y_train_CGSiS = train_df_CGSiS["glycan"].tolist()
+#         y_test_CGSiS = test_df_CGSiS["glycan"].tolist()
+#
+#         train_df_TGSiS = downcast_numeric(train_df_TGSiS)
+#         test_df_TGSiS = downcast_numeric(test_df_TGSiS)
+#         write_spectrum_store(train_df_TGSiS, output_dir / "train_TGSiS")
+#         write_spectrum_store(test_df_TGSiS, output_dir / "test_TGSiS")
+#         y_train_TGSiS = train_df_TGSiS["glycan"].tolist()
+#         y_test_TGSiS = test_df_TGSiS["glycan"].tolist()
+#
+#         with open(output_dir / "X_train_CGSiS.pkl", "wb") as fh:
+#             pickle.dump(X_train_CGSiS, fh)
+#         with open(output_dir / "X_test_CGSiS.pkl", "wb") as fh:
+#             pickle.dump(X_test_CGSiS, fh)
+#         with open(output_dir / "y_train_CGSiS.pkl", "wb") as fh:
+#             pickle.dump(y_train_CGSiS, fh)
+#         with open(output_dir / "y_test_CGSiS.pkl", "wb") as fh:
+#             pickle.dump(y_test_CGSiS, fh)
 #
 #
-#     train_df_CGSiS = pd.concat(train_parts_CNN, ignore_index=True)
-#     test_df_CGSiS = pd.concat(test_parts_CNN, ignore_index=True)
-#
-#     train_df_TGSiS = pd.concat(train_parts_TRN, ignore_index=True)
-#     test_df_TGSiS = pd.concat(test_parts_TRN, ignore_index=True)
-#
-#     drop_temp_cols = ["_combined_index", "_datasail_id", "split"]
-#     train_df_CGSiS = train_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_CGSiS.columns])
-#     test_df_CGSiS = test_df_CGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_CGSiS.columns])
-#
-#     train_df_TGSiS = train_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in train_df_TGSiS.columns])
-#     test_df_TGSiS = test_df_TGSiS.drop(columns=[c for c in drop_temp_cols if c in test_df_TGSiS.columns])
-#
-#     print(
-#         "Final DataSAIL glycan-wise split for CNN:",
-#         f"train rows={len(train_df_CGSiS)},",
-#         f"test rows={len(test_df_CGSiS)},",
-#         f"test fraction={len(test_df_CGSiS) / (len(train_df_CGSiS) + len(test_df_CGSiS)):.3f}",
-#     )
-#
-#     print(
-#         "Final DataSAIL glycan-wise split for Transformer:",
-#         f"train rows={len(train_df_TGSiS)},",
-#         f"test rows={len(test_df_TGSiS)},",
-#         f"test fraction={len(test_df_TGSiS) / (len(train_df_TGSiS) + len(test_df_TGSiS)):.3f}",
-#     )
-#
-#     train_df_CGSiS = downcast_numeric(train_df_CGSiS)
-#     test_df_CGSiS = downcast_numeric(test_df_CGSiS)
-#     write_spectrum_store(train_df_CGSiS, output_dir / "train_CGSiS")
-#     write_spectrum_store(test_df_CGSiS, output_dir / "test_CGSiS")
-#     y_train_CGSiS = train_df_CGSiS["glycan"].tolist()
-#     y_test_CGSiS = test_df_CGSiS["glycan"].tolist()
-#
-#     train_df_TGSiS = downcast_numeric(train_df_TGSiS)
-#     test_df_TGSiS = downcast_numeric(test_df_TGSiS)
-#     write_spectrum_store(train_df_TGSiS, output_dir / "train_TGSiS")
-#     write_spectrum_store(test_df_TGSiS, output_dir / "test_TGSiS")
-#     y_train_TGSiS = train_df_TGSiS["glycan"].tolist()
-#     y_test_TGSiS = test_df_TGSiS["glycan"].tolist()
-#
-#     with open(output_dir / "X_train_CGSiS.pkl", "wb") as fh:
-#         pickle.dump(X_train_CGSiS, fh)
-#     with open(output_dir / "X_test_CGSiS.pkl", "wb") as fh:
-#         pickle.dump(X_test_CGSiS, fh)
-#     with open(output_dir / "y_train_CGSiS.pkl", "wb") as fh:
-#         pickle.dump(y_train_CGSiS, fh)
-#     with open(output_dir / "y_test_CGSiS.pkl", "wb") as fh:
-#         pickle.dump(y_test_CGSiS, fh)
-#
-#
-#     with open(output_dir / "X_train_TGSiS.pkl", "wb") as fh:
-#         pickle.dump(X_train_TGSiS, fh)
-#     with open(output_dir / "X_test_TGSiS.pkl", "wb") as fh:
-#         pickle.dump(X_test_TGSiS, fh)
-#     with open(output_dir / "y_train_TGSiS.pkl", "wb") as fh:
-#         pickle.dump(y_train_TGSiS, fh)
-#     with open(output_dir / "y_test_TGSiS.pkl", "wb") as fh:
-#         pickle.dump(y_test_TGSiS, fh)
+#         with open(output_dir / "X_train_TGSiS.pkl", "wb") as fh:
+#             pickle.dump(X_train_TGSiS, fh)
+#         with open(output_dir / "X_test_TGSiS.pkl", "wb") as fh:
+#             pickle.dump(X_test_TGSiS, fh)
+#         with open(output_dir / "y_train_TGSiS.pkl", "wb") as fh:
+#             pickle.dump(y_train_TGSiS, fh)
+#         with open(output_dir / "y_test_TGSiS.pkl", "wb") as fh:
+#             pickle.dump(y_test_TGSiS, fh)
 ########################################################################################################################
     # Random split
 ########################################################################################################################
@@ -1000,7 +1015,7 @@ def main(args):
     print(f"Saved processed datasets to {output_dir.resolve()}")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = 'Data Processing')
-    parser.add_argument('--dataset_name', type = str, required = False, choices = ["full", "HC","XPF","GMS","OP","OP0.7S","DSXXX"])
+    parser.add_argument('--dataset_name', type = str, required = False, choices = ["full", "HC","XPF","GMS","OP","OP0.7S","DSXXX","PreOP"])
     parser.add_argument('--dataset_path', type = str, required = False, default = None,
                         help = "spectra table (.xlsx or .pkl) with peak_d, RT, glycan, filename, GlycoPost_ID; overrides --dataset_name, output goes to prepared_datasets_<file stem>")
     parser.add_argument('--metadata_path', type = str, required = False, default = metadata_path,
