@@ -9,7 +9,6 @@ from candycrunch.losses import CandidateSetLoss, ClassAwareContrastiveBatchSampl
 from glycowork.ml.models import init_weights
 from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
-from memory_utils import report_process_tree_memory
 import pandas as pd
 import wandb
 import candycrunch.model
@@ -74,9 +73,6 @@ def main(args):
     if args.model == "Transformer" and args.disable_mha_fastpath:
         torch.backends.mha.set_fastpath_enabled(False)
         print("Transformer attention fastpath disabled for CUDA diagnostics.")
-    memory_reporter = report_process_tree_memory if args.report_memory else None
-    if memory_reporter is not None:
-        memory_reporter("startup")
     print("Reading data")
     # ============================================================
     # Load data
