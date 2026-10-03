@@ -28,8 +28,8 @@ import gc
 import argparse
 from downsample_representative_spectra_V3 import downsample_representative_spectra_V3
 
-# from numpy.exceptions import ComplexWarning
-# np.ComplexWarning = ComplexWarning
+from numpy.exceptions import ComplexWarning
+np.ComplexWarning = ComplexWarning
 from datasail.sail import datasail
 
 metadata_path = Path("file_checklist_template.csv")
@@ -564,7 +564,6 @@ def split_one_glycan_group_with_datasail_max_peaks(
         group_df["split"] = "train"
         return group_df[group_df["split"] == "train"].copy(), group_df.iloc[0:0].copy()
 
-    datasail = _load_datasail()
 
     item_ids = np.array(
         [f"row_{idx}" for idx in group_df["_combined_index"].tolist()],
@@ -625,7 +624,8 @@ def split_one_glycan_group_with_datasail_max_peaks(
 
 def main(args):
     print("Loading condensed spectra")
-    full_dataset_path = Path(args.dataset_path) if args.dataset_path else Path(f"{args.dataset_name}20260929.pkl")
+    data_path = "./../data_processing/Final_Results"
+    full_dataset_path = (Path(args.dataset_path)if args.dataset_path else Path(data_path) / f"{args.dataset_name}20261003.pkl")
     date = full_dataset_path.stem[-8:]
     full_df = pd.read_excel(full_dataset_path) if full_dataset_path.suffix == ".xlsx" else pd.read_pickle(full_dataset_path)
     counts = []
