@@ -1,7 +1,6 @@
 from pathlib import Path
 from datetime import datetime
 import argparse
-
 import pandas as pd
 
 
@@ -146,125 +145,6 @@ def find_latest_full_dataset(training_dir):
     return candidates[-1] if candidates else None
 
 
-def merge_files(files, output_file_fd,output_file_hcd, drop_duplicates=True):
-    """Merge files into one dataframe and save it."""
-    output_file = Path(output_file_fd)
-    if not files:
-        print(f"No files found for {output_file.name}")
-        return pd.DataFrame()
-
-    dataframes = []
-    for file_path in files:
-        print(f"Reading: {file_path}")
-        dataframes.append(read_dataframe(file_path))
-
-    merged_df = pd.concat(dataframes, ignore_index=True)
-    if drop_duplicates:
-        try:
-            merged_df = merged_df.drop_duplicates().reset_index(drop=True)
-        except TypeError as e:
-            print(f"Could not drop duplicates because some columns contain unhashable values: {e}")
-            print("Keeping all rows.")
-    merged_df["glycan_type"] = merged_df["glycan"].apply(get_glycan_label)
-
-    ## HC
-    # best_data= merged_df[(merged_df["on_peak"]==True) & (merged_df["xic_peak_found"]==True) &  (merged_df["glycan_match_status"] == "unique")]
-    ## XPF
-    # best_data= merged_df[merged_df["xic_peak_found"]==True]
-    ## OP
-    # best_data= merged_df[merged_df["on_peak"]==True]
-    ## GMS
-    best_data= merged_df[merged_df["glycan_match_status"] == "unique"]
-
-    # # ## OPS
-    # best_data = merged_df[merged_df["on_peak"] == True].copy()
-    # passes = best_data["glycan_score"] <= 0.9
-    # # Glycans having at least one row that passes
-    # has_passing = passes.groupby(best_data["glycan"]).transform("any")
-    # # Keep passing rows from those glycans
-    # passing_rows = best_data[passes & has_passing]
-    #
-    # # For glycans where nothing passes, keep the 7 smallest scores
-    # fallback_rows = (best_data[~has_passing].sort_values("glycan_score").groupby("glycan", group_keys=False).head(7))
-    # best_data = pd.concat([passing_rows, fallback_rows],ignore_index=True)
-
-    write_dataframe(merged_df, output_file_fd)
-    print("\nDone")
-    print(f"Output file: {output_file_fd}")
-    print(f"Files merged: {len(files)}")
-    print(f"Full dataset: {len(merged_df)}")
-
-    write_dataframe(best_data, output_file_hcd)
-    print("\nDone")
-    print(f"Output file: {output_file_hcd}")
-    print(f"High confident Dataset: {len(best_data)}")
-
-    write_final_dataset_report(merged_df, output_file_fd)
-    print("\nDone")
-    print(f"Output file: {output_file_fd}")
-    print(f"Full dataset: {len(merged_df)}")
-    unique_glycans = count_unique_glycans(merged_df)
-    if unique_glycans is not None:
-        print(f"Unique glycans: {unique_glycans}")
-
-
-    write_final_dataset_report(best_data, output_file_hcd)
-    print("\nDone")
-    print(f"Output file: {output_file_hcd}")
-    print(f"High confident Dataset: {len(best_data)}")
-    unique_glycans = count_unique_glycans(best_data)
-    if unique_glycans is not None:
-        print(f"Unique glycans for High confident Dataset: {unique_glycans}")
-
-    return merged_df, best_data
-
-
-# def merge_with_current_data(current_data_path=None, new_data_path=None, output_file=None,
-#                             drop_duplicates=True):
-#     """Merge with an existing full dataset, or save new data as the full dataset."""
-#     new_data_path = Path(new_data_path)
-#     if not new_data_path.exists():
-#         print(f"New merged training data does not exist: {new_data_path}")
-#         print("Skipping full-dataset merge.")
-#         return pd.DataFrame()
-#
-#     new_df = read_dataframe(new_data_path)
-#     if current_data_path is None:
-#         print("No existing full_dataset_* file found.")
-#         print("Saving newly merged training data as the full dataset.")
-#         merged_df = new_df
-#     else:
-#         current_data_path = Path(current_data_path)
-#         if current_data_path.exists():
-#             dataframes = [
-#                 read_dataframe(current_data_path),
-#                 new_df,
-#             ]
-#             merged_df = pd.concat(dataframes, ignore_index=True)
-#             print(f"Merging with existing full dataset: {current_data_path}")
-#         else:
-#             print(f"Current full dataset does not exist: {current_data_path}")
-#             print("Saving newly merged training data as the full dataset.")
-#             merged_df = new_df
-#
-#     if drop_duplicates:
-#         try:
-#             merged_df = merged_df.drop_duplicates().reset_index(drop=True)
-#         except TypeError as e:
-#             print(f"Could not drop duplicates because some columns contain unhashable values: {e}")
-#             print("Keeping all rows.")
-#
-#     write_dataframe(merged_df, output_file)
-#     write_final_dataset_report(merged_df, output_file)
-#     print("\nDone")
-#     print(f"Output file: {output_file}")
-#     print(f"Rows merged: {len(merged_df)}")
-#     unique_glycans = count_unique_glycans(merged_df)
-#     if unique_glycans is not None:
-#         print(f"Unique glycans: {unique_glycans}")
-#     return merged_df
-
-
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Merge CandyCrunch train/pretrain outputs from the new pkl pipeline."
@@ -281,6 +161,7 @@ def build_arg_parser():
                         help="Format for merged outputs")
     parser.add_argument("--keep-duplicates", action="store_true",
                         help="Do not drop duplicate rows after merging")
+    parser.add_argument('--datasets', nargs='+', type=str, default=["OPS", "HC", "OP", "XPF", "GMS", "full"]) #
     return parser
 
 
@@ -289,37 +170,84 @@ def main(args=None):
     date_str = datetime.today().strftime("%Y%m%d")
     drop_duplicates = not args.keep_duplicates
 
-    train_files = find_matching_files(args.base_dir, "train")
-    pretrain_files = find_matching_files(args.base_dir, "pretrain")
+    files = find_matching_files(args.base_dir, "train")
+    # files = find_matching_files(args.base_dir, "pretrain")
+    dataframes = []
+    for file_path in files:
+        print(f"Reading: {file_path}")
+        dataframes.append(read_dataframe(file_path))
+    merged_df = pd.concat(dataframes, ignore_index=True)
+    del dataframes
+    if drop_duplicates:
+        try:
+            merged_df = merged_df.drop_duplicates().reset_index(drop=True)
+        except TypeError as e:
+            print(f"Could not drop duplicates because some columns contain unhashable values: {e}")
+            print("Keeping all rows.")
+    merged_df["glycan_type"] = merged_df["glycan"].apply(get_glycan_label)
+    cglycans1 = pd.read_csv("corrected_glycans_1.csv")
+    cglycans2 = pd.read_csv("corrected_glycans_2.csv")
+    mapping1 = (cglycans1.loc[cglycans1["correct_glycan"].notna()].set_index("glycan")["correct_glycan"])
+    merged_df["glycan"] = merged_df["glycan"].map(mapping1).fillna(merged_df["glycan"])
+    mapping2 = (cglycans2.loc[cglycans2["new_glycan"].notna()].set_index("glycan")["new_glycan"])
+    merged_df["glycan"] = merged_df["glycan"].map(mapping2).fillna(merged_df["glycan"])
+    columns = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'on_peak', 'xic_peak_found', 'glycan',
+               'glycan_score',
+               'glycan_match_status', 'filename', 'GlycoPost_ID', 'mode', 'trap', 'instrument', 'fragmentation',
+               'ion_source',
+               'lc_type', 'modification']
+    merged_df = merged_df[columns]
 
-    FD_output = args.base_dir / f"full{date_str}.{args.output_format}"
-    GMS_output = args.base_dir / f"GMS{date_str}.{args.output_format}"
-    pretrain_output = args.base_dir / f"all_pretrain_{date_str}.{args.output_format}"
 
-    merge_files(
-        files=train_files,
-        output_file_fd=FD_output,
-        output_file_hcd=GMS_output,
-        drop_duplicates=drop_duplicates,
-    )
+    for dataset in args.datasets:
+        print(f"\n=== Creating  {dataset} dataset ===")
+        threshold = 0.7
+        output = (args.base_dir/f"{f'{dataset}{threshold}' if dataset == 'OPS' else dataset}_{date_str}.{args.output_format}")
+        # output = args.base_dir / f"all_pretrain_{dataset}{date_str}.{args.output_format}"
+        output_file = Path(output)
+        ## HC
+        if dataset == "HC":
+            final_df = merged_df[(merged_df["on_peak"] == True) & (merged_df["xic_peak_found"] == True) & (
+                        merged_df["glycan_match_status"] == "unique")]
+        ## XPF
+        if dataset == "XPF":
+            final_df = merged_df[merged_df["xic_peak_found"] == True]
+        ## OP
+        if dataset == "OP":
+            final_df = merged_df[merged_df["on_peak"] == True]
+        ## GMS
+        if dataset == "GMS":
+            final_df = merged_df[merged_df["glycan_match_status"] == "unique"]
+        # # ## OPS
+        if dataset == "OPS":
+            final_df = merged_df[merged_df["on_peak"] == True].copy()
+            passes = final_df["glycan_score"] <= threshold
+            # Glycans having at least one row that passes
+            has_passing = passes.groupby(final_df["glycan"]).transform("any")
+            # Keep passing rows from those glycans
+            passing_rows = final_df[passes & has_passing]
 
-    # merge_files(
-    #     files=pretrain_files,
-    #     output_file=pretrain_output,
-    #     drop_duplicates=drop_duplicates,
-    # )
+            # For glycans where nothing passes, keep the 7 smallest scores
+            fallback_rows = (
+                final_df[~has_passing].sort_values("glycan_score").groupby("glycan", group_keys=False).head(7))
+            final_df = pd.concat([passing_rows, fallback_rows], ignore_index=True)
 
-    # if not args.skip_current_merge:
-    #     current_train = args.current_train
-    #     if current_train is None:
-    #         current_train = find_latest_full_dataset(args.training_dir)
-    #     full_output = args.training_dir / f"full_dataset_{date_str}.{args.output_format}"
-    #     merge_with_current_data(
-    #         current_data_path=current_train,
-    #         new_data_path=train_output,
-    #         output_file=full_output,
-    #         drop_duplicates=drop_duplicates,
-    #     )
+        if dataset == "full":
+            final_df = merged_df
+
+        write_dataframe(final_df, output_file)
+        print("\nDone")
+        print(f"Output file: {output_file}")
+        print(f"{dataset} Dataset: {len(final_df)}")
+
+        write_final_dataset_report(final_df, output_file)
+        print("\nDone")
+        print(f"Output file: {output_file}")
+        print(f"{dataset} dataset: {len(final_df)}")
+        unique_glycans = count_unique_glycans(final_df)
+        if unique_glycans is not None:
+            print(f"Unique glycans: {unique_glycans}")
+        del final_df
 
 
 if __name__ == "__main__":

@@ -27,6 +27,11 @@ import ast
 import gc
 import argparse
 from downsample_representative_spectra_V3 import downsample_representative_spectra_V3
+
+# from numpy.exceptions import ComplexWarning
+# np.ComplexWarning = ComplexWarning
+from datasail.sail import datasail
+
 metadata_path = Path("file_checklist_template.csv")
 test_size = 0.20
 random_state = 42
@@ -89,42 +94,6 @@ def bin_intensities(peak_d, frames):
     binned_intensities[unique_bins - 1] = summed_intensities
     mz_diff[unique_bins - 1] = max_mz_remainder
     return binned_intensities, mz_diff
-
-
-# def bin_intensities(peak_d, frames):
-#     """
-#     Select the highest-intensity peak in each non-overlapping m/z bin.
-#     Arguments
-#     ---------
-#     peak_d : dict
-#         Dictionary of {fragment m/z: intensity}
-#     frames : array-like
-#         m/z boundaries separating each bin
-#     Returns
-#     -------
-#     binned_intensities : np.ndarray
-#         Maximum peak intensity in each bin.
-#     mz_diff : np.ndarray
-#         m/z remainder of the selected maximum-intensity peak
-#         relative to the lower bin edge.
-#     """
-#
-#     num_frames = len(frames)
-#     binned_intensities = np.zeros(num_frames)
-#     mz_diff = np.zeros(num_frames)
-#     mzs = np.array(list(peak_d.keys()), dtype="float32")
-#     intensities = np.array(list(peak_d.values()))
-#     bin_indices = np.digitize(mzs, frames, right=True)
-#     for bin_idx in np.unique(bin_indices):
-#         if bin_idx == 0 or bin_idx > num_frames:
-#             continue
-#         mask = bin_indices == bin_idx
-#         bin_mzs = mzs[mask]
-#         bin_intensities = intensities[mask]
-#         max_idx = np.argmax(bin_intensities)
-#         binned_intensities[bin_idx - 1] = bin_intensities[max_idx]
-#         mz_diff[bin_idx - 1] = (bin_mzs[max_idx] - frames[bin_idx - 1])
-#     return binned_intensities, mz_diff
 
 
 def _safe_peak_parse(value):
@@ -431,18 +400,6 @@ def random_fallback_split(group_df, test_size=0.20, random_state=42):
         group_df.loc[test_idx].copy(),
     )
 
-def _load_datasail():
-    # Older GraKeL releases import this warning from NumPy's pre-2.0 namespace.
-    if not hasattr(np, "ComplexWarning"):
-        from numpy.exceptions import ComplexWarning
-
-        np.ComplexWarning = ComplexWarning
-
-    from datasail.sail import datasail
-
-    return datasail
-
-
 def split_one_glycan_group_with_datasail(
     group_df,
     glycan_name,
@@ -457,7 +414,6 @@ def split_one_glycan_group_with_datasail(
         group_df["split"] = "train"
         return group_df[group_df["split"] == "train"], group_df.iloc[0:0]
 
-    datasail = _load_datasail()
 
     item_ids = np.array(
         [f"row_{idx}" for idx in group_df["_combined_index"].tolist()],
@@ -709,12 +665,6 @@ def main(args):
     combined.reset_index(drop=True, inplace=True)
     # glycans = sorted(set(combined["glycan"]))
     combined["glycan_comp"] = combined["glycan"].apply(iupac_to_composition_string)
-    cglycans1 = pd.read_csv("corrected_glycans_1.csv")
-    cglycans2 = pd.read_csv("corrected_glycans_2.csv")
-    mapping1 = (cglycans1.loc[cglycans1["correct_glycan"].notna()].set_index("glycan")["correct_glycan"])
-    combined["glycan"] = combined["glycan"].map(mapping1).fillna(combined["glycan"])
-    mapping2 = (cglycans2.loc[cglycans2["correct_glycan"].notna()].set_index("glycan")["new_glycan"])
-    combined["glycan"] = combined["glycan"].map(mapping2).fillna(combined["glycan"])
     combined.sort_values(by="glycan", inplace=True)
     combined.reset_index(drop=True, inplace=True)
     glycans = combined[["glycan", "glycan_comp"]].drop_duplicates().reset_index(drop=True)
@@ -876,15 +826,15 @@ def main(args):
 #
 #     train_df_CGSiS = downcast_numeric(train_df_CGSiS)
 #     test_df_CGSiS = downcast_numeric(test_df_CGSiS)
-#     X_train_CGSiS = tupleify(train_df_CGSiS, FEATURE_COLUMNS)
-#     X_test_CGSiS = tupleify(test_df_CGSiS, FEATURE_COLUMNS)
+#     write_spectrum_store(train_df_CGSiS, output_dir / "train_CGSiS")
+#     write_spectrum_store(test_df_CGSiS, output_dir / "test_CGSiS")
 #     y_train_CGSiS = train_df_CGSiS["glycan"].tolist()
 #     y_test_CGSiS = test_df_CGSiS["glycan"].tolist()
 #
 #     train_df_TGSiS = downcast_numeric(train_df_TGSiS)
 #     test_df_TGSiS = downcast_numeric(test_df_TGSiS)
-#     X_train_TGSiS = tupleify(train_df_TGSiS, FEATURE_COLUMNS)
-#     X_test_TGSiS = tupleify(test_df_TGSiS, FEATURE_COLUMNS)
+#     write_spectrum_store(train_df_TGSiS, output_dir / "train_TGSiS")
+#     write_spectrum_store(test_df_TGSiS, output_dir / "test_TGSiS")
 #     y_train_TGSiS = train_df_TGSiS["glycan"].tolist()
 #     y_test_TGSiS = test_df_TGSiS["glycan"].tolist()
 #
@@ -925,11 +875,10 @@ def main(args):
     # test_df_R = combined[combined['glycan'].isin(test_glycans)]
     # train_df_R = downcast_numeric(train_df_R)
     # test_df_R = downcast_numeric(test_df_R)
-    # X_train_R = tupleify(train_df_R, FEATURE_COLUMNS)
-    # X_test_R = tupleify(test_df_R, FEATURE_COLUMNS)
+    # write_spectrum_store(train_df_R, output_dir / "train_R")
+    # write_spectrum_store(test_df_R, output_dir / "test_R")
     # y_train_R = train_df_R["glycan"].tolist()
     # y_test_R = test_df_R["glycan"].tolist()
-    #
     # with open(output_dir /"X_train_R.pkl", "wb") as fh:
     #     pickle.dump(X_train_R, fh)
     # with open(output_dir /"X_test_R.pkl", "wb") as fh:
@@ -997,8 +946,8 @@ def main(args):
     # test_df_C1e = combined[combined["split"] == "test"]
     # train_df_C1e = downcast_numeric(train_df_C1e)
     # test_df_C1e = downcast_numeric(test_df_C1e)
-    # X_train_C1e = tupleify(train_df_C1e, FEATURE_COLUMNS)
-    # X_test_C1e = tupleify(test_df_C1e, FEATURE_COLUMNS)
+    # write_spectrum_store(train_df_C1e, output_dir / "train_C1e")
+    # write_spectrum_store(test_df_C1e, output_dir / "test_C1e")
     # y_train_C1e = train_df_C1e["glycan"].tolist()
     # y_test_C1e = test_df_C1e["glycan"].tolist()
     # with open(output_dir /"X_train_C1e.pkl", "wb") as fh:
