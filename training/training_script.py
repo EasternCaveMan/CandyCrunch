@@ -168,18 +168,7 @@ def main(args):
                                    args.model,
                                    max_peaks=args.max_peaks)
 
-    if memory_reporter is not None:
-        memory_reporter("datasets ready")
-    if args.prepare_data_only:
-        print("Memory-map caches are ready; exiting before model setup.")
-        return
 
-    # if args.model == "CNN":
-    #     trainset = SimpleDataset(X_train, y_train, transform_mz = transform_mz, transform_rt = transform_rt)
-    #     valset = SimpleDataset(X_test, y_test)
-    # elif args.model == "Transformer":
-    #     trainset = TransDataset(X_train, y_train, transform_rt = transform_rt)
-    #     valset = TransDataset(X_test, y_test)
     # ============================================================
     # Data loaders
     # ============================================================
@@ -395,8 +384,8 @@ def main(args):
         model = train_model(model,pretrain_dataloaders,pretrain_criterion,pretrain_optimizer,pretrain_scheduler,glycans,
             num_epochs=args.pretraining_epochs,patience=args.pretraining_patience if args.pretraining_patience is not None else args.patience,
             model_type=args.model,setting_name=pretrain_setting_name,transformer_moe_aux_loss_weight=args.transformer_moe_aux_loss_weight,
-            classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=pretrain_metadata,
-            memory_reporter=memory_reporter,glycan_compositions=glycan_compositions,save_dir=pretrain_model_dir,
+            classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=pretrain_metadata
+            ,glycan_compositions=glycan_compositions,save_dir=pretrain_model_dir,
             wandb_prefix="pretrain",cand_mask=cand_mask)
         pretrain_model_path = pretrain_model_dir / f"CandyCrunch_{pretrain_setting_name}.pt"
         checkpoint = torch.load(pretrain_model_path,map_location=device)
@@ -425,8 +414,7 @@ def main(args):
         print("Classifier MoE auxiliary weight:",args.classifier_moe_aux_loss_weight)
     model_ft = train_model(model,dataloaders,criterion,optimizer_ft,scheduler,glycans, num_epochs=args.epoch,
         patience=args.patience,model_type=args.model,setting_name=setting_name, transformer_moe_aux_loss_weight=args.transformer_moe_aux_loss_weight,
-        classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=checkpoint_metadata,
-        memory_reporter=memory_reporter,glycan_compositions=glycan_compositions,
+        classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=checkpoint_metadata,glycan_compositions=glycan_compositions,
         contrastive_criterion=contrastive_criterion,contrastive_loss_weight=args.contrastive_loss_weight,
         save_dir=model_dir,cand_mask=cand_mask)
     wandb.finish()
@@ -480,8 +468,6 @@ if __name__ == "__main__":
     parser.add_argument("--persistent-workers",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--pin-memory",action=argparse.BooleanOptionalAction,default=None)
     parser.add_argument("--multiprocessing-context",choices=["spawn", "forkserver", "fork"],default="spawn")
-    parser.add_argument("--report-memory",action="store_true")
-    parser.add_argument("--prepare-data-only",action="store_true")
     # ============================================================
     # Transformer
     # ============================================================
