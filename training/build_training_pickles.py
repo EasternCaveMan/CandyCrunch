@@ -1000,7 +1000,7 @@ def main(args):
     print(f"Saved processed datasets to {output_dir.resolve()}")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = 'Data Processing')
-    parser.add_argument('--dataset_name', type = str, required = False, choices = ["full", "HC","XPF","GMS","OP","OPS","DSXXX"])
+    parser.add_argument('--dataset_name', type = str, required = False, choices = ["full", "HC","XPF","GMS","OP","OP0.7S","DSXXX"])
     parser.add_argument('--dataset_path', type = str, required = False, default = None,
                         help = "spectra table (.xlsx or .pkl) with peak_d, RT, glycan, filename, GlycoPost_ID; overrides --dataset_name, output goes to prepared_datasets_<file stem>")
     parser.add_argument('--metadata_path', type = str, required = False, default = metadata_path,

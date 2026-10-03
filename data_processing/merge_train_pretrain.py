@@ -202,7 +202,7 @@ def main(args=None):
     for dataset in args.datasets:
         print(f"\n=== Creating  {dataset} dataset ===")
         threshold = 0.7
-        output = (args.base_dir/f"{f'{dataset}{threshold}' if dataset == 'OPS' else dataset}_{date_str}.{args.output_format}")
+        output = (args.base_dir/f"{f'OP{threshold}S' if dataset == 'OPS' else dataset}_{date_str}.{args.output_format}")
         # output = args.base_dir / f"all_pretrain_{dataset}{date_str}.{args.output_format}"
         output_file = Path(output)
         ## HC
