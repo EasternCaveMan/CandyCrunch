@@ -665,8 +665,6 @@ def main(args):
         output_dir.mkdir(parents=True, exist_ok=True)
         combined = downcast_numeric(combined)
         write_spectrum_store(combined, output_dir / "pretrain_data")
-        with open(output_dir / "pretrain_data.pkl", "wb") as fh:
-            pickle.dump(combined, fh)
     elif args.dataset_name != "PreOP":
         combined = filter_data_exceptions_v1(combined)
         combined.reset_index(drop=True, inplace=True)
