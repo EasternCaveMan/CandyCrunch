@@ -669,7 +669,7 @@ def process_local_files(output_dir = None, file_names = None):
     return all_mzml_files
 
 
-def extract_xic_peak(
+def _extract_xic_peak(
         precursor_mz,
         scan_rt,
         ms1_rts,
@@ -869,7 +869,7 @@ def _process_mzML_stack(filepath, num_peaks= None,
             xic_results = []
             for r in range(len(df_out)):
                 xic_results.append(
-                    extract_xic_peak(
+                    _extract_xic_peak(
                         df_out['m/z'].values[r],
                         df_out.RT.values[r],
                         df_out.attrs['ms1_rts'],
