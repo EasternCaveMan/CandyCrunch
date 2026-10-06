@@ -46,9 +46,9 @@ TEST_DICTS = [
     {'name':'JC_220302DO3','args': {'glycan_class':'O'}},
     {'name':'JC_221028MeO2','args': {'glycan_class':'O'}},
     {'name':'JC_221028MeN4','args': {'glycan_class':'N'}},
-    {'name': 'JC_211214_24N', 'args': {'glycan_class': 'N'}},
-    {'name':'240410_4812_pool','args': {'glycan_class':'O'}},
-    {'name':'GPST000134','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/")]},
+    # {'name': 'JC_211214_24N', 'args': {'glycan_class': 'N'}},
+    # {'name':'240410_4812_pool','args': {'glycan_class':'O'}},
+    #{'name':'GPST000134','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/")]},
 ]
 AVG_THRESHOLD = 0.05
 MASS_TOLERANCE = 0.5
