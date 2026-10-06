@@ -793,9 +793,8 @@ def _process_mzML_stack(filepath, num_peaks= None,
         if spectrum.ms_level == ms_level:
             try:
                 peaks_raw = spectrum.peaks("raw")
+                spectrum.highest_peaks(2)
             except Exception:
-                continue
-            if len(peaks_raw) == 0 or not spectrum.selected_precursors:
                 continue
             # Fallback metadata detector if extract_mzml_metadata failed
             if detected_mode is None or detected_trap is None or metadata.get("fragmentation") is None:
@@ -829,13 +828,11 @@ def _process_mzML_stack(filepath, num_peaks= None,
                         elif "etd" in name_lower:
                             metadata["fragmentation"] = "ETD"
             num_actual_peaks = len(peaks_raw) if num_peaks is None else min(num_peaks, len(peaks_raw))
-            if num_actual_peaks < len(peaks_raw):
-                peak_idx = np.argpartition(peaks_raw[:, 1], -num_actual_peaks)[-num_actual_peaks:]
-                selected_peaks = peaks_raw[peak_idx]
-            else:
-                selected_peaks = peaks_raw
+            selected_peaks = spectrum.highest_peaks(num_actual_peaks)
             mz_i_dict = {float(mz): float(i) for mz, i in selected_peaks}
             if mz_i_dict:
+                if not spectrum.selected_precursors:
+                    continue
                 key = f"{spectrum.ID}_{spectrum.selected_precursors[0]['mz']}"
                 highest_i_dict[key] = mz_i_dict
                 mzs.append(float(key.split('_')[-1]))

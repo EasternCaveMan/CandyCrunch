@@ -27,6 +27,7 @@ from candycrunch.model import (CandyCrunch_CNN, CandyCrunch_Transformer, MemmapS
 from candycrunch.analysis import CandyCrumbs
 from candycrunch.losses import CompositionConstraint
 from pathlib import Path
+from data_processing.candycrunch_processingV5_db6 import  _process_mzML_stack
 
 _, this_filename = os.path.split(__file__)
 data_path = "/home/daniel/vahid/CandyCrunch/candycrunch/glytoucan_mapping.pkl"
@@ -43,8 +44,8 @@ MODEL_CLASSES = {
 MODEL_DIR = "/home/daniel/vahid/CandyCrunch/training/models"
 # MoC20K8 SupConW0.1T0.1
 DEFAULT_MODEL_PATHS = {
-        "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_ShCl_GShS_CELOSS_CombSupConW0.1T0.07_HC20260929.pt"),
-        "Transformer": os.path.join(MODEL_DIR, "CandyCrunch_Transformer_MoE26K12_ShCl_GShS_H4L2PHD128_FFD256_MP256_PE(fourier)_N(rms)_ACT(relu)_FF(True)_RU(False)_CMLOSS_HC20260929.pt")
+        "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_ShCl_GShS_CELOSS_NoCS_OP20261003.pt"),
+        "Transformer": os.path.join(MODEL_DIR, "CandyCrunch_Transformer_MoE26K12_ShCl_GShS_H4L2PHD128_FFD256_MP256_PE(fourier)_N(rms)_ACT(relu)_FF(True)_RU(False)_CELOSS_NoCS_OP20261003.pt")
 }
 dataset_name = Path(DEFAULT_MODEL_PATHS["CNN"]).stem.split("_")[-1]
 data_path = os.path.join(f"/home/daniel/vahid/CandyCrunch/training/prepared_datasets_{dataset_name}",'glycans.pkl')
@@ -203,87 +204,87 @@ def get_adduct_list(mode):
     return NEGATIVE_ADDUCTS if mode == 'negative' else POSITIVE_ADDUCTS
 
 
-def process_mzML_stack(filepath, num_peaks=5000,
-                       ms_level=2, intensity=False, extract_ms1=False):
-    """function extracting all MS/MS spectra from .mzML file\n
-   | Arguments:
-   | :-
-   | filepath (string): absolute filepath to the .mzML file
-   | num_peaks (int): max number of peaks to extract from spectrum; default:1000
-   | ms_level (int): which MS^n level to extract; default:2
-   | intensity (bool): whether to extract precursor ion intensity from spectra; default:False
-   | extract_ms1 (bool): whether to extract MS1 data for XIC area quantification; default:False\n
-   | Returns:
-   | :-
-   | Returns a pandas dataframe of spectra with m/z, peak dictionary, retention time, charge, and intensity if True
-   """
-    run = pymzml.run.Reader(filepath)
-    highest_i_dict = {}
-    rts, intensities, mzs, charges = [], [], [], []
-    detected_mode, detected_trap = None, None
-    ms1_rts, ms1_scans = [], []
-    for spectrum in run:
-        if extract_ms1 and spectrum.ms_level == 1:
-            peaks_raw = spectrum.peaks("raw")
-            if len(peaks_raw) > 0:
-                ms1_rts.append(spectrum.scan_time_in_minutes())
-                ms1_scans.append((peaks_raw[:, 0].copy(), peaks_raw[:, 1].copy()))
-        if spectrum.ms_level == ms_level:
-            try:
-                temp = spectrum.highest_peaks(2)
-            except:
-                continue
-            if detected_mode is None:
-                ns_uri = '{http://psi.hupo.org/ms/mzml}'
-                for cv in spectrum.element.iter(f'{ns_uri}cvParam'):
-                    acc = cv.get('accession', '')
-                    if acc == 'MS:1000129':
-                        detected_mode = 'negative'
-                    elif acc == 'MS:1000130':
-                        detected_mode = 'positive'
-                    elif acc == 'MS:1000512':
-                        filt = cv.get('value', '')
-                        if filt.startswith('ITMS'):
-                            detected_trap = 'linear'
-                        elif filt.startswith('FTMS'):
-                            detected_trap = 'orbitrap'
-            mz_i_dict = {}
-            num_actual_peaks = min(num_peaks, len(spectrum.peaks("raw")))
-            for mz, i in spectrum.highest_peaks(num_actual_peaks):
-                mz_i_dict[mz] = i
-            if mz_i_dict:
-                if not spectrum.selected_precursors:
-                    continue
-                key = f"{spectrum.ID}_{spectrum.selected_precursors[0]['mz']}"
-                highest_i_dict[key] = mz_i_dict
-                mzs.append(float(key.split('_')[-1]))
-                rts.append(spectrum.scan_time_in_minutes())
-                raw_charge = spectrum.selected_precursors[0].get('charge', None)
-                # Vendor software can default to charge=1 when undetermined;
-                # only trust explicit multiply-charged assignments
-                if raw_charge is not None and abs(int(raw_charge)) == 1:
-                    raw_charge = None
-                charges.append(abs(int(raw_charge)) if raw_charge is not None else None)
-                if intensity:
-                    inty = spectrum.selected_precursors[0].get('i', np.nan)
-                    intensities.append(inty)
-    # Sort the highest_i_dict by values
-    for key in highest_i_dict.keys():
-        highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key=lambda x: x[1], reverse=True))
-    df_out = pd.DataFrame({
-        'm/z': mzs,
-        'peak_d': list(highest_i_dict.values()),
-        'RT': rts,
-        'precursor_charge': charges,
-    })
-    if intensity:
-        df_out['intensity'] = intensities
-    df_out.attrs['detected_mode'] = detected_mode
-    df_out.attrs['detected_trap'] = detected_trap
-    if extract_ms1:
-        df_out.attrs['ms1_rts'] = np.array(ms1_rts)
-        df_out.attrs['ms1_scans'] = ms1_scans
-    return df_out
+# def process_mzML_stack(filepath, num_peaks=5000,
+#                        ms_level=2, intensity=False, extract_ms1=False):
+#     """function extracting all MS/MS spectra from .mzML file\n
+#    | Arguments:
+#    | :-
+#    | filepath (string): absolute filepath to the .mzML file
+#    | num_peaks (int): max number of peaks to extract from spectrum; default:1000
+#    | ms_level (int): which MS^n level to extract; default:2
+#    | intensity (bool): whether to extract precursor ion intensity from spectra; default:False
+#    | extract_ms1 (bool): whether to extract MS1 data for XIC area quantification; default:False\n
+#    | Returns:
+#    | :-
+#    | Returns a pandas dataframe of spectra with m/z, peak dictionary, retention time, charge, and intensity if True
+#    """
+#     run = pymzml.run.Reader(filepath)
+#     highest_i_dict = {}
+#     rts, intensities, mzs, charges = [], [], [], []
+#     detected_mode, detected_trap = None, None
+#     ms1_rts, ms1_scans = [], []
+#     for spectrum in run:
+#         if extract_ms1 and spectrum.ms_level == 1:
+#             peaks_raw = spectrum.peaks("raw")
+#             if len(peaks_raw) > 0:
+#                 ms1_rts.append(spectrum.scan_time_in_minutes())
+#                 ms1_scans.append((peaks_raw[:, 0].copy(), peaks_raw[:, 1].copy()))
+#         if spectrum.ms_level == ms_level:
+#             try:
+#                 temp = spectrum.highest_peaks(2)
+#             except:
+#                 continue
+#             if detected_mode is None:
+#                 ns_uri = '{http://psi.hupo.org/ms/mzml}'
+#                 for cv in spectrum.element.iter(f'{ns_uri}cvParam'):
+#                     acc = cv.get('accession', '')
+#                     if acc == 'MS:1000129':
+#                         detected_mode = 'negative'
+#                     elif acc == 'MS:1000130':
+#                         detected_mode = 'positive'
+#                     elif acc == 'MS:1000512':
+#                         filt = cv.get('value', '')
+#                         if filt.startswith('ITMS'):
+#                             detected_trap = 'linear'
+#                         elif filt.startswith('FTMS'):
+#                             detected_trap = 'orbitrap'
+#             mz_i_dict = {}
+#             num_actual_peaks = min(num_peaks, len(spectrum.peaks("raw")))
+#             for mz, i in spectrum.highest_peaks(num_actual_peaks):
+#                 mz_i_dict[mz] = i
+#             if mz_i_dict:
+#                 if not spectrum.selected_precursors:
+#                     continue
+#                 key = f"{spectrum.ID}_{spectrum.selected_precursors[0]['mz']}"
+#                 highest_i_dict[key] = mz_i_dict
+#                 mzs.append(float(key.split('_')[-1]))
+#                 rts.append(spectrum.scan_time_in_minutes())
+#                 raw_charge = spectrum.selected_precursors[0].get('charge', None)
+#                 # Vendor software can default to charge=1 when undetermined;
+#                 # only trust explicit multiply-charged assignments
+#                 if raw_charge is not None and abs(int(raw_charge)) == 1:
+#                     raw_charge = None
+#                 charges.append(abs(int(raw_charge)) if raw_charge is not None else None)
+#                 if intensity:
+#                     inty = spectrum.selected_precursors[0].get('i', np.nan)
+#                     intensities.append(inty)
+#     # Sort the highest_i_dict by values
+#     for key in highest_i_dict.keys():
+#         highest_i_dict[key] = dict(sorted(highest_i_dict[key].items(), key=lambda x: x[1], reverse=True))
+#     df_out = pd.DataFrame({
+#         'm/z': mzs,
+#         'peak_d': list(highest_i_dict.values()),
+#         'RT': rts,
+#         'precursor_charge': charges,
+#     })
+#     if intensity:
+#         df_out['intensity'] = intensities
+#     df_out.attrs['detected_mode'] = detected_mode
+#     df_out.attrs['detected_trap'] = detected_trap
+#     if extract_ms1:
+#         df_out.attrs['ms1_rts'] = np.array(ms1_rts)
+#         df_out.attrs['ms1_scans'] = ms1_scans
+#     return df_out
 
 
 def process_mzXML_stack(filepath, num_peaks=1000, ms_level=2, intensity=False):
@@ -335,6 +336,37 @@ def process_mzXML_stack(filepath, num_peaks=1000, ms_level=2, intensity=False):
     return df_out
 
 
+def bin_intensities(peak_d, frames):
+    """sums up intensities for each bin across a spectrum\n
+   | Arguments:
+   | :-
+   | peak_d (dict): dictionary of form (fragment) m/z : intensity
+   | frames (list): m/z boundaries separating each bin\n
+   | Returns:
+   | :-
+   | (1) a list of binned intensities
+   | (2) a list of the difference (bin edge - m/z of highest peak in bin) for each bin
+   """
+    num_frames = len(frames)
+    binned_intensities = np.zeros(num_frames)
+    mz_diff = np.zeros(num_frames)
+    mzs = np.array(list(peak_d.keys()), dtype = 'float32')
+    intensities = np.array(list(peak_d.values()))
+    # Peaks outside the binned range would wrap into the last bin (index -1) with a remainder of about -2960
+    in_range = (mzs > frames[0]) & (mzs <= frames[-1])
+    mzs, intensities = mzs[in_range], intensities[in_range]
+    if not len(mzs):
+        return binned_intensities, mz_diff
+    bin_indices = np.digitize(mzs, frames, right = True)
+    mz_remainder = mzs - frames[bin_indices - 1]
+    unique_bins, max_intensities = npi.group_by(bin_indices).max(intensities)
+    mz_remainder = mz_remainder * (intensities == max_intensities[np.searchsorted(unique_bins, bin_indices)])
+    unique_bins, summed_intensities = npi.group_by(bin_indices).sum(intensities)
+    _, max_mz_remainder = npi.group_by(bin_indices).max(mz_remainder)
+    binned_intensities[unique_bins - 1] = summed_intensities
+    mz_diff[unique_bins - 1] = max_mz_remainder
+    return binned_intensities, mz_diff
+
 def average_dicts(dicts, mode='mean', round_dp=False):
     """averages a list of dictionaries containing spectra\n
    | Arguments:
@@ -354,65 +386,6 @@ def average_dicts(dicts, mode='mean', round_dp=False):
             else:
                 result[mass].append(intensity)
     return {mass: np.mean(intensities) if mode == 'mean' else max(intensities) for mass, intensities in result.items()}
-
-
-# def bin_intensities(peak_d, frames):
-#     """sums up intensities for each bin across a spectrum\n
-#    | Arguments:
-#    | :-
-#    | peak_d (dict): dictionary of form (fragment) m/z : intensity
-#    | frames (list): m/z boundaries separating each bin\n
-#    | Returns:
-#    | :-
-#    | (1) a list of binned intensities
-#    | (2) a list of the difference (bin edge - m/z of highest peak in bin) for each bin
-#    """
-#     num_frames = len(frames)
-#     binned_intensities = np.zeros(num_frames)
-#     mz_diff = np.zeros(num_frames)
-#     mzs = np.array(list(peak_d.keys()), dtype='float32')
-#     intensities = np.array(list(peak_d.values()))
-#     bin_indices = np.digitize(mzs, frames, right=True)
-#     mz_remainder = mzs - frames[bin_indices - 1]
-#     max_intensities = npi.group_by(bin_indices - 1).max(intensities)
-#     mz_remainder = mz_remainder * np.isin(intensities, max_intensities)
-#     unique_bins, summed_intensities = npi.group_by(bin_indices).sum(intensities)
-#     _, max_mz_remainder = npi.group_by(bin_indices).max(mz_remainder)
-#     binned_intensities[unique_bins - 1] = summed_intensities
-#     mz_diff[unique_bins - 1] = max_mz_remainder
-#     return binned_intensities, mz_diff
-
-
-def bin_intensities(peak_d, frames):
-    """sums up intensities for each bin across a spectrum, ignoring peaks outside the binned m/z range; must stay identical to bin_intensities in training/build_training_pickles.py\n
-   | Arguments:
-   | :-
-   | peak_d (dict): dictionary of form (fragment) m/z : intensity
-   | frames (list): m/z boundaries separating each bin\n
-   | Returns:
-   | :-
-   | (1) a list of binned intensities
-   | (2) a list of the difference (m/z of highest peak in bin - lower bin edge) for each bin
-   """
-    num_frames = len(frames)
-    binned_intensities = np.zeros(num_frames)
-    mz_diff = np.zeros(num_frames)
-    mzs = np.array(list(peak_d.keys()), dtype='float32')
-    intensities = np.array(list(peak_d.values()))
-    bin_indices = np.digitize(mzs, frames, right=True)
-    in_range = (bin_indices > 0) & (bin_indices < num_frames)
-    mzs, intensities, bin_indices = mzs[in_range], intensities[in_range], bin_indices[in_range]
-    if not len(mzs):
-        return binned_intensities, mz_diff
-    mz_remainder = mzs - frames[bin_indices - 1]
-    unique_bins, max_intensities = npi.group_by(bin_indices).max(intensities)
-    mz_remainder = mz_remainder * (intensities == max_intensities[np.searchsorted(unique_bins, bin_indices)])
-    unique_bins, summed_intensities = npi.group_by(bin_indices).sum(intensities)
-    _, max_mz_remainder = npi.group_by(bin_indices).max(mz_remainder)
-    binned_intensities[unique_bins - 1] = summed_intensities
-    mz_diff[unique_bins - 1] = max_mz_remainder
-    return binned_intensities, mz_diff
-
 
 def _normalise_spectrum(spec):
     total = float(sum(spec.values()))
@@ -770,12 +743,6 @@ def condense_dataframe(df, mz_diff= 0.5, rt_diff= 1.0, min_mz= 39.714, max_mz= 3
                 ms, ints = zip(*cur_grp)
                 pk[np.average(ms, weights=ints)] = sum(ints)
         peaks = dict(sorted(pk.items(), key=lambda x: x[1], reverse=True))
-        rt_int_pairs = sorted(zip(cluster['RT'], cluster['intensity']))
-        rts_sorted, ints_sorted = zip(*rt_int_pairs)
-        if len(rts_sorted) >= 3:
-            sum_intensity = _trapezoid(ints_sorted, rts_sorted)
-        else:
-            sum_intensity = np.nansum(ints_sorted)
         binned_intensities, mz_remainder = zip(*[bin_intensities(c, frames) for c in cluster['peak_d']])
         binned_intensities = np.mean(np.array(binned_intensities), axis=0)
         mz_remainder = np.mean(np.array(mz_remainder), axis=0)
@@ -785,7 +752,7 @@ def condense_dataframe(df, mz_diff= 0.5, rt_diff= 1.0, min_mz= 39.714, max_mz= 3
         num_spectra = len(cluster['RT'])
         rep_charge = cluster['precursor_charge'][highest_intensity_index]
         condensed_data.append(
-            [min_mz, mean_rt, sum_intensity, peaks, binned_intensities, peak_list, mz_remainder, num_spectra,
+            [min_mz, mean_rt, highest_intensity, peaks, binned_intensities, peak_list, mz_remainder, num_spectra,
              rep_charge])
     return pd.DataFrame(condensed_data,
                         columns=['m/z', 'RT', 'intensity', 'peak_d', 'binned_intensities', 'peak_list',
@@ -1415,7 +1382,18 @@ class DictStorage:
 
 def load_spectra_filepath(spectra_filepath, extract_ms1= False):
     if spectra_filepath.endswith(".mzML"):
-        return process_mzML_stack(spectra_filepath, intensity=True, extract_ms1=extract_ms1)
+        # return process_mzML_stack(spectra_filepath, intensity=True, extract_ms1=extract_ms1)
+        print(f"Loading {spectra_filepath}")
+        xic_cache_path = Path(spectra_filepath).with_name(f"{Path(spectra_filepath).name}.xic.pkl")
+        if xic_cache_path.exists():
+            print(f"Loading cached XIC from {xic_cache_path}")
+            return pd.read_pickle(xic_cache_path)
+        print(f"Calculating  XIC.....")
+        loaded_file = _process_mzML_stack(spectra_filepath, intensity=True, extract_ms1=extract_ms1)
+        loaded_file.to_pickle(xic_cache_path)
+        print(f"Saved XIC cache to {xic_cache_path}")
+        loaded_file["precursor_charge"] = loaded_file["precursor_charge"].abs()
+        return loaded_file
     if spectra_filepath.endswith(".mzXML"):
         return process_mzXML_stack(spectra_filepath, intensity=True)
     if spectra_filepath.endswith(".pkl"):
@@ -1909,6 +1887,14 @@ def wrap_inference(spectra_filepath, glycan_class, model= candycrunch, glycans=N
         df_use = df_use[df_use[taxonomy_level].apply(lambda x: taxonomy_filter in x)].reset_index(drop=True)
     multiplier = -1 if mode == 'negative' else 1
     loaded_file = load_spectra_filepath(spectra_filepath, extract_ms1=spectra_filepath.endswith('.mzML'))
+    print(f"Finished XIC calculation")
+    if spectra_filepath.endswith('.mzML'):
+        required_xic_columns = {'on_peak', 'xic_peak_found', 'peak_RT', 'xic_rt_delta'}
+        missing_xic_columns = required_xic_columns.difference(loaded_file.columns)
+        if missing_xic_columns:
+            raise ValueError(
+                f"XIC extraction did not add required columns: {sorted(missing_xic_columns)}"
+            )
     ms1_rts = loaded_file.attrs.pop('ms1_rts', None)
     ms1_scans = loaded_file.attrs.pop('ms1_scans', None)
     detected_mode = getattr(loaded_file, 'attrs', {}).get('detected_mode')
@@ -1923,6 +1909,12 @@ def wrap_inference(spectra_filepath, glycan_class, model= candycrunch, glycans=N
             f"WARNING: File was acquired on {detected_trap} but trap='{trap}' was specified. Overriding to '{detected_trap}'.")
         trap = detected_trap
     loaded_file = filter_rts(loaded_file, rt_min, rt_max)
+    print(f"Loaded file has {len(loaded_file)} rows")
+    if spectra_filepath.endswith('.mzML'):
+          # loaded_file = loaded_file[loaded_file['on_peak'].fillna(False)].reset_index(drop=True)
+          loaded_file = loaded_file[loaded_file["xic_peak_found"].fillna(False)& (loaded_file["xic_rt_delta"] <= 1.5)].reset_index(drop=True)
+          # loaded_file = loaded_file[loaded_file["xic_peak_found"].fillna(False)].reset_index(drop=True)
+    print(f"Loaded file has {len(loaded_file)} rows after filtering on peak True")
     intensity = 'intensity' in loaded_file.columns and not (loaded_file['intensity'] == 0).all() and not loaded_file[
         'intensity'].isnull().all()
     if intensity:
@@ -1937,7 +1929,7 @@ def wrap_inference(spectra_filepath, glycan_class, model= candycrunch, glycans=N
     # Group spectra by mass/retention isomers and process them for being inputs to CandyCrunch
     # df_out = condense_dataframe(loaded_file, mz_diff = mass_tolerance, rt_diff = rt_diff, bin_num = bin_num)
 
-    df_out = condense_dataframe(loaded_file, mz_diff = mass_tolerance, rt_diff = rt_diff, bin_num = bin_num, max_peaks = peak_max_peaks,)
+    df_out = condense_dataframe(loaded_file, mz_diff = mass_tolerance, rt_diff = rt_diff, bin_num = bin_num, max_peaks = peak_max_peaks)
     common_structure_map, df_use, topo_struct_map = create_struct_map(df_use, glycan_class, filter_out = filter_out,
                                                                       phylo_level = taxonomy_level,
                                                                       phylo_filter = taxonomy_filter)
