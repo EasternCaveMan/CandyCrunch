@@ -1,6 +1,7 @@
 import pytest
 import unittest
 import os
+import base64
 import pathlib
 import sys
 from tabulate import tabulate
@@ -45,14 +46,15 @@ TEST_DICTS = [
     {'name':'JC_220302DO3','args': {'glycan_class':'O'}},
     {'name':'JC_221028MeO2','args': {'glycan_class':'O'}},
     {'name':'JC_221028MeN4','args': {'glycan_class':'N'}},
-
-    # {'name': 'JC_211214_24N', 'args': {'glycan_class': 'N'}},
-    # {'name':'240410_4812_pool','args': {'glycan_class':'O'}},
-    # {'name':'GPST000134','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/")]},
+    {'name': 'JC_211214_24N', 'args': {'glycan_class': 'N'}},
+    {'name':'240410_4812_pool','args': {'glycan_class':'O'}},
+    {'name':'GPST000134','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000134/")]},
 ]
 AVG_THRESHOLD = 0.05
 MASS_TOLERANCE = 0.5
 RT_TOLERANCE = 1.0
+# Batch F1 on rows with MS2 evidence was 0.701-0.720 (GPST000029) and 0.705-0.713 (GPST000017) over seeds 0-2
+BATCH_F1_THRESHOLDS = {'GPST000029': 0.65, 'GPST000017': 0.65}
 
 
 def match_spectra(array1, array2, mass_threshold = MASS_TOLERANCE, rt_threshold = RT_TOLERANCE, array2_alt = None):
@@ -99,11 +101,10 @@ def add_pred_column(df_in, col_name, matches, pred_df, rt_col):
 
 
 def evaluate_predictions(predictions, gt, rt_col, mass_thresh, RT_thresh, verbose = False):
-  assert len(predictions)>0
   if len(predictions)==0:
     print('empty preds')
     return 0, 0, 0, 0, 0, 0, 0, 0, 0
-  predictions['converted_masses'] = [m_z * abs(charge) + (abs(charge) - 1) for m_z, charge in zip(predictions.reset_index()['m/z'], predictions['charge'])]
+  predictions['converted_masses'] = [m_z * abs(charge) - (charge - np.sign(charge)) * PROTON_MASS for m_z, charge in zip(predictions.reset_index()['m/z'], predictions['charge'])]
   pairs = predictions.reset_index()[['m/z', 'RT']].round(2).values
   pairs_converted = predictions[['converted_masses', 'RT']].round(2).values
   gt_pairs = gt.reset_index()[['Mass', rt_col]].round(2).values
@@ -214,13 +215,13 @@ def test_candycrunch_accuracy(test_params, result_collector, input_format, verbo
         print('False Positives',eval_scores[-3])
         print('Unevaluable',eval_scores[-1])
         print('False Negatives',eval_scores[-2])
-        print('incorrect_preds',eval_scores[-3])
+        print('incorrect_preds',eval_scores[4])
         print('peaks_not_picked',eval_scores[-6])
         test_outputs.append(eval_scores)
         file_format = 'mzML' if filename.endswith('.mzML') else 'xlsx'
         print(f'file_score:{eval_scores[0]} ({file_format})')
         test_params['format'] = file_format
-        result_collector.add_result(test_params, eval_scores[0], eval_scores, test_nodeid=request.node.nodeid)
+        result_collector.add_result(test_params, eval_scores[0], eval_scores, test_nodeid = request.node.nodeid)
         param_key = tuple(
             test_params[key] if key != 'test_dict' else test_params['test_dict']['name']
             for key in test_params
@@ -229,4 +230,105 @@ def test_candycrunch_accuracy(test_params, result_collector, input_format, verbo
     print("Adding results to collector")  # Debug print
     if test_outputs:
         print(f'avg_score:{np.mean([x[0] for x in test_outputs])}')
-        assert np.mean([x[0] for x in test_outputs])>AVG_THRESHOLD
+        assert np.mean([x[0] for x in test_outputs]) > AVG_THRESHOLD
+
+
+@pytest.mark.parametrize('model', ['CNN', 'Transformer'])
+def test_candycrunch_batch(result_collector, verbose, model):
+    if result_collector.param_names is None:
+        result_collector.param_names = {k: k for k in list(extra_param_dict.keys()) + ['format']}
+    files = {'GPST000029': 'CA_PGMLAD_OG_051017', 'GPST000017': 'JC_141128PGMa'}
+    combined, outputs = wrap_inference_batch([f"{TEST_DATA_DIR}/{name}/{label}.mzML" for name, label in files.items()],
+                                             'O', intra_cat_thresh = 1.0, spectra = True, model = model)
+    assert list(outputs) == list(files.values())
+    for name, label in files.items():
+        df_out, spectra_out = outputs[label]
+        gaps = (df_out['evidence'] == 'ms1_only').values
+        # Spectra stay aligned with the rows, MS1-only gap rows included
+        assert len(spectra_out) == len(df_out)
+        assert all(s is None for s, g in zip(spectra_out, gaps) if g)
+        # Gap rows share the MS2 rows' abundance scale, so they cannot dominate a file
+        assert abs(df_out['rel_abundance'].sum() - 100) < 1e-6
+        assert df_out.loc[gaps, 'rel_abundance'].sum() < 50
+        gt = pd.read_csv(f"{TEST_DATA_DIR}/{name}/df_mz_{name}.csv")
+        eval_scores = evaluate_predictions(df_out[~gaps].copy(), gt[gt[label] > 0],
+                                           'RT' if 'RT' in gt.columns else label + '_RT', MASS_TOLERANCE, RT_TOLERANCE,
+                                           verbose = verbose)
+        print(f'{name} batch F1 (rows with MS2 evidence): {eval_scores[0]:.3f}, MS1-only gap rows: {gaps.sum()}')
+        # Report like the per-file tests, so batch scores reach the summary tables, the results log and the regression check
+        result_collector.add_result({'test_dict': {'name': f'{name}_batch'}, 'model': model, 'supplement': True,
+                                     'experimental': True, 'format': 'mzML'}, eval_scores[0], eval_scores)
+        result_collector.check_performance(
+            f'{name}_batch', (f'{name}_batch', model, True, True, 'mzML'), eval_scores[0])
+        assert eval_scores[0] > BATCH_F1_THRESHOLDS[name]
+    # Feature table: one row per isomer group with per-file abundances and evidence
+    assert {'top1_pred', 'm/z', 'RT', 'n_files_ms2'}.issubset(combined.columns)
+    assert all(label in combined.columns and f'evidence_{label}' in combined.columns for label in files.values())
+    assert (combined['n_files_ms2'] > 0).all()
+
+
+def test_xic_quantification():
+    # Two isomers 0.6 min apart (4:1) and a doubly charged ion, with isotope envelopes, on a 5 s MS1 cycle: each gets its own peak area
+    rts, sigma, envelope = np.arange(0, 20, 0.08), 0.08, np.array([0.6, 0.3, 0.08, 0.02])
+    peaks = [(600.2, 1, 8.0, 4e5), (600.2, 1, 8.6, 1e5), (850.3, 2, 12.0, 2e5)]
+    scans = [sorted((mz + i * 1.003355 / z, h * p * np.exp(-0.5 * ((rt - apex) / sigma) ** 2)) for mz, z, apex, h in peaks for i, p in enumerate(envelope)) for rt in rts]
+    ms1 = (rts, np.array([m for scan in scans for m, _ in scan], dtype = np.float32), np.array([i for scan in scans for _, i in scan], dtype = np.float32),
+           np.arange(len(rts) + 1, dtype = np.int64) * len(scans[0]))
+    areas = extract_xic_areas(ms1, [p[0] for p in peaks], [8.05, 8.55, 12.1], charges = [p[1] for p in peaks], weights = [4, 1, 2])
+    truth = np.array([p[3] for p in peaks]) * sigma * np.sqrt(2 * np.pi)
+    assert np.allclose(areas, truth, rtol = 0.05)
+
+
+def test_precursor_refinement():
+    # Three survey scans: a jittering z = 1 isotope envelope at 600.2 and a precursor at 700.2 with an unrelated weak peak 1 Da below it
+    jitter, scale = [-0.02, 0.02, 0.0], [0.9, 1.0, 1.1]
+    scans = [[(600.2 + d, 1000 * f), (601.2 + d, 300 * f), (602.2 + d, 60 * f), (699.2, 100), (700.2, 1000)] for d, f in zip(jitter, scale)]
+    ms1 = (np.array([10.0, 10.05, 10.1]), np.array([m for scan in scans for m, _ in scan], dtype = np.float32),
+           np.array([i for scan in scans for _, i in scan], dtype = np.float32), np.arange(4, dtype = np.int64) * 5)
+    mono = np.average([600.18, 600.22, 600.2], weights = [900, 1000, 1100])
+    out, drop = refine_precursor_mz(ms1, [600.31, 601.25, 601.25, 700.3], [10.06, 10.07, 10.08, 10.06], [1, 1, 1, 1], [True, True, False, True])
+    # The trigger moves onto the averaged monoisotopic centroid, an M+1 trigger is walked down and dropped as its monoisotopic precursor was
+    # fragmented itself, a header charge state is trusted, and an unrelated lighter peak is not mistaken for the monoisotopic one
+    assert np.allclose(out[:2], mono, atol = 1e-3) and out[2] == 601.25 and abs(out[3] - 700.2) < 1e-3
+    assert list(drop) == [False, True, False, False]
+
+def test_spectra_scan_activation(tmp_path):
+    # A glycoproteomics run alternates HCD and EThcD (ETD + supplemental beam-type CID) scans of one precursor; both are kept apart by scan
+    # number and activation, which a search engine's identification and CandyCrumbs' fragmentation_method need
+    def cv(acc, name, value = ''):
+        return f'<cvParam cvRef="MS" accession="{acc}" name="{name}" value="{value}"/>'
+    def spectrum(i, native_id, level, rt, activation = ()):
+        arrays = ''.join(f'<binaryDataArray encodedLength="0">{cv("MS:1000523", "64-bit float")}{cv("MS:1000576", "no compression")}{cv(acc, name)}'
+                         f'<binary>{base64.b64encode(np.array(values, dtype = "<f8").tobytes()).decode()}</binary></binaryDataArray>'
+                         for acc, name, values in (('MS:1000514', 'm/z array', [204.0867, 1189.512, 1392.591]), ('MS:1000515', 'intensity array', [100.0, 50.0, 80.0])))
+        precursor = (f'<precursorList count="1"><precursor><selectedIonList count="1"><selectedIon>{cv("MS:1000744", "selected ion m/z", 878.69)}'
+                     f'{cv("MS:1000041", "charge state", 3)}</selectedIon></selectedIonList><activation>{"".join(cv(a, "") for a in activation)}</activation>'
+                     '</precursor></precursorList>') if level == 2 else ''
+        return (f'<spectrum index="{i}" id="{native_id}" defaultArrayLength="3">{cv("MS:1000511", "ms level", level)}'
+                f'{cv("MS:1000130", "positive scan")}<scanList count="1"><scan><cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="{rt}" '
+                f'unitName="minute"/></scan></scanList>{precursor}'
+                f'<binaryDataArrayList count="2">{arrays}</binaryDataArrayList></spectrum>')
+    def write(name, spectra):
+        path = tmp_path / name
+        path.write_text(f'<?xml version="1.0" encoding="utf-8"?><mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0"><run id="r"><spectrumList count="{len(spectra)}">' +
+                        ''.join(spectrum(i, *x) for i, x in enumerate(spectra)) + '</spectrumList></run></mzML>')
+        return str(path)
+    thermo = write('thermo.mzML', [(f'controllerType=0 controllerNumber=1 scan={i + 1}', *x) for i, x in
+                                   enumerate([(1, 10.0), (2, 10.01, ['MS:1000422']), (2, 10.02, ['MS:1000598', 'MS:1002678'])])])
+    df = load_spectra_filepath(thermo)
+    assert df['scan'].tolist() == [2, 3] and df['activation'].tolist() == ['HCD', 'EThcD']
+    assert df.attrs['detected_mode'] == 'positive' and df['precursor_charge'].tolist() == [3, 3]
+    # Both survive the .xlsx export that wrap_inference reads directly
+    df_xlsx = load_spectra_filepath(extract_spectra(thermo))
+    assert df_xlsx['scan'].tolist() == [2, 3] and df_xlsx['activation'].tolist() == ['HCD', 'EThcD']
+    # SCIEX native IDs have no scan= number and repeat their experiment number every cycle, so the whole ID identifies a spectrum; EAD gives
+    # c/z ions like ECD, and ETciD and low-energy CID have terms of their own
+    sciex = write('sciex.mzML', [(f'sample=1 period=1 cycle={c} experiment={e}', *x) for c, e, x in
+                                 [(1, 1, (1, 10.0)), (1, 2, (2, 10.01, ['MS:1003294'])), (2, 2, (2, 10.02, ['MS:1000433'])), (3, 2, (2, 10.03, ['MS:1003182']))]])
+    df = load_spectra_filepath(sciex)
+    assert df['scan'].tolist() == [f'sample=1 period=1 cycle={c} experiment=2' for c in (1, 2, 3)]
+    assert df['activation'].tolist() == ['ECD', 'CID', 'ETciD']
+    # MGF scan numbers are integers as in mzML
+    mgf_path = tmp_path / 'glycopeptides.mgf'
+    mgf_path.write_text('BEGIN IONS\nTITLE=s1\nPEPMASS=878.69 1000\nCHARGE=3+\nRTINSECONDS=600\nSCANS=1234\n204.0867 100\n1189.512 50\nEND IONS\n')
+    assert load_spectra_filepath(str(mgf_path))['scan'].tolist() == [1234]

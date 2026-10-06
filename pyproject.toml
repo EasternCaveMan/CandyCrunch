@@ -30,6 +30,7 @@ dependencies = [
     "pandas",
     "statsmodels",
     "pymzml", 
+    "opentfraw>=2.0",
     "pyteomics",
     "lxml",
     "openpyxl",
