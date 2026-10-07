@@ -1,6 +1,5 @@
 import ast
 import copy
-import inspect
 import os
 import re
 import pickle
@@ -26,7 +25,7 @@ from glycowork.motif.processing import enforce_class
 from glycowork.motif.annotate import get_molecular_properties
 from glycowork.motif.tokenization import (composition_to_mass, get_ion_mzs,
                                           glycan_to_composition, PROTON_MASS,
-                                          glycan_to_mass, calculate_adduct_mass,
+                                          glycan_to_mass, modification_formula_dict, calculate_adduct_mass,
                                           mz_to_composition, structure_to_basic, mass_dict)
 try:
     from glycowork.motif.tokenization import modification_formula_dict
@@ -184,8 +183,7 @@ MODEL_INFERENCE_DEFAULTS = {
 MZ_REF = 1600  # reference m/z used internally to turn the user's single ppm tolerance into the flat-Da window for binning/fragments; corresponds to ~0.5 Da at 300ppm
 ISOTOPE_SPACING = 1.003355  # 13C - 12C
 # Label mass a reducing-end modification adds (H2 for reduction, label minus O for reductive amination)
-modification_mass_dict = (dict(legacy_modification_mass_dict) if modification_formula_dict is None else
-                          {key: calculate_adduct_mass(formula) for key, formula in modification_formula_dict.items()})
+modification_mass_dict = {k: calculate_adduct_mass(v) for k, v in modification_formula_dict.items()}
 # Natural abundances of each element's isotopes at +0, +1, +2, ... Da, for the share of a glycan's molecules within the integrated isotope peaks
 ISOTOPE_ABUNDANCES = {'C': [0.9893, 0.0107], 'H': [0.999885, 0.000115], 'N': [0.99636, 0.00364], 'O': [0.99757, 0.00038, 0.00205],
                       'S': [0.9499, 0.0075, 0.0425, 0, 0.0001], 'P': [1.0]}
