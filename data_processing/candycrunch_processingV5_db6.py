@@ -93,21 +93,27 @@ def extract_mzml_metadata(run=None, attrs=None, df=None, metadata=None, filepath
         update_modification(os.path.basename(filepath))
 
     if run is not None:
-        instrument_list = run.info.get("instrument_configuration_list_element")
-        if instrument_list is not None:
+        # msconvert writes the instrument model into referenceableParamGroupList, which the old code never read. Models
+        # (e.g., MS:1001911 "Q Exactive") are OBO descendants of MS:1000031, never MS:1000031 itself; run.OT follows the
+        # file's cv version and often falls back to OBO 1.1.0 without most models, so use 4.1.33 (bundled with pymzml 2.5.6+)
+        obo = pymzml.obo.OboTranslator.from_cache(version="4.1.33")
+        obo["MS:1000031"]  # pymzml parses the OBO lazily, on first lookup
+        for list_key in ("referenceable_param_group_list_element", "instrument_configuration_list_element"):
+            instrument_list = run.info.get(list_key)
+            if instrument_list is None:
+                continue
             for cv in instrument_list.iter():
                 if not cv.tag.endswith("cvParam"):
                     continue
-
                 accession = cv.attrib.get("accession", "")
-                # Old code:
-                # name = cv.attrib.get("name", "")
                 name = cv.attrib.get("name") or ""
                 name_lower = name.lower()
                 update_modification(name)
-
-                if accession == "MS:1000031":
-                    metadata_out["instrument"] = name
+                ancestor = accession
+                while ancestor and ancestor != "MS:1000031":
+                    ancestor = (obo.id.get(ancestor, {}).get("is_a") or "").split(" ")[0]
+                if ancestor == "MS:1000031":
+                    metadata_out["instrument"] = cv.attrib.get("value") or name
                 elif "orbitrap" in name_lower:
                     metadata_out["trap"] = "orbitrap"
                 elif "linear ion trap" in name_lower:
@@ -124,16 +130,7 @@ def extract_mzml_metadata(run=None, attrs=None, df=None, metadata=None, filepath
                     metadata_out["ion_source"] = "APCI"
                 elif "maldi" in name_lower:
                     metadata_out["ion_source"] = "MALDI"
-
-                if any(lc_name in name_lower for lc_name in (
-                        "easy-nlc",
-                        "ultimate",
-                        "vanquish",
-                        "uplc",
-                        "hplc",
-                        "nano lc",
-                        "nano-lc",
-                )):
+                if any(lc_name in name_lower for lc_name in ("easy-nlc", "ultimate", "vanquish", "uplc", "hplc", "nano lc", "nano-lc")):
                     metadata_out["lc_system"] = name
 
     if df is not None:
@@ -596,10 +593,13 @@ def _process_downloaded_file(file_path, output_dir, reuse_existing_mzml=True):
             print(f"  Cleaned up temporary extraction directory")
         except Exception as e:
             print(f"  Warning: Could not clean up {extract_dir}: {e}")
+        if mzml_files:
+            with open(f"{file_path}.extracted.json", "w", encoding="utf-8") as handle:
+                json.dump([os.path.basename(path) for path in mzml_files], handle)
         try:
             os.remove(file_path)
             print(f"  Removed original {archive_type} file")
-        except:
+        except OSError:
             pass
 
     return mzml_files
@@ -615,14 +615,30 @@ def download_and_process(download_base_url=None, output_dir=None, file_names=Non
         url = f"{download_base_url}/{urllib.parse.quote(file_name)}"
         download_target = os.path.join(output_dir, file_name)
         os.makedirs(os.path.dirname(download_target), exist_ok=True)
+        # extracted archives are deleted, so without this marker a rerun re-downloads them and re-extracts every file as a duplicate *_2.mzML
+        marker_path = f"{download_target}.extracted.json"
+        if os.path.exists(marker_path):
+            with open(marker_path, encoding="utf-8") as handle:
+                all_mzml_files.extend(path for path in (os.path.join(output_dir, name) for name in json.load(handle)) if os.path.exists(path))
+            print(f"Skipping {file_name}: already downloaded and extracted")
+            continue
         print(f"\n{'=' * 60}")
         print(f"Processing {file_name}")
         print(f"{'=' * 60}")
         print(f"1. Downloading {file_name}...")
+        # resumable pure-Python download: wget does not exist on Windows (FileNotFoundError escaped the old except; doesn't matter for Linux but still); HTTP 416 = already complete
+        resume_from = os.path.getsize(download_target) if os.path.exists(download_target) else 0
+        request = urllib.request.Request(url, headers={"User-Agent": "CandyCrunch/1.0", "Range": f"bytes={resume_from}-"})
         try:
-            subprocess.run(["wget", "-c", url, "-O", download_target], check=True)
+            with urllib.request.urlopen(request, timeout=60) as response, open(download_target, "ab" if response.status == 206 else "wb") as handle:
+                shutil.copyfileobj(response, handle, 1024 * 1024)
             print(f"✓ Successfully downloaded {file_name}")
-        except subprocess.CalledProcessError as e:
+        except urllib.error.HTTPError as e:
+            if e.code != 416:
+                print(f"✗ Failed to download {file_name}: {e}")
+                continue
+            print(f"✓ {file_name} was already fully downloaded")
+        except (urllib.error.URLError, OSError) as e:
             print(f"✗ Failed to download {file_name}: {e}")
             continue
         downloaded_file_path = os.path.abspath(download_target)
@@ -670,14 +686,11 @@ def process_local_files(output_dir = None, file_names = None):
 
 
 def _extract_xic_peak(
-        precursor_mz,
+        xic,
         scan_rt,
         ms1_rts,
-        ms1_scans,
-        mz_tolerance=None,
         min_prominence_frac=None,
         rt_pad=None):
-    mz_tolerance = XIC_MZ_TOLERANCE if mz_tolerance is None else mz_tolerance
     min_prominence_frac = XIC_PEAK_PROMINENCE_FRAC if min_prominence_frac is None else min_prominence_frac
     rt_pad = XIC_RT_PAD if rt_pad is None else rt_pad
     empty_result = {
@@ -691,15 +704,6 @@ def _extract_xic_peak(
         'xic_right_RT': np.nan,
         'xic_apex_intensity': np.nan,
     }
-    if len(ms1_rts) == 0:
-        return empty_result
-    xic = np.zeros(len(ms1_rts))
-    for s in range(len(ms1_scans)):
-        mzs, ints = ms1_scans[s]
-        lo = np.searchsorted(mzs, precursor_mz - mz_tolerance, side='left')
-        hi = np.searchsorted(mzs, precursor_mz + mz_tolerance, side='right')
-        if hi > lo:
-            xic[s] = ints[lo:hi].sum()
     if xic.max() <= 0:
         return empty_result
     peaks, peak_props = find_peaks(xic, prominence=min_prominence_frac * xic.max())
@@ -746,13 +750,14 @@ def _filename_from_path(filepath):
 
 
 def _mapping_for_file(df_mz_total, filepath):
-    df_mz = df_mz_total
-    metadata_cols = {"glycan_class", "rt_group"}
-    for column in [c for c in df_mz_total.columns.tolist()[3:] if c not in metadata_cols]:
-        if column in os.fspath(filepath):
-            df_mz = df_mz_total[df_mz_total[column] > 0].reset_index(drop=True)
-            break
-    return df_mz
+    # match sample columns against the file name only (not its folders), longest first so "S1" cannot claim "S10.mzML";
+    # named exclusion instead of columns[3:], which silently dropped the first sample column of mappings without RT
+    filename = os.path.basename(os.fspath(filepath))
+    non_sample_cols = {"Mass", "RT", "glycan", "added_db", "removed_db", "glycan_class", "rt_group"}
+    for column in sorted((c for c in df_mz_total.columns if c not in non_sample_cols), key=len, reverse=True):
+        if column in filename:
+            return df_mz_total[df_mz_total[column] > 0].reset_index(drop=True)
+    return df_mz_total
 
 
 def _prepare_match_index(df_mz, retention=False):
@@ -782,14 +787,17 @@ def _process_mzML_stack(filepath, num_peaks= None,
     highest_i_dict = {}
     rts, intensities, mzs, charges = [], [], [], []
     detected_mode = metadata.get("mode")
-    detected_trap = metadata.get("trap")
+    # the MS2 scan's own analyzer (filter string FTMS/ITMS) decides first: on hybrids (LTQ Orbitrap, Fusion) the run-level list holds
+    # both analyzers and the last one ("linear") won, even when MS2 was read out in the Orbitrap
+    detected_trap = None
     ms1_rts, ms1_scans = [], []
     for spectrum in run:
         if extract_ms1 and spectrum.ms_level == 1:
             peaks_raw = spectrum.peaks("raw")
             if len(peaks_raw) > 0:
                 ms1_rts.append(spectrum.scan_time_in_minutes())
-                ms1_scans.append((peaks_raw[:, 0].copy(), peaks_raw[:, 1].copy()))
+                # cumulative intensities (same memory as the raw ones) turn every XIC window sum into one subtraction
+                ms1_scans.append((peaks_raw[:, 0].copy(), np.concatenate(([0.0], np.cumsum(peaks_raw[:, 1])))))
         if spectrum.ms_level == ms_level:
             try:
                 peaks_raw = spectrum.peaks("raw")
@@ -820,13 +828,16 @@ def _process_mzML_stack(filepath, num_peaks= None,
                             metadata["modification"] = "permethylated"
                         elif "reduced" in name_lower or "reduction" in name_lower:
                             metadata["modification"] = "reduced"
+                    # activation terms are named, e.g., "beam-type collision-induced dissociation", so substrings never matched; better use the ontology
                     if metadata.get("fragmentation") is None:
-                        if "hcd" in name_lower:
+                        if acc in {"MS:1000422", "MS:1002481"}:
                             metadata["fragmentation"] = "HCD"
-                        elif "cid" in name_lower:
+                        elif acc in {"MS:1000133", "MS:1002472"}:
                             metadata["fragmentation"] = "CID"
-                        elif "etd" in name_lower:
+                        elif acc == "MS:1000598":
                             metadata["fragmentation"] = "ETD"
+                        elif acc == "MS:1002631":
+                            metadata["fragmentation"] = "EThcD"
             num_actual_peaks = len(peaks_raw) if num_peaks is None else min(num_peaks, len(peaks_raw))
             selected_peaks = spectrum.highest_peaks(num_actual_peaks)
             mz_i_dict = {float(mz): float(i) for mz, i in selected_peaks}
@@ -855,28 +866,26 @@ def _process_mzML_stack(filepath, num_peaks= None,
     if intensity:
         df_out['intensity'] = intensities
     metadata["mode"] = metadata.get("mode") or detected_mode
-    metadata["trap"] = metadata.get("trap") or detected_trap
+    metadata["trap"] = detected_trap or metadata.get("trap")
     df_out.attrs.update(metadata)
     df_out.attrs['detected_mode'] = detected_mode
     df_out.attrs['detected_trap'] = detected_trap
-    if extract_ms1 and xic_mode != "off":
-        df_out.attrs['ms1_rts'] = np.array(ms1_rts)
-        df_out.attrs['ms1_scans'] = ms1_scans
-        if len(ms1_rts) > 0 and len(df_out) > 0:
-            xic_results = []
-            for r in range(len(df_out)):
-                xic_results.append(
-                    _extract_xic_peak(
-                        df_out['m/z'].values[r],
-                        df_out.RT.values[r],
-                        df_out.attrs['ms1_rts'],
-                        ms1_scans
-                    )
-                )
-            for column in xic_results[0]:
-                df_out[column] = [result[column] for result in xic_results]
-        df_out.attrs.pop('ms1_rts', None)
-        df_out.attrs.pop('ms1_scans', None)
+    if extract_ms1 and xic_mode != "off" and len(ms1_rts) > 0 and len(df_out) > 0:
+        ms1_rts = np.array(ms1_rts)
+        precursor_mzs = df_out['m/z'].to_numpy(dtype=float)
+        precursor_rts = df_out['RT'].to_numpy(dtype=float)
+        xic_results = []
+        # XICs for 1000 precursors per vectorized lookup in each MS1 scan, instead of a Python loop over every MS1 scan per precursor
+        for start in range(0, len(precursor_mzs), 1000):
+            chunk = precursor_mzs[start:start + 1000]
+            xics = np.zeros((len(chunk), len(ms1_rts)))
+            for s, (scan_mzs, cumulative_ints) in enumerate(ms1_scans):
+                lo = np.searchsorted(scan_mzs, chunk - XIC_MZ_TOLERANCE, side='left')
+                hi = np.searchsorted(scan_mzs, chunk + XIC_MZ_TOLERANCE, side='right')
+                xics[:, s] = np.where(hi > lo, cumulative_ints[hi] - cumulative_ints[lo], 0.0)
+            xic_results.extend(_extract_xic_peak(xic, rt, ms1_rts) for xic, rt in zip(xics, precursor_rts[start:start + 1000]))
+        for column in xic_results[0]:
+            df_out[column] = [result[column] for result in xic_results]
     return df_out
 
 
@@ -1155,8 +1164,10 @@ def _clear_dataframe_attrs(df):
 
 
 def _process_single_mzml_for_extraction(args):
+    global RT_TOLERANCE, XIC_MZ_TOLERANCE, XIC_SCORE_MARGIN
+    # spawned workers (Windows, and Linux from Python 3.14) re-import this module and lose main()'s overrides, so they travel with the task
     (filepath, glycopost_id, df_mz, glycan_class, retention, xic_mode,
-     mass_tolerance, num_peaks) = args
+     mass_tolerance, num_peaks, RT_TOLERANCE, XIC_MZ_TOLERANCE, XIC_SCORE_MARGIN) = args
     spectrum_df = _process_mzML_stack(
         filepath,
         num_peaks=num_peaks,
@@ -1229,6 +1240,9 @@ def data_extraction(mzml_files, glycopost_id, df_mz_total, out_path, glycan_clas
             xic_mode,
             mass_tolerance,
             NUMBER_PEAKS,
+            RT_TOLERANCE,
+            XIC_MZ_TOLERANCE,
+            XIC_SCORE_MARGIN,
         )
         for k in mzml_files
     ]
@@ -1379,7 +1393,36 @@ def main(args):
             df_mz_total = mapping_file
         else:
             df_mz_total = pd.read_csv(mapping_file)
-        out_path = os.path.join("Final_Results", f'{glco_id}_results')
+        # rescue reported masses that cannot match (rounded or truncated, e.g., "1625" for 1625.61) with the exact m/z of the annotated glycan's
+        # nearest protonated/deprotonated ion, under the ion mode, reducing end and derivatization explaining most rows of this mapping; rows
+        # already within tolerance keep their reported mass, as do rows >1 Da from every ion (annotation and mass disagree) or without a glycan
+        from glycowork.motif.tokenization import glycan_to_mass, get_ion_mzs
+        reported = pd.to_numeric(df_mz_total["Mass"], errors="coerce").to_numpy(dtype=float)
+        best = None
+        for sample_prep in ("underivatized", "permethylated"):
+            for reducing_end in ("reduced", None):
+                neutral = []
+                for glycan in df_mz_total["glycan"]:
+                    try:
+                        neutral.append(glycan_to_mass(glycan, sample_prep=sample_prep, modification=reducing_end) if isinstance(glycan, str) else np.nan)
+                    except Exception:
+                        neutral.append(np.nan)
+                for max_charge in (-4, 4):
+                    ions = np.column_stack(list(get_ion_mzs(np.array(neutral, dtype=float), max_charge=max_charge, min_mass={2: 900, 3: 1500, 4: 3500}).values()))
+                    errors = np.abs(ions - reported[:, None])
+                    errors[np.isnan(errors)] = np.inf
+                    nearest_ion = errors.argmin(axis=1)
+                    error = errors[np.arange(len(errors)), nearest_ion]
+                    explained = int((error <= MASS_TOLERANCE).sum())
+                    if best is None or explained > best[0]:
+                        setting = f"{'negative' if max_charge < 0 else 'positive'} mode, {reducing_end or 'free reducing end'}, {sample_prep}"
+                        best = (explained, ions[np.arange(len(ions)), nearest_ion], error, setting)
+        _, theoretical_mz, error, setting = best
+        rescued = (error > MASS_TOLERANCE) & (error <= 1.0)
+        df_mz_total = df_mz_total.assign(Mass=np.where(rescued, theoretical_mz, reported))
+        print(f"Mapping: {int(rescued.sum())}/{len(rescued)} reported masses more than {MASS_TOLERANCE} Da off replaced by their exact m/z ({setting})")
+        # next to this script (where merge_train_pretrain.py looks by default) instead of wherever the process was launched from
+        out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Final_Results", f'{glco_id}_results')
         os.makedirs(out_path, exist_ok=True)
         summary = data_extraction(
             mzml_files=mzml_files,
@@ -1394,7 +1437,9 @@ def main(args):
             peak_workers=peak_workers,
         )
     elif not mzml_files:
-        print("\n️  No mzML files were generated. data extraction skipped.")
+        # raise instead of print: the wrapper otherwise logs SUCCESS and writes a dataset whose downloads all failed into history.txt,
+        # after which it is only ever reprocessed from its (empty) local folder
+        raise RuntimeError("No mzML files were generated, data extraction skipped")
     elif not has_mapping_data:
         print("\n  No mapping file provided. data extraction skipped.")
 
@@ -1402,7 +1447,7 @@ def main(args):
     print("ALL PROCESSING COMPLETED SUCCESSFULLY!")
     print(f"  - Processed files saved in: {output_dir}")
     if has_mapping_data and mzml_files:
-        print(f"  - Results saved in: {os.path.join('./Final_Results', f'{glco_id}_results')}")
+        print(f"  - Results saved in: {out_path}")
     print("=" * 60)
     return summary
 

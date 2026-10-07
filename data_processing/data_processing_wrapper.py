@@ -119,10 +119,12 @@ def main(args):
     print(f"Found {len(files)} files")
     for file in files:
         file_name = file.removeprefix("df_mz_").rsplit(".", 1)[0]
-        file_df = pd.read_csv(mz_maps_dir / file).copy()
-        if "_O" in file_name:
+        # _N/_O is a class suffix (it is stripped with removesuffix), so names like "_Neutrophil" must not force class 1
+        run_base = file_name.removesuffix("_N").removesuffix("_O")
+        file_df = pd.read_csv(mz_maps_dir / file)
+        if file_name.endswith("_O"):
             file_df["glycan_class"] = 0
-        elif "_N" in file_name:
+        elif file_name.endswith("_N"):
             file_df["glycan_class"] = 1
         else:
             file_df["glycan_class"] = file_df["glycan"].apply(get_glycan_label)
@@ -152,11 +154,8 @@ def main(args):
 
             for group_num, ((glycan_class, rt_group), group_df) in enumerate(grouped, start = 1):
                 rt = rt_group == "rtT"
-                if any(marker in file_name for marker in ("_N", "_O")):
-                    file_name = file_name.replace("_N", "_1").replace("_O", "_0")
-                    group_run_id = f"{file_name}_{rt_group}"
-                else:
-                    group_run_id = f"{file_name}_{glycan_class}_{rt_group}"
+                # file_name used to be rewritten here, so the 2nd group of "X_N" became "X_1_1_rtF" instead of "X_1_rtF"
+                group_run_id = f"{run_base}_{glycan_class}_{rt_group}"
                 group_mapping_df = group_df.drop(columns=["rt_group"])
                 files_downloaded_before = files_downloaded
                 files_path_before = files_path
@@ -217,12 +216,12 @@ def main(args):
                         error=e,
                     )
         else:
-            files_downloaded = None
-            file_name = file.removeprefix("df_mz_").rsplit(".", 1)[0]
-            folder_name = file_name.removesuffix("_N").removesuffix("_O")
-            files_path = data_processing_dir / "raw_files" / folder_name
-            if files_path.exists():
-                files_downloaded = True
+            files_path = data_processing_dir / "raw_files" / run_base
+            # no GPST ID means nothing to download; the old files_downloaded=None crashed in _str_to_bool and was logged as a cryptic FAILED
+            if not files_path.exists():
+                print(f"✗ {file}: no GlycoPOST ID and no raw files in {files_path}, skipping")
+                continue
+            files_downloaded = True
             if "RT" in file_df.columns:
                 file_df["rt_group"] = file_df["RT"].notna().map({
                     True: "rtT",
@@ -236,16 +235,12 @@ def main(args):
 
             for group_num, ((glycan_class, rt_group), group_df) in enumerate(grouped, start = 1):
                 rt = rt_group == "rtT"
-                if any(marker in file_name for marker in ("_N", "_O")):
-                    file_name = file_name.replace("_N", "_1").replace("_O", "_0")
-                    group_run_id = f"{file_name}_{rt_group}"
-                else:
-                    group_run_id = f"{file_name}_{glycan_class}_{rt_group}"
+                group_run_id = f"{run_base}_{glycan_class}_{rt_group}"
                 group_mapping_df = group_df.drop(columns=["rt_group"])
                 start_time = time.time()
                 try:
-                    print(f"{file}: File_name={file_name}, glycan_class={glycan_class}, retention={rt}. Group {group_num} out of {total_groups} group(s)")
-                    summary = candycrunch_processing.run_processing( glcopost_id = file_name,
+                    print(f"{file}: File_name={run_base}, glycan_class={glycan_class}, retention={rt}. Group {group_num} out of {total_groups} group(s)")
+                    summary = candycrunch_processing.run_processing( glcopost_id = run_base,
                                                                      output_dir = files_path,
                                                                      mapping_file = group_mapping_df,
                                                                      glycan_class = glycan_class,
@@ -259,10 +254,10 @@ def main(args):
                                                                      xic_score_margin = 0.25,
                                                                      group_run_id=group_run_id,
                                                                      peak_workers=args.peak_workers )
-                    if file_name not in completed_ids:
+                    if run_base not in completed_ids:
                         with report_history.open("a", encoding="utf-8") as handle:
-                            handle.write(f"{file_name}\n")
-                        completed_ids.add(file_name)
+                            handle.write(f"{run_base}\n")
+                        completed_ids.add(run_base)
                     write_group_report(
                         report_path=report_path,
                         status="SUCCESS",
