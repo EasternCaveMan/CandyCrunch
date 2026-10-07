@@ -39,7 +39,7 @@ from candycrunch.model import (CandyCrunch_CNN, CandyCrunch_Transformer, MemmapS
                                transform_mz, transform_rt)
 from candycrunch.analysis import CandyCrumbs, PEPTIDE_ION_TYPES
 from candycrunch.losses import CompositionConstraint
-
+import inspect
 CANDYCRUMBS_SUPPORTS_MS3 = 'ms3_precursor' in inspect.signature(CandyCrumbs).parameters
 
 this_dir, this_filename = os.path.split(__file__)
@@ -59,7 +59,7 @@ MODEL_CLASSES = {
 
 MODEL_DIR = os.path.join(os.path.dirname(this_dir), "training", "models")
 DEFAULT_MODEL_PATHS = {
-    "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_ShCl_GShS_CELOSS_NoCS_OP20261003.pt"),
+    "CNN": os.path.join(MODEL_DIR, "CandyCrunch_CNN_MoC20K8_GShS_CELOSS_NoCS_OP20261003.pt"),
     "Transformer": os.path.join(
         MODEL_DIR,
         "CandyCrunch_Transformer_MoE26K12_ShCl_GShS_H4L2PHD128_FFD256_MP256_"

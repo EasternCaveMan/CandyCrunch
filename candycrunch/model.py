@@ -48,7 +48,7 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
     """Read spectra from a training cache or in-memory inference arrays."""
 
     def __init__(self,cache_dir,targets,composition_vectors,model_type,max_peaks=None,transform_mz=None,transform_rt=None,
-                 *, arrays=None, repeats=1):
+                 *, arrays=None, repeats=1, default_composition=None):
         if (cache_dir is None) == (arrays is None):
             raise ValueError("Provide either cache_dir or in-memory arrays.")
         if not isinstance(repeats, (int, np.integer)) or repeats < 1:
@@ -69,6 +69,7 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
                 raise ValueError("Inference arrays must have the same number of samples.")
         self.targets = np.zeros(sample_count, dtype=np.int64) if targets is None else np.asarray(targets, dtype=np.int64)
         self.composition_vectors = None if composition_vectors is None else np.asarray(composition_vectors, dtype=np.float32)
+        self.default_composition = None if default_composition is None else np.asarray(default_composition, dtype=np.float32)
         self.model_type = model_type
         self.max_peaks = max_peaks
         self.transform_mz = transform_mz
@@ -96,6 +97,8 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
         if self._arrays is not None:
             return self._arrays
         names = ["bin_offsets", "bin_index", "bin_intensity", "bin_remainder"] if self.model_type == "CNN" else ["peak_offsets", "peak_mz", "peak_intensity"]
+        if (Path(self.cache_dir) / "sample_compositions.npy").exists():
+            names.append("sample_compositions")
         self._arrays = {name: np.load(Path(self.cache_dir) / f"{name}.npy", mmap_mode="r") for name in ["metadata", *names]}
         return self._arrays
 
@@ -104,7 +107,15 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
         arrays = self._open_arrays()
         metadata = arrays["metadata"][index]
         target = int(self.targets[index])
-        composition = arrays["sample_compositions"][index] if self.composition_vectors is None else self.composition_vectors[target]
+        if self.composition_vectors is None:
+            if "sample_compositions" in arrays:
+                composition = arrays["sample_compositions"][index]
+            elif self.default_composition is not None:
+                composition = self.default_composition
+            else:
+                raise ValueError("Unlabeled spectrum stores need sample_compositions.npy or default_composition.")
+        else:
+            composition = self.composition_vectors[target]
         precursor = torch.tensor(composition, dtype=torch.float32)
         retention_time = float(metadata[1])
         if self.transform_rt is not None:

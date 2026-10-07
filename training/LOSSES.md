@@ -2,13 +2,13 @@
 
 ## Supervised contrastive loss
 
-Use `--pretraining True` to train the model representations with the
+Use `--sup-pretraining True` to train the model representations with the
 supervised contrastive loss from Khosla et al., Eq. 2, then fine-tune the same
 model with the selected classification loss. For example, from `training/`:
 
 ```bash
 python training_script.py --dataset OP20260908 --split GShS --model CNN \
-  --pretraining True --pretraining-epochs 10 \
+  --sup-pretraining True --pretraining-epochs 10 \
   --loss_function cross_entropy --supcon-temperature 0.07
 ```
 
@@ -32,10 +32,28 @@ CNN SupCon views use the existing spectrum and RT jitter. Transformer SupCon
 views use RT jitter through the shared memmap dataset path. No model
 architecture, inference interface, or checkpoint weight layout changes are
 required. The pretraining checkpoint is saved first, then reloaded before
-fine-tuning starts. When `--pretraining False`, SupCon is not used and the
+fine-tuning starts. When `--sup-pretraining False`, SupCon is not used and the
 script trains directly with `--loss_function`.
 
-Use `--combine-loss True` instead of `--pretraining True` to apply SupCon during
+## Unsupervised contrastive pretraining
+
+Use `--unsup-pretraining True` to pretrain from an unlabeled spectra store. This
+uses repeated augmented views of each original spectrum as positives and treats
+other spectra in the batch as negatives:
+
+```bash
+python training_script.py --dataset OP20260908 --split GShS --model CNN \
+  --unsup-pretraining True --unsup-pretraining-dataset PreOP20261003 \
+  --pretraining-epochs 10 --loss_function cross_entropy \
+  --supcon-temperature 0.07
+```
+
+By default, the script loads `prepared_datasets_PreOP20261003/pretrain_data`.
+The unlabeled store does not provide glycan labels, so it uses a zero precursor
+composition vector during pretraining and learns from spectrum/metadata
+augmentations only.
+
+Use `--combine-loss True` instead of pretraining to apply SupCon during
 fine-tuning itself. This optimizes
 `loss_function + contrastive_loss_weight * SupConLoss`, using
 `--supcon-temperature` for the SupCon temperature:
@@ -46,9 +64,9 @@ python training_script.py --dataset OP20260908 --split GShS --model CNN \
   --contrastive-loss-weight 0.1 --supcon-temperature 0.07
 ```
 
-`--pretraining True` and `--combine-loss True` are mutually exclusive: the first
-uses SupCon before classification fine-tuning, and the second uses SupCon inside
-the fine-tuning objective.
+`--sup-pretraining True`, `--unsup-pretraining True`, and `--combine-loss True`
+are mutually exclusive: pretraining runs before classification fine-tuning,
+while combined loss applies SupCon inside the fine-tuning objective.
 
 ## Ambiguous labels (candidate sets)
 

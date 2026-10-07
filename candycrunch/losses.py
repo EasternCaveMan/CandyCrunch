@@ -142,6 +142,73 @@ class SupConLoss(torch.nn.Module):
         return anchor_losses[valid_anchors].mean()
 
 
+class UnsupervisedContrastiveLoss(torch.nn.Module):
+    """NT-Xent/InfoNCE loss where repeated augmented views of one sample are positives."""
+
+    uses_embeddings = True
+
+    def __init__(self, temperature=0.07, views_per_example=2):
+        super().__init__()
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and positive.")
+        if views_per_example < 2:
+            raise ValueError("views_per_example must be at least 2.")
+        self.temperature = temperature
+        self.views_per_example = int(views_per_example)
+
+    def _gather_distributed(self, features, sample_ids):
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return features, sample_ids, 0
+        world_size = torch.distributed.get_world_size()
+        if world_size == 1:
+            return features, sample_ids, 0
+        rank = torch.distributed.get_rank()
+        sample_ids = sample_ids + rank * sample_ids.max().add(1)
+        gathered_features = [torch.zeros_like(features) for _ in range(world_size)]
+        gathered_sample_ids = [torch.zeros_like(sample_ids) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_features, features.contiguous())
+        torch.distributed.all_gather(gathered_sample_ids, sample_ids.contiguous())
+        gathered_features[rank] = features
+        gathered_sample_ids[rank] = sample_ids
+        all_features = torch.cat(gathered_features, dim=0)
+        all_sample_ids = torch.cat(gathered_sample_ids, dim=0)
+        return all_features, all_sample_ids, rank * features.size(0)
+
+    def forward(self, features, labels=None):
+        if features.ndim != 2:
+            raise ValueError("features must have shape [batch, embedding_dim].")
+        batch_size = features.size(0)
+        if batch_size % self.views_per_example != 0:
+            raise ValueError("batch size must be divisible by views_per_example.")
+
+        features = F.normalize(features, dim=1)
+        sample_ids = torch.arange(
+            batch_size // self.views_per_example,
+            device=features.device,
+            dtype=torch.long,
+        ).repeat_interleave(self.views_per_example)
+        all_features, all_sample_ids, local_offset = self._gather_distributed(features, sample_ids)
+        logits = torch.matmul(features, all_features.T) / self.temperature
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+        local_rows = torch.arange(batch_size, device=features.device)
+        local_columns = local_rows + local_offset
+        logits_mask = torch.ones_like(logits, dtype=torch.bool)
+        logits_mask[local_rows, local_columns] = False
+        positive_mask = sample_ids.unsqueeze(1) == all_sample_ids.unsqueeze(0)
+        positive_mask = positive_mask & logits_mask
+
+        positive_counts = positive_mask.sum(dim=1)
+        valid_anchors = positive_counts > 0
+        if not valid_anchors.any():
+            return features.sum() * 0.0
+
+        log_denominator = torch.logsumexp(logits.masked_fill(~logits_mask, float("-inf")), dim=1)
+        log_prob = logits - log_denominator.unsqueeze(1)
+        anchor_losses = -(log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1) / positive_counts.clamp_min(1))
+        return anchor_losses[valid_anchors].mean()
+
+
 class ClassAwareContrastiveBatchSampler(torch.utils.data.Sampler):
     """Yield repeated-index batches for two-view supervised contrastive learning."""
 
@@ -206,6 +273,58 @@ class ClassAwareContrastiveBatchSampler(torch.utils.data.Sampler):
                 positions = torch.randperm(len(indices), generator=generator)[: self.examples_per_class].tolist()
                 for position in positions:
                     batch.extend([int(indices[position])] * self.views_per_example)
+            yield batch
+
+
+class UnlabeledContrastiveBatchSampler(torch.utils.data.Sampler):
+    """Yield repeated-index batches for augmented-view unsupervised contrastive learning."""
+
+    def __init__(
+        self,
+        num_samples,
+        examples_per_batch=256,
+        views_per_example=2,
+        drop_last=True,
+        seed=0,
+    ):
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive.")
+        if examples_per_batch < 1:
+            raise ValueError("examples_per_batch must be positive.")
+        if views_per_example < 2:
+            raise ValueError("views_per_example must be at least 2.")
+        self.num_samples = int(num_samples)
+        self.examples_per_batch = int(examples_per_batch)
+        self.views_per_example = int(views_per_example)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.original_batch_size = self.examples_per_batch
+        self.batch_size = self.examples_per_batch * self.views_per_example
+        if self.drop_last:
+            self._num_batches = self.num_samples // self.examples_per_batch
+        else:
+            self._num_batches = math.ceil(self.num_samples / self.examples_per_batch)
+        if self._num_batches < 1:
+            raise ValueError("Unlabeled contrastive sampler has fewer samples than examples_per_batch.")
+
+    def __len__(self):
+        return self._num_batches
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(self.num_samples, generator=generator).tolist()
+        stop = self._num_batches * self.examples_per_batch if self.drop_last else self.num_samples
+        for start in range(0, stop, self.examples_per_batch):
+            examples = indices[start:start + self.examples_per_batch]
+            if self.drop_last and len(examples) < self.examples_per_batch:
+                continue
+            batch = []
+            for index in examples:
+                batch.extend([int(index)] * self.views_per_example)
             yield batch
 
 

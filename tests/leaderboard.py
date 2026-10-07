@@ -91,7 +91,7 @@ LOSS_TAGS = {
     "CMLOSS": "custom_loss",
 }
 PRETRAINING_TAG_PATTERN = re.compile(
-    r"_(?P<tag>SupConPtE|PretrainE)(?P<pretraining_epochs>\d+)T(?P<supcon_temperature>[0-9.eE+-]+)(?=_)"
+    r"_(?P<tag>SupConPtE|UnsupConPtE|PretrainE)(?P<pretraining_epochs>\d+)T(?P<supcon_temperature>[0-9.eE+-]+)(?=_)"
 )
 LEGACY_CONTRASTIVE_TAG_PATTERN = re.compile(
     r"_SupConW[0-9.eE+-]+T[0-9.eE+-]+(?=_|$)"
@@ -417,6 +417,13 @@ def _checkpoint_model_parameters(checkpoint_path: str) -> dict[str, str]:
         parsed.pop("contrastive_loss_weight", None)
         parsed.pop("contrastive_loss_temperature", None)
     _set_if_present(parsed, "pretraining", training_args.get("pretraining"))
+    if parsed.get("pretraining") != "True" and (
+        training_args.get("sup_pretraining")
+        or training_args.get("unsup_pretraining")
+        or payload.get("sup_pretraining")
+        or payload.get("unsup_pretraining")
+    ):
+        parsed["pretraining"] = "True"
     _set_if_present(parsed, "pretraining_epochs", training_args.get("pretraining_epochs"))
     _set_if_present(parsed, "supcon_temperature", training_args.get("supcon_temperature"))
     if parsed.get("pretraining") != "True":

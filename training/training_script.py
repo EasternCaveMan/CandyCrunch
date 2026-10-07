@@ -5,7 +5,16 @@ import random
 from pathlib import Path
 import numpy as np
 import torch
-from candycrunch.losses import CandidateSetLoss, ClassAwareContrastiveBatchSampler, FocalLoss, SupConLoss, custom_loss, xyz_loss
+from candycrunch.losses import (
+    CandidateSetLoss,
+    ClassAwareContrastiveBatchSampler,
+    FocalLoss,
+    SupConLoss,
+    UnlabeledContrastiveBatchSampler,
+    UnsupervisedContrastiveLoss,
+    custom_loss,
+    xyz_loss,
+)
 from glycowork.ml.models import init_weights
 from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
@@ -62,12 +71,40 @@ def resolve_transformer_peak_hidden_dim(args):
     return args.nheads * 64
 
 
+def resolve_prepared_dataset_dir(dataset):
+    dataset_path = Path(dataset)
+    if dataset_path.exists():
+        return dataset_path
+    base_dirs = [Path("."), Path(__file__).resolve().parent]
+    for base_dir in base_dirs:
+        exact = base_dir / f"prepared_datasets_{dataset}"
+        if exact.exists():
+            return exact
+    matches = []
+    for base_dir in base_dirs:
+        matches.extend(base_dir.glob(f"prepared_datasets_{dataset}*"))
+    matches = sorted(set(matches))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"Could not find prepared dataset {dataset!r}.")
+    names = ", ".join(str(match) for match in matches)
+    raise ValueError(f"Prepared dataset {dataset!r} is ambiguous: {names}")
+
+
 def main(args):
     set_seed(args.current_seed)
-    if args.pretraining and args.combine_loss:
-        raise ValueError("Use either --pretraining True or --combine-loss True, not both.")
-    if args.pretraining and args.pretraining_epochs < 1:
-        raise ValueError("--pretraining-epochs must be at least 1 when --pretraining is True.")
+    pretraining_enabled = args.sup_pretraining or args.unsup_pretraining
+    if args.sup_pretraining and args.unsup_pretraining:
+        raise ValueError("Use either --sup-pretraining True or --unsup-pretraining True, not both.")
+    if pretraining_enabled and args.combine_loss:
+        raise ValueError("Use --sup-pretraining, --unsup-pretraining, or --combine-loss, not more than one.")
+    if pretraining_enabled and args.pretraining_epochs < 1:
+        raise ValueError("--pretraining-epochs must be at least 1 when pretraining is enabled.")
+    if args.unsup_pretraining and args.unsup_pretraining_examples_per_batch < 1:
+        raise ValueError("--unsup-pretraining-examples-per-batch must be positive.")
+    if args.unsup_pretraining and args.unsup_pretraining_views_per_example < 2:
+        raise ValueError("--unsup-pretraining-views-per-example must be at least 2.")
     if args.combine_loss and (not np.isfinite(args.contrastive_loss_weight) or args.contrastive_loss_weight <= 0):
         raise ValueError("--contrastive-loss-weight must be finite and positive when --combine-loss is True.")
     if args.model == "Transformer" and args.disable_mha_fastpath:
@@ -77,7 +114,7 @@ def main(args):
     # ============================================================
     # Load data
     # ============================================================
-    dataset_dir = Path(f"./prepared_datasets_{args.dataset}")
+    dataset_dir = resolve_prepared_dataset_dir(args.dataset)
     train_cache = dataset_dir / f"train_{args.split}"
     val_cache = dataset_dir / f"test_{args.split}"
 
@@ -153,7 +190,7 @@ def main(args):
                                      transform_rt=transform_rt if args.model == "CNN" else None)
 
     pretrain_trainset = None
-    if args.pretraining:
+    if args.sup_pretraining:
         pretrain_trainset = MemmapSpectrumDataset(train_cache,
                                                   y_train,
                                                   composition_vectors,
@@ -161,6 +198,19 @@ def main(args):
                                                   max_peaks=args.max_peaks,
                                                   transform_mz=transform_mz if args.model == "CNN" else None,
                                                   transform_rt=transform_rt)
+    elif args.unsup_pretraining:
+        unsup_pretrain_dir = resolve_prepared_dataset_dir(args.unsup_pretraining_dataset)
+        unsup_pretrain_cache = unsup_pretrain_dir / args.unsup_pretraining_cache
+        if not unsup_pretrain_cache.exists():
+            raise FileNotFoundError(f"Could not find unsupervised pretraining cache: {unsup_pretrain_cache}")
+        pretrain_trainset = MemmapSpectrumDataset(unsup_pretrain_cache,
+                                                  None,
+                                                  None,
+                                                  args.model,
+                                                  max_peaks=args.max_peaks,
+                                                  transform_mz=transform_mz if args.model == "CNN" else None,
+                                                  transform_rt=transform_rt,
+                                                  default_composition=np.zeros(len(comp_vector_order), dtype=np.float32))
 
     valset = MemmapSpectrumDataset(val_cache,
                                    y_test,
@@ -200,8 +250,10 @@ def main(args):
     train_generator = torch.Generator().manual_seed(args.current_seed)
     val_generator = torch.Generator().manual_seed(args.current_seed + 1)
     pretrain_batch_sampler = None
+    pretrain_val_batch_sampler = None
     pretrainloader = None
-    if args.pretraining:
+    pretrain_valloader = None
+    if args.sup_pretraining:
         pretrain_batch_sampler = ClassAwareContrastiveBatchSampler(
             y_train,
             classes_per_batch=args.supcon_classes_per_batch,
@@ -210,10 +262,28 @@ def main(args):
             seed=args.current_seed,
         )
         pretrainloader = make_loader(pretrain_trainset, False, args.num_workers, train_generator, pretrain_batch_sampler)
+    elif args.unsup_pretraining:
+        pretrain_sample_count = len(pretrain_trainset.targets)
+        pretrain_batch_sampler = UnlabeledContrastiveBatchSampler(
+            pretrain_sample_count,
+            examples_per_batch=args.unsup_pretraining_examples_per_batch,
+            views_per_example=args.unsup_pretraining_views_per_example,
+            seed=args.current_seed,
+        )
+        pretrain_val_batch_sampler = UnlabeledContrastiveBatchSampler(
+            pretrain_sample_count,
+            examples_per_batch=args.unsup_pretraining_examples_per_batch,
+            views_per_example=args.unsup_pretraining_views_per_example,
+            seed=args.current_seed + 1,
+        )
+        pretrainloader = make_loader(pretrain_trainset, False, args.num_workers, train_generator, pretrain_batch_sampler)
+        pretrain_valloader = make_loader(pretrain_trainset, False, args.val_num_workers, val_generator, pretrain_val_batch_sampler)
     trainloader = make_loader(trainset, True, args.num_workers, train_generator)
     valloader = make_loader(valset, False, args.val_num_workers, val_generator)
+    if args.sup_pretraining:
+        pretrain_valloader = valloader
     dataloaders = {"train": trainloader,"val": valloader}
-    pretrain_dataloaders = {"train": pretrainloader,"val": valloader} if pretrainloader is not None else None
+    pretrain_dataloaders = {"train": pretrainloader,"val": pretrain_valloader} if pretrainloader is not None else None
     print(
         f"DataLoader settings: train_workers={args.num_workers}, "
         f"val_workers={args.val_num_workers}, persistent={args.persistent_workers}, "
@@ -221,14 +291,23 @@ def main(args):
         f"multiprocessing={args.multiprocessing_context}"
     )
     if pretrain_batch_sampler is not None:
-        print(
-            "SupCon sampler: "
-            f"classes_per_batch={args.supcon_classes_per_batch}, "
-            f"examples_per_class={args.supcon_examples_per_class}, "
-            f"views_per_example={args.supcon_views_per_example}, "
-            f"original_examples={pretrain_batch_sampler.original_batch_size}, "
-            f"embedded_views={pretrain_batch_sampler.batch_size}"
-        )
+        if args.sup_pretraining:
+            print(
+                "SupCon sampler: "
+                f"classes_per_batch={args.supcon_classes_per_batch}, "
+                f"examples_per_class={args.supcon_examples_per_class}, "
+                f"views_per_example={args.supcon_views_per_example}, "
+                f"original_examples={pretrain_batch_sampler.original_batch_size}, "
+                f"embedded_views={pretrain_batch_sampler.batch_size}"
+            )
+        else:
+            print(
+                "Unsupervised contrastive sampler: "
+                f"examples_per_batch={args.unsup_pretraining_examples_per_batch}, "
+                f"views_per_example={args.unsup_pretraining_views_per_example}, "
+                f"original_examples={pretrain_batch_sampler.original_batch_size}, "
+                f"embedded_views={pretrain_batch_sampler.batch_size}"
+            )
     # ============================================================
     # Structural/composition distances
     # ============================================================
@@ -264,7 +343,12 @@ def main(args):
     print("Preparing the model")
     candidate_sets_tag = "_CS" if args.candidate_sets else "_NoCS"
     loss_tag = LOSS_TAGS.get(args.loss_function, "") + candidate_sets_tag
-    pretraining_tag = (f"_SupConPtE{args.pretraining_epochs}T{args.supcon_temperature}" if args.pretraining else "")
+    if args.sup_pretraining:
+        pretraining_tag = f"_SupConPtE{args.pretraining_epochs}T{args.supcon_temperature}"
+    elif args.unsup_pretraining:
+        pretraining_tag = f"_UnsupConPtE{args.pretraining_epochs}T{args.supcon_temperature}"
+    else:
+        pretraining_tag = ""
     combine_loss_tag = (f"_CombSupConW{args.contrastive_loss_weight:g}T{args.supcon_temperature:g}" if args.combine_loss else "")
     if args.model == "CNN":
         model_kwargs = {"input_dim": 2048,"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order),
@@ -304,7 +388,7 @@ def main(args):
             f"PHD{resolve_transformer_peak_hidden_dim(args)}_{'FFD' + str(args.ff_dim) + '_' if args.ff_dim is not None else ''}"
             f"MP{args.max_peaks}_PE({args.peak_encoder})_N({args.norm_type})_ACT({args.activation})_FF({args.use_transformer_ff})_"
             f"RU({args.use_resunits}){loss_tag}{pretraining_tag}{combine_loss_tag}_{args.dataset}")
-    pretrain_setting_name = setting_name if args.pretraining else None
+    pretrain_setting_name = setting_name if pretraining_enabled else None
     # ============================================================
     # Checkpoint metadata
     # ============================================================
@@ -316,6 +400,11 @@ def main(args):
             "lc","modification","trap"],"training_args":vars(args).copy(),}
     checkpoint_metadata["loss_function"] = args.loss_function
     checkpoint_metadata["combine_loss"] = bool(args.combine_loss)
+    checkpoint_metadata["sup_pretraining"] = bool(args.sup_pretraining)
+    checkpoint_metadata["unsup_pretraining"] = bool(args.unsup_pretraining)
+    if args.unsup_pretraining:
+        checkpoint_metadata["unsup_pretraining_dataset"] = args.unsup_pretraining_dataset
+        checkpoint_metadata["unsup_pretraining_cache"] = args.unsup_pretraining_cache
     if args.combine_loss:
         checkpoint_metadata["contrastive_loss_weight"] = float(args.contrastive_loss_weight)
         checkpoint_metadata["contrastive_loss_temperature"] = float(args.supcon_temperature)
@@ -367,19 +456,30 @@ def main(args):
         entity=("vahid-atabaigielmi-university-of-gothenburg"),name=setting_name,save_code=True)
     # Runs with several seeds share one setting_name, so each seed gets its own folder instead of overwriting the previous seed's checkpoint and metrics
     model_dir = Path("./models") if len(args.random_seeds) == 1 else Path("./models") / f"seed{args.current_seed}"
-    if args.pretraining:
+    if pretraining_enabled:
         pretrain_optimizer, pretrain_scheduler, _ = make_training_components(model,
                                                                              args.pretraining_patience if args.pretraining_patience is not None else args.patience)
-        pretrain_criterion = SupConLoss(temperature=args.supcon_temperature,cand_mask=cand_mask).to(device)
+        if args.sup_pretraining:
+            pretrain_criterion = SupConLoss(temperature=args.supcon_temperature,cand_mask=cand_mask).to(device)
+            pretrain_loss_name = "supcon"
+            pretrain_stage = "supcon_pretraining"
+            print("Start SupCon pretraining")
+        else:
+            pretrain_criterion = UnsupervisedContrastiveLoss(
+                temperature=args.supcon_temperature,
+                views_per_example=args.unsup_pretraining_views_per_example,
+            ).to(device)
+            pretrain_loss_name = "unsupcon"
+            pretrain_stage = "unsupervised_contrastive_pretraining"
+            print("Start unsupervised contrastive pretraining")
         pretrain_metadata = dict(checkpoint_metadata)
         pretrain_metadata["setting_name"] = pretrain_setting_name
-        pretrain_metadata["loss_function"] = "supcon"
-        pretrain_metadata["training_stage"] = "supcon_pretraining"
+        pretrain_metadata["loss_function"] = pretrain_loss_name
+        pretrain_metadata["training_stage"] = pretrain_stage
         pretrain_metadata["fine_tune_loss_function"] = args.loss_function
         pretrain_metadata["training_args"] = vars(args).copy()
-        pretrain_metadata["training_args"]["loss_function"] = "supcon"
+        pretrain_metadata["training_args"]["loss_function"] = pretrain_loss_name
         pretrain_metadata["training_args"]["fine_tune_loss_function"] = args.loss_function
-        print("Start SupCon pretraining")
         pretrain_model_dir = model_dir / "pretrained"
         model = train_model(model,pretrain_dataloaders,pretrain_criterion,pretrain_optimizer,pretrain_scheduler,glycans,
             num_epochs=args.pretraining_epochs,patience=args.pretraining_patience if args.pretraining_patience is not None else args.patience,
@@ -391,8 +491,8 @@ def main(args):
         checkpoint = torch.load(pretrain_model_path,map_location=device)
         model.load_state_dict(checkpoint["state_dict"])
         checkpoint_metadata["pretraining_checkpoint"] = str(pretrain_model_path)
-        checkpoint_metadata["pretraining_loss_function"] = "supcon"
-        print(f"Loaded SupCon pretrained weights from {pretrain_model_path}")
+        checkpoint_metadata["pretraining_loss_function"] = pretrain_loss_name
+        print(f"Loaded contrastive pretrained weights from {pretrain_model_path}")
 
     optimizer_ft, scheduler, _ = make_training_components(model, args.patience)
     criterion = make_finetuning_criterion()
@@ -441,25 +541,38 @@ if __name__ == "__main__":
         help=("Let ambiguous labels (e.g., Gal(b1-3/4)GlcNAc) also accept every more specific class in all losses and metrics "
               "(default: True; pass --candidate-sets to enable or --no-candidate-sets to train on single-class targets; "
               "setting names include _CS or _NoCS after the loss tag)."))
-    parser.add_argument("--pretraining",type=str_to_bool,nargs="?",const=True,default=False,
-        help="If True, run SupCon pretraining first, then fine-tune with --loss_function (default: False).")
+    parser.add_argument("--sup-pretraining","--sup_pretraining",dest="sup_pretraining",type=str_to_bool,nargs="?",const=True,default=False,
+        help="If True, run supervised SupCon pretraining on the labeled --dataset first, then fine-tune with --loss_function (default: False).")
+    parser.add_argument("--pretraining",dest="sup_pretraining",type=str_to_bool,nargs="?",const=True,help=argparse.SUPPRESS)
+    parser.add_argument("--unsup-pretraining","--unsup_pretraining",dest="unsup_pretraining",type=str_to_bool,nargs="?",const=True,default=False,
+        help="If True, run unsupervised contrastive pretraining on --unsup-pretraining-dataset first, then fine-tune with --loss_function (default: False).")
+    parser.add_argument("--unsup-pretraining-dataset","--unsup_pretraining_dataset",dest="unsup_pretraining_dataset",
+        type=str,default="PreOP20261003",help="Prepared dataset name/path for unsupervised pretraining; defaults to PreOP20261003.")
+    parser.add_argument("--unsup-pretraining-cache","--unsup_pretraining_cache",dest="unsup_pretraining_cache",
+        type=str,default="pretrain_data",help="Cache directory inside the unsupervised pretraining dataset (default: pretrain_data).")
     parser.add_argument("--combine-loss",type=str_to_bool,nargs="?",const=True,default=False,
         help=("If True, fine-tune with --loss_function plus "
-              "--contrastive-loss-weight * SupConLoss. Mutually exclusive with --pretraining."))
+              "--contrastive-loss-weight * SupConLoss. Mutually exclusive with pretraining."))
     parser.add_argument("--contrastive-loss-weight","--contrastive_loss_weight",dest="contrastive_loss_weight",
         type=float,default=0.1,help="Weight for SupConLoss when --combine-loss is True (default: 0.1).")
     parser.add_argument("--pretraining-epochs",type=int,default=10,
-        help="Number of SupCon pretraining epochs before fine-tuning (default: 10).")
+        help="Number of contrastive pretraining epochs before fine-tuning (default: 10).")
     parser.add_argument("--pretraining-patience",type=int,default=None,
         help="Early-stopping patience for SupCon pretraining. Defaults to --patience when omitted.")
     parser.add_argument("--supcon-temperature",type=float,default=0.07,
-        help="Temperature for supervised contrastive pretraining loss (default: 0.07).")
+        help="Temperature for supervised or unsupervised contrastive pretraining loss (default: 0.07).")
     parser.add_argument("--supcon-classes-per-batch",type=int,default=64,
         help="Classes sampled per SupCon pretraining batch (default: 64).")
     parser.add_argument("--supcon-examples-per-class",type=int,default=4,
         help="Distinct original examples sampled per class for SupCon pretraining (default: 4).")
     parser.add_argument("--supcon-views-per-example",type=int,default=2,
         help="Independent augmented views per original example for SupCon pretraining (default: 2).")
+    parser.add_argument("--unsup-pretraining-examples-per-batch","--unsup_pretraining_examples_per_batch",
+        dest="unsup_pretraining_examples_per_batch",type=int,default=256,
+        help="Original unlabeled spectra per unsupervised contrastive pretraining batch (default: 256).")
+    parser.add_argument("--unsup-pretraining-views-per-example","--unsup_pretraining_views_per_example",
+        dest="unsup_pretraining_views_per_example",type=int,default=2,
+        help="Independent augmented views per unlabeled spectrum for unsupervised pretraining (default: 2).")
     parser.add_argument("--patience", type = int, default = 6)
     parser.add_argument("--max_peaks",type=int,default=None)
     parser.add_argument("--num-workers",type=int,default=2,help="Training DataLoader workers.")
