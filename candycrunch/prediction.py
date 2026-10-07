@@ -1,5 +1,6 @@
 import ast
 import copy
+import inspect
 import os
 import re
 import pickle
@@ -25,12 +26,13 @@ from glycowork.motif.processing import enforce_class
 from glycowork.motif.annotate import get_molecular_properties
 from glycowork.motif.tokenization import (composition_to_mass, get_ion_mzs,
                                           glycan_to_composition, PROTON_MASS,
-                                          glycan_to_mass, modification_mass_dict as glycowork_modification_mass_dict,
-                                          calculate_adduct_mass,
+                                          glycan_to_mass, calculate_adduct_mass,
                                           mz_to_composition, structure_to_basic, mass_dict)
 try:
     from glycowork.motif.tokenization import modification_formula_dict
+    legacy_modification_mass_dict = None
 except ImportError:
+    from glycowork.motif.tokenization import modification_mass_dict as legacy_modification_mass_dict
     modification_formula_dict = None
 from glycowork.network.biosynthesis import construct_network, evoprune_network
 from pyteomics import mgf, mzxml
@@ -38,6 +40,8 @@ from candycrunch.model import (CandyCrunch_CNN, CandyCrunch_Transformer, MemmapS
                                transform_mz, transform_rt)
 from candycrunch.analysis import CandyCrumbs, PEPTIDE_ION_TYPES
 from candycrunch.losses import CompositionConstraint
+
+CANDYCRUMBS_SUPPORTS_MS3 = 'ms3_precursor' in inspect.signature(CandyCrumbs).parameters
 
 this_dir, this_filename = os.path.split(__file__)
 data_path = os.path.join(this_dir, 'glycans.pkl')
@@ -76,7 +80,6 @@ def _strip_module_prefix(state_dict):
 def _resolve_model_path(model):
     if not isinstance(model, (str, os.PathLike)):
         return model
-
     model_key = os.fspath(model).strip()
     canonical_name = {'cnn': 'CNN', 'transformer': 'Transformer'}.get(model_key.lower())
     if canonical_name is not None:
@@ -95,7 +98,6 @@ def _canonical_model_name(model):
         if canonical_name is not None:
             return canonical_name
         return _canonical_model_name(get_model(model_key))
-
     model_type = getattr(model, "_candycrunch_model_type", None)
     if model_type in {"CNN", "Transformer"}:
         return model_type
@@ -116,7 +118,6 @@ def load_checkpoint_model(checkpoint_path):
             f"{checkpoint_path} is not a CandyCrunch checkpoint dictionary. "
             "It looks like a raw state_dict or invalid checkpoint."
         )
-
     model_class_name = checkpoint.get("model_class")
     model_kwargs = checkpoint.get("model_kwargs")
     if model_class_name not in MODEL_CLASSES or not isinstance(model_kwargs, dict):
@@ -124,11 +125,9 @@ def load_checkpoint_model(checkpoint_path):
             f"Invalid checkpoint model metadata: model_class={model_class_name!r}, "
             f"available classes={list(MODEL_CLASSES)}."
         )
-
     loaded_model = MODEL_CLASSES[model_class_name](**model_kwargs).to(device)
     loaded_model.load_state_dict(_strip_module_prefix(checkpoint["state_dict"]))
     loaded_model.eval()
-
     model_type = checkpoint.get("model_type")
     if model_type not in {"CNN", "Transformer"}:
         model_type = "Transformer" if model_class_name == "CandyCrunch_Transformer" else "CNN"
@@ -185,7 +184,7 @@ MODEL_INFERENCE_DEFAULTS = {
 MZ_REF = 1600  # reference m/z used internally to turn the user's single ppm tolerance into the flat-Da window for binning/fragments; corresponds to ~0.5 Da at 300ppm
 ISOTOPE_SPACING = 1.003355  # 13C - 12C
 # Label mass a reducing-end modification adds (H2 for reduction, label minus O for reductive amination)
-modification_mass_dict = (dict(glycowork_modification_mass_dict) if modification_formula_dict is None else
+modification_mass_dict = (dict(legacy_modification_mass_dict) if modification_formula_dict is None else
                           {key: calculate_adduct_mass(formula) for key, formula in modification_formula_dict.items()})
 # Natural abundances of each element's isotopes at +0, +1, +2, ... Da, for the share of a glycan's molecules within the integrated isotope peaks
 ISOTOPE_ABUNDANCES = {'C': [0.9893, 0.0107], 'H': [0.999885, 0.000115], 'N': [0.99636, 0.00364], 'O': [0.99757, 0.00038, 0.00205],
@@ -285,14 +284,25 @@ def process_mzML_stack(filepath, num_peaks = 1000,
    | :-
    | Returns a pandas dataframe of spectra with m/z, peak dictionary, retention time, charge, intensity if True, scan (the scan= number of the native
    | spectrum ID, else the whole ID), and activation ('CID', 'HCD', 'ETD', 'ECD', 'EThcD', 'ETciD', the fragmentation_method values of CandyCrumbs,
-   | with EAD as 'ECD' for its c/z ions; None if not stated)
+   | with EAD as 'ECD' for its c/z ions; None if not stated), and, if the file has MS3 spectra, ms3 (a list of (MS3 precursor m/z, peak dictionary)
+   | tuples per MS2 spectrum)
    """
     run = pymzml.run.Reader(filepath)
     highest_i_dict = {}
     rts, intensities, mzs, charges, scans, activations = [], [], [], [], [], []
     detected_mode, detected_trap = None, None
     ms1_rts, ms1_mzs, ms1_ints, ms1_scans, refine = [], [], [], [], []
+    ms3s, row_of = [], {}
     for spectrum in run:
+        if spectrum.ms_level == ms_level + 1 and spectrum.selected_precursors and mzs:
+            # An MS3 spectrum fragments one fragment of an MS2 spectrum; its precursors are listed latest stage first, each referencing its
+            # parent scan by native ID (else, as in old converters, it belongs to the latest MS2 spectrum)
+            ref = next(spectrum.element.iter('{http://psi.hupo.org/ms/mzml}precursor')).get('spectrumRef')
+            row = row_of.get(ref, len(mzs) - 1 if ref is None else None)
+            if row is not None and len(spectrum.peaks("raw")):
+                peaks = spectrum.highest_peaks(min(num_peaks, len(spectrum.peaks("raw"))))
+                ms3s[row].append((float(spectrum.selected_precursors[0]['mz']), dict(sorted(((float(m), float(i)) for m, i in peaks),
+                                                                                              key = lambda x: x[1], reverse = True))))
         if spectrum.ms_level == 1:
             peaks_raw = spectrum.peaks("raw")
             if len(peaks_raw) > 0:
@@ -334,6 +344,8 @@ def process_mzML_stack(filepath, num_peaks = 1000,
                 native_id = spectrum.element.get('id', '')
                 key = f"{native_id}_{spectrum.selected_precursors[0]['mz']}"
                 highest_i_dict[key] = mz_i_dict
+                row_of[native_id] = len(mzs)
+                ms3s.append([])
                 mzs.append(float(key.split('_')[-1]))
                 rts.append(spectrum.scan_time_in_minutes())
                 # Search engines identify glycopeptide spectra by scan number, and HCD and EThcD scans of one precursor alternate in
@@ -369,6 +381,9 @@ def process_mzML_stack(filepath, num_peaks = 1000,
     if intensity:
         df_out['intensity'] = intensities
     df_out['scan'], df_out['activation'] = scans, activations
+    # Each MS2 spectrum's MS3 spectra as (MS3 precursor m/z, peak dictionary) tuples; files without MS3 get no column
+    if any(ms3s):
+        df_out['ms3'] = ms3s
     # Flat MS1 store (rts, mzs, intensities, offsets): the peaks of scan i are mzs[offsets[i]:offsets[i + 1]]
     ms1 = (np.array(ms1_rts), np.concatenate(ms1_mzs) if ms1_mzs else np.zeros(0, np.float32),
            np.concatenate(ms1_ints) if ms1_ints else np.zeros(0, np.float32),
@@ -400,8 +415,17 @@ def process_mzXML_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fa
     rts, intensities, mzs, charges, scans, activations = [], [], [], [], [], []
     detected_mode, detected_trap = None, None
     ms1_rts, ms1_mzs, ms1_ints, ms1_scans, refine = [], [], [], [], []
+    ms3s, row_of = [], {}
     with mzxml.read(filepath) as reader:
         for spectrum in reader:
+            if spectrum['msLevel'] == ms_level + 1 and spectrum.get('precursorMz') and len(spectrum['m/z array']) and mzs:
+                # As in process_mzML_stack; mzXML names the parent scan as precursorScanNum (nested scans are yielded one by one)
+                prec = next((p for p in spectrum['precursorMz'] if int(p.get('precursorScanNum', -1)) in row_of), spectrum['precursorMz'][0])
+                row = row_of.get(int(prec.get('precursorScanNum', -1)), len(mzs) - 1 if 'precursorScanNum' not in prec else None)
+                if row is not None:
+                    top_idx = np.argsort(spectrum['intensity array'])[::-1][:num_peaks]
+                    ms3s[row].append((float(prec['precursorMz']), {float(m): float(i) for m, i in zip(spectrum['m/z array'][top_idx],
+                                                                                                    spectrum['intensity array'][top_idx])}))
             if spectrum['msLevel'] == 1 and len(spectrum['m/z array']):
                 order = np.argsort(spectrum['m/z array'], kind = 'stable')
                 ms1_rts.append(float(spectrum['retentionTime']))
@@ -422,6 +446,8 @@ def process_mzXML_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fa
                     precursor_mz = spectrum['precursorMz'][0]['precursorMz']
                     key = f"{spectrum['id']}_{precursor_mz}"
                     highest_i_dict[key] = mz_i_dict
+                    row_of[int(spectrum['num'])] = len(mzs)
+                    ms3s.append([])
                     mzs.append(float(precursor_mz))
                     rts.append(spectrum['retentionTime'])
                     scans.append(int(spectrum['num']))
@@ -449,6 +475,8 @@ def process_mzXML_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fa
     if intensity:
         df_out['intensity'] = intensities
     df_out['scan'], df_out['activation'] = scans, activations
+    if any(ms3s):
+        df_out['ms3'] = ms3s
     # Same flat MS1 store and precursor refinement as process_mzML_stack
     ms1 = (np.array(ms1_rts), np.concatenate(ms1_mzs) if ms1_mzs else np.zeros(0, np.float32),
            np.concatenate(ms1_ints) if ms1_ints else np.zeros(0, np.float32),
@@ -480,20 +508,84 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
         raise ImportError("Reading Thermo .raw files requires the optional 'opentfraw' package.")
     raw = opentfraw.RawFile(filepath)
     table = raw.scan_table()
+    # opentfraw 2.0.0 misreads the scan events of version 66 files from ion traps (LTQ, LTQ XL, LTQ Orbitrap Velos with Xcalibur 4): they are
+    # self-describing (136-byte preamble, then counted 56-byte reactions, 16-byte scan windows and 8-byte coefficients, then 3 u32), not of the
+    # fixed size it assumes. Its peaks, profile intensities, retention times and trailers are right, so if this layout walks exactly over the event
+    # stream, the columns read below are rebuilt from the events and the trailer
+    index_addr, data_addr = 0, 0
+    with open(filepath, 'rb') as f:
+        f.seek(36)
+        if int.from_bytes(f.read(4), 'little') >= 66:
+            # Skips the sequence row (64 bytes, 31 strings with a u32 after the 16th) and the autosampler info (24 bytes, a string), each string
+            # being a u32 count of UTF-16 characters followed by them
+            f.seek(1420)
+            for size in [None] * 16 + [4] + [None] * 15 + [24, None]:
+                f.seek(size or 2 * int.from_bytes(f.read(4), 'little'), 1)
+            info = f.read(824)
+            addrs = f.read(16 * max(int.from_bytes(info[28:32], 'little'), 2))
+            # The MS controller's run header has scan events or the file's data address
+            for a in range(0, len(addrs), 16):
+                f.seek(int.from_bytes(addrs[a:a + 8], 'little'))
+                run_header = f.read(7464)
+                n_events = int.from_bytes(run_header[7376:7380], 'little')
+                if int.from_bytes(addrs[a:a + 8], 'little') and (n_events or run_header[7416:7424] == info[808:816]):
+                    break
+            trailer_addr, params_addr = int.from_bytes(run_header[7448:7456], 'little'), int.from_bytes(run_header[7456:7464], 'little')
+            f.seek(trailer_addr + 4)
+            stream = f.read(max(params_addr - trailer_addr - 4, 0))
+            starts, pos = [], 0
+            while pos + 148 <= len(stream) and len(starts) < n_events:
+                starts.append(pos)
+                pos += 140 + 56 * int.from_bytes(stream[pos + 136:pos + 140], 'little')
+                pos += 4 + 16 * int.from_bytes(stream[pos:pos + 4], 'little')
+                pos += 16 + 8 * int.from_bytes(stream[pos:pos + 4], 'little')
+            if pos == len(stream) and len(starts) == len(table['ms_level']) and len(set(np.diff(starts + [pos]))) > 1:
+                index_addr, data_addr = int.from_bytes(run_header[7408:7416], 'little'), int.from_bytes(info[808:816], 'little')
+                for i, s in enumerate(starts):
+                    level = max(stream[s + 6], 1)
+                    reactions = [np.frombuffer(stream, '<f8', 3, s + 140 + 56 * k) for k in range(int.from_bytes(stream[s + 136:s + 140], 'little'))]
+                    act = {1: 'hcd', 3: 'etd', 4: 'cid', 5: 'ecd'}.get(stream[s + 24], '')
+                    params = (raw.scan_parameters(raw.first_scan + i) or {}) if level > 1 else {}
+                    mono, charge = params.get('Monoisotopic M/Z:') or 0, int(params.get('Charge State:') or 0)
+                    table['ms_level'][i] = level
+                    table['polarity'][i] = {0: '-', 1: '+'}.get(stream[s + 4])
+                    table['scan_mode'][i] = {0: 'centroid', 1: 'profile'}.get(stream[s + 5])
+                    table['analyzer'][i] = {0: 'ITMS', 1: 'TQMS', 2: 'SQMS', 3: 'TOFMS', 4: 'FTMS', 5: 'Sector'}.get(stream[s + 40])
+                    table['filter_string'][i] = ' '.join(f'{mz:.4f}@{act}{energy:.2f}' for mz, width, energy in reactions if mz > 0)
+                    table['precursor_mz'][i] = mono if mono > 0 else float(reactions[-1][0]) if reactions else None
+                    table['charge'][i] = charge if charge > 0 else None
+                    table['isolation_width'][i] = params.get('MS2 Isolation Width:') or params.get('MSn Isolation Width:')
     peak_ds, rts, intensities, mzs, charges, scans, activations = [], [], [], [], [], [], []
     detected_mode, detected_trap = None, None
     ms1_rts, ms1_mzs, ms1_ints, ms1_scans, refine, ms1_index = [], [], [], [], [], {}
+    ms3s, isolations = [], []
     for i, scan in enumerate(range(raw.first_scan, raw.last_scan + 1)):
-        if table['ms_level'][i] not in (1, ms_level):
+        if table['ms_level'][i] not in (1, ms_level, ms_level + 1):
             continue
         peak_mzs, peak_ints = raw.peaks(scan)
-        # Ion-trap profile scans come without centroids. Like Thermo's centroider (which made the centroids of mzML files from such runs, all at least
-        # 0.5 m/z apart), the profile is split at the lowest point between maxima (ignoring maxima below 1e-6 of the scan's highest point, which are
-        # numerical noise) and neighboring centroids closer than 0.5 m/z are merged, each carrying the summed signal of its share of the profile at
-        # its intensity-weighted m/z
+        # Ion-trap profile scans come without centroids. Like Thermo's centroider, which made the centroids of mzML files from such runs, profile
+        # points below 1 are dropped, the profile is split at the lowest point between maxima and neighboring centroids closer than 0.5 m/z are
+        # merged, each carrying the summed signal of its share of the profile at its intensity-weighted m/z
         if not len(peak_mzs) and table['scan_mode'][i] == 'profile' and table['analyzer'][i] != 'FTMS':
             prof_mzs, prof_ints = raw.profile(scan)
-            apex = np.where((prof_ints[1:-1] > prof_ints[:-2]) & (prof_ints[1:-1] >= prof_ints[2:]) & (prof_ints[1:-1] > 1e-6 * prof_ints.max(initial = 0)))[0] + 1
+            if index_addr:
+                # opentfraw 2.0.0 also converts these profiles with coefficients of the misread events, but ion-trap profile bins are m/z already,
+                # so each chunk's m/z are rebuilt from the scan's packet: 40-byte header, 8 bytes per further segment, then the profile
+                with open(filepath, 'rb') as f:
+                    f.seek(index_addr + 88 * i + 72)
+                    f.seek(data_addr + int.from_bytes(f.read(8), 'little'))
+                    head = f.read(40)
+                    f.seek(8 * max(int.from_bytes(head[:4], 'little') - 1, 0), 1)
+                    prof = f.read(4 * int.from_bytes(head[4:8], 'little'))
+                (first_value, step), fudge, pos, prof_mzs = np.frombuffer(prof, '<f8', 2), head[12] > 0, 24, [np.zeros(0)]
+                for _ in range(int.from_bytes(prof[16:20], 'little')):
+                    first_bin, n = np.frombuffer(prof, '<u4', 2, pos)
+                    fudge_mz = np.frombuffer(prof, '<f4', 1, pos + 8)[0] if fudge else 0
+                    prof_mzs.append(first_value + np.arange(first_bin, first_bin + n) * step + fudge_mz)
+                    pos += 8 + 4 * fudge + 4 * int(n)
+                prof_mzs = np.concatenate(prof_mzs)
+            prof_ints = np.where(prof_ints < 1, 0, prof_ints)
+            apex = np.where((prof_ints[1:-1] > prof_ints[:-2]) & (prof_ints[1:-1] >= prof_ints[2:]) & (prof_ints[1:-1] > 0))[0] + 1
             edges = np.array([0] + [a + 1 + np.argmin(prof_ints[a + 1:b]) for a, b in zip(apex[:-1], apex[1:])], dtype = np.int64)
             while len(apex):
                 peak_ints = np.add.reduceat(prof_ints, edges)
@@ -504,6 +596,10 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
                 # Merges every pair closer than 0.5 m/z whose gap is the smallest among its neighbouring gaps, until none is left
                 left, right = np.concatenate([[np.inf], gaps[:-1]]), np.concatenate([gaps[1:], [np.inf]])
                 edges = np.delete(edges, np.where((gaps < 0.5) & (gaps <= left) & (gaps < right))[0] + 1)
+            if len(apex):
+                # Thermo's centroids of up to 8 profile points sit one bin above their weighted mean on this axis, those of wider peaks on it
+                peak_mzs = peak_mzs + (prof_mzs[1] - prof_mzs[0]) * (
+                            np.add.reduceat((prof_ints > 0).astype(int), edges) < 9)
         if not len(peak_mzs):
             continue
         if table['ms_level'][i] == 1:
@@ -516,6 +612,13 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
         filt = table['filter_string'][i] or ''
         # The filter string ends with this stage's isolation m/z and activation(s), e.g. 1022.47@etd50.00@hcd25.00
         stage = re.findall(r'([\d.]+)((?:@[a-z]+[\d.]+)+)', filt)
+        if table['ms_level'][i] == ms_level + 1:
+            # An MS3 scan (e.g., ms3 492.99@cid35.00 394.92@cid35.00) fragments a fragment of the latest MS2 scan isolating its first m/z
+            row = next((r for r, iso in reversed(isolations) if len(stage) > 1 and abs(iso - float(stage[-2][0])) < 0.011), None)
+            if row is not None:
+                top = np.argsort(-peak_ints, kind = 'stable')[:num_peaks]
+                ms3s[row].append((float(stage[-1][0]), dict(zip(peak_mzs[top].tolist(), peak_ints[top].tolist()))))
+            continue
         precursor_mz = table['precursor_mz'][i]
         if not precursor_mz:
             continue
@@ -529,6 +632,8 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
             detected_trap = {'ITMS': 'linear', 'FTMS': 'orbitrap'}.get(table['analyzer'][i])
         top = np.argsort(-peak_ints, kind = 'stable')[:num_peaks]
         peak_ds.append(dict(zip(peak_mzs[top].tolist(), peak_ints[top].tolist())))
+        isolations.append((len(mzs), iso))
+        ms3s.append([])
         mzs.append(precursor_mz)
         rts.append(table['retention_time'][i])
         scans.append(scan)
@@ -542,9 +647,11 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
         refine.append(raw_charge is None)
         charges.append(raw_charge if raw_charge is not None and raw_charge > 1 else None)
         if intensity:
-            # ThermoRawFileParser's precursor intensity: summed centroids within 1.5 m/z of the isolation m/z in the scan that triggered this one
-            s = ms1_index.get(table['master_scan_number'][i], len(ms1_rts) - 1)
-            intensities.append(float(ms1_ints[s][(ms1_mzs[s] >= iso - 1.5) & (ms1_mzs[s] < iso + 1.5)].sum()) if s >= 0 else np.nan)
+            # ThermoRawFileParser's precursor intensity: summed centroids within 1.5 m/z of the isolation m/z in the trailer's master scan (tribrids
+            # acquire MS2 in parallel with the next survey scan), else in the preceding survey scan; LTQ trailers only carry a 'Master Index:', no scan
+            s = ms1_index.get((raw.scan_parameters(scan) or {}).get('Master Scan Number:'), len(ms1_rts) - 1)
+            intensities.append(
+                float(ms1_ints[s][(ms1_mzs[s] >= iso - 1.5) & (ms1_mzs[s] < iso + 1.5)].sum()) if s >= 0 else np.nan)
     df_out = pd.DataFrame({
         'm/z': mzs,
         'peak_d': peak_ds,
@@ -554,6 +661,8 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
     if intensity:
         df_out['intensity'] = intensities
     df_out['scan'], df_out['activation'] = scans, activations
+    if any(ms3s):
+        df_out['ms3'] = ms3s
     # Same flat MS1 store and precursor refinement as process_mzML_stack
     ms1 = (np.array(ms1_rts), np.concatenate(ms1_mzs) if ms1_mzs else np.zeros(0, np.float32),
            np.concatenate(ms1_ints) if ms1_ints else np.zeros(0, np.float32),
@@ -774,8 +883,8 @@ def extract_xic_areas(ms1, target_mzs, rt_centers, charges = None, rt_window = 1
 
 
 def process_for_inference(df, glycan_class, mode = 'negative', modification = 'reduced', lc = 'PGC',
-                          trap = 'linear', rt_max_default = 30.0, model = 'CNN', max_peaks = 256,
-                          test_time_copies = None, augment_mz = None, augment_rt = None):
+                          trap = 'linear', rt_max_default = 30.0, tta_thresh = None, model = 'CNN',
+                          max_peaks = 256, test_time_copies = None, augment_mz = None, augment_rt = None):
     """processes averaged spectra for them being inputs to CandyCrunch\n
    | Arguments:
    | :-
@@ -785,11 +894,13 @@ def process_for_inference(df, glycan_class, mode = 'negative', modification = 'r
    | modification (string): chemical modification of glycans; options are 'reduced', 'permethylated' or 'other'/'none'; default:'reduced'
    | lc (string): type of liquid chromatography; options are 'PGC', 'C18', and 'other'; default:'PGC'
    | trap (string): type of ion trap; options are 'linear', 'orbitrap', 'amazon', and 'other'; default:'linear'
-   | rt_max_default (float): minimum maximum retention time to normalize to; default: 30.0\n
+   | rt_max_default (float): minimum maximum retention time to normalize to; default: 30.0
+   | tta_thresh (float): inputs of spectra whose best annotation_score exceeds this get 5 augmented copies, the others one plain copy (column 'tta'); default: None (all get 5)\n
    | Returns:
    | :-
-   | (1) a dataloader used for model prediction
+   | (1) a dataloader used for model prediction (augmented inputs first, then plain inputs, each in input_id order)
    | (2) a preliminary df_out dataframe
+   | (3) the number of copies made for each augmented input
    """
     df = df.assign(glycan_type = glycan_class,
                    mode = {'negative': 0, 'positive': 1}.get(str(mode).lower().strip(), 2),
@@ -800,6 +911,12 @@ def process_for_inference(df, glycan_class, mode = 'negative', modification = 'r
     # Retention time normalization
     max_rt = max(max(df['RT']), rt_max_default)
     df['RT2'] = df['RT'] / max_rt
+    # Candidate structures of one composition share spectrum and composition vector, i.e., the model input, so every distinct input is
+    # predicted once (input_id points each row to its input)
+    input_ids = {}
+    df['input_id'] = [input_ids.setdefault((s, tuple(v)), len(input_ids)) for s, v in zip(df['spec_id'], df['compositional_vector'])]
+    df['tta'] = True if tta_thresh is None else (df.groupby('spec_id')['annotation_score'].transform('max') > tta_thresh).values
+    df_in = df.drop_duplicates('input_id')
     model_name = _canonical_model_name(model)
     defaults = MODEL_INFERENCE_DEFAULTS[model_name]
     if test_time_copies is None:
@@ -808,34 +925,42 @@ def process_for_inference(df, glycan_class, mode = 'negative', modification = 'r
         augment_mz = defaults['augment_mz']
     if augment_rt is None:
         augment_rt = defaults['augment_rt']
+    tta_copies = test_time_copies if augment_mz or augment_rt else 1
 
-    arrays = {
-        'metadata': df[['glycan_type', 'RT2', 'mode', 'lc', 'modification', 'trap']].to_numpy(dtype = np.float32),
-        'sample_compositions': np.stack(df.compositional_vector.to_numpy()).astype(np.float32),
-    }
-    if model_name == 'CNN':
-        arrays['binned_intensities'] = np.stack(df.binned_intensities.to_numpy()).astype(np.float32)
-        arrays['mz_remainder'] = np.stack(df.mz_remainder.to_numpy()).astype(np.float32)
-    else:
-        arrays['peak_list'] = np.stack([
-            spectrum_to_peak_list(spectrum, max_peaks = max_peaks, min_mz = 39.714, max_mz = 3000)
-            for spectrum in df.peak_d
-        ])
+    def make_arrays(frame):
+        arrays = {
+            'metadata': frame[['glycan_type', 'RT2', 'mode', 'lc', 'modification', 'trap']].to_numpy(dtype = np.float32),
+            'sample_compositions': np.stack(frame.compositional_vector.to_numpy()).astype(np.float32),
+        }
+        if model_name == 'CNN':
+            arrays['binned_intensities'] = np.stack(frame.binned_intensities.to_numpy()).astype(np.float32)
+            arrays['mz_remainder'] = np.stack(frame.mz_remainder.to_numpy()).astype(np.float32)
+        else:
+            arrays['peak_list'] = np.stack([
+                spectrum_to_peak_list(spectrum, max_peaks = max_peaks, min_mz = 39.714, max_mz = 3000)
+                for spectrum in frame.peak_d
+            ])
+        return arrays
 
-    dset = MemmapSpectrumDataset.for_inference(
-        arrays,
-        model_name,
-        repeats = test_time_copies,
-        transform_mz = transform_mz if augment_mz and model_name == 'CNN' else None,
-        transform_rt = transform_rt if augment_rt else None,
-    )
+    # Test-time augmentation only where the prediction can reach the output. ConcatDataset preserves the upstream order:
+    # augmented inputs first, then plain inputs, with each group remaining in input_id order.
+    tta = df_in['tta'].values
+    datasets = []
+    if tta.any():
+        datasets.append(MemmapSpectrumDataset.for_inference(
+            make_arrays(df_in[tta]), model_name, repeats = tta_copies,
+            transform_mz = transform_mz if augment_mz and model_name == 'CNN' else None,
+            transform_rt = transform_rt if augment_rt else None))
+    if (~tta).any():
+        datasets.append(MemmapSpectrumDataset.for_inference(make_arrays(df_in[~tta]), model_name, repeats = 1))
+    dset = datasets[0] if len(datasets) == 1 else torch.utils.data.ConcatDataset(datasets)
     dloader = torch.utils.data.DataLoader(dset, batch_size = 256, shuffle = False)
     idx_col = 'm/z' if 'm/z' in df.columns else 'reducing_mass'
     df.set_index(idx_col, inplace = True)
-    drop_cols = ['binned_intensities', 'mz_remainder', 'RT2', 'mode', 'modification', 'trap', 'glycan',
-                 'glycan_type', 'lc']
+    drop_cols = ['binned_intensities', 'mz_remainder', 'RT2', 'mode', 'modification', 'trap', 'glycan', 'glycan_type',
+                 'lc']
     df.drop(drop_cols, axis = 1, inplace = True, errors = 'ignore')
-    return dloader, df, test_time_copies
+    return dloader, df, tta_copies
 
 
 def get_topk(dataloader, model, glycans = None, k = 25, temp = False, temperature = temperature):
@@ -968,6 +1093,7 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
     df['rounded_mz'] = np.round(df[idx_col] * 2) / 2
     df['rounded_RT'] = np.round(df['RT'], 1)
     df.sort_values(by = ['rounded_mz', 'rounded_RT'], inplace = True)
+    rounded_mz = df['rounded_mz'].to_numpy()
     df.drop(['rounded_mz', 'rounded_RT'], axis = 1, inplace = True)
     # Initialize the first cluster
     mz_arr = df[idx_col].to_numpy()
@@ -975,21 +1101,28 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
     int_arr = df['intensity'].to_numpy()
     peak_arr = df['peak_d'].to_numpy(dtype = object)
     chg_arr = df['precursor_charge'].to_numpy(dtype = object)
+    ms3_arr = df['ms3'].to_numpy(dtype = object) if 'ms3' in df.columns else [[]] * len(df)
     clusters.append({
         'm/z': [mz_arr[0]],
         'RT': [rt_arr[0]],
         'intensity': [int_arr[0]],
         'peak_d': [peak_arr[0]],
         'precursor_charge': [chg_arr[0]],
+        'ms3': list(ms3_arr[0]),
         'apex_int': int_arr[0],
         'apex_mz': mz_arr[0],
         'apex_rt': rt_arr[0]
     })
+    active = list(clusters)
     # Loop through the sorted dataframe starting from the second row
     for r in range(1, len(mz_arr)):
         mz, rt, intensity, peak_d = mz_arr[r], rt_arr[r], int_arr[r], peak_arr[r]
+        # Rows come sorted by m/z rounded to 0.5, so a cluster whose reference m/z lies more than mz_diff below this rounding bin can never
+        # match again; dropping those keeps the scan from growing with every cluster made so far (the first matching cluster is unchanged)
+        if rounded_mz[r] != rounded_mz[r - 1]:
+            active = [c for c in active if (c['apex_mz'] if c['apex_int'] > 0 else c['m/z'][-1]) >= rounded_mz[r] - 0.5 - mz_diff]
         found = False
-        for cluster in clusters:
+        for cluster in active:
             last_max = cluster['apex_int']
             if last_max > 0:
                 last_mz, last_rt = cluster['apex_mz'], cluster['apex_rt']
@@ -1001,6 +1134,7 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
                 cluster['intensity'].append(intensity)
                 cluster['peak_d'].append(peak_d)
                 cluster['precursor_charge'].append(chg_arr[r])
+                cluster['ms3'].extend(ms3_arr[r])
                 if intensity > last_max:
                     cluster['apex_int'], cluster['apex_mz'], cluster['apex_rt'] = intensity, mz, rt
                 found = True
@@ -1012,10 +1146,12 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
                 'intensity': [intensity],
                 'peak_d': [peak_d],
                 'precursor_charge': [chg_arr[r]],
+                'ms3': list(ms3_arr[r]),
                 'apex_int': intensity,
                 'apex_mz': mz,
                 'apex_rt': rt
             })
+            active.append(clusters[-1])
     # Create a condensed dataframe
     condensed_data = []
     for cluster in clusters:
@@ -1056,9 +1192,13 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
         # the precursor intensities of however many MS2 spectra dynamic exclusion happened to allow
         condensed_data.append(
             [rep_mz, mean_rt, highest_intensity, peaks, binned_intensities, mz_remainder, num_spectra, rep_charge])
-    return pd.DataFrame(condensed_data,
-                        columns = ['m/z', 'RT', 'intensity', 'peak_d', 'binned_intensities', 'mz_remainder',
-                                   'num_spectra', 'precursor_charge'])
+    df_out = pd.DataFrame(condensed_data,
+                          columns = ['m/z', 'RT', 'intensity', 'peak_d', 'binned_intensities', 'mz_remainder',
+                                     'num_spectra', 'precursor_charge'])
+    # The MS3 spectra of all MS2 spectra in a cluster
+    if 'ms3' in df.columns:
+        df_out['ms3'] = [c['ms3'] for c in clusters]
+    return df_out
 
 
 def create_struct_map(df_glycan, glycan_class, filter_out = None, phylo_level = 'Kingdom', phylo_filter = 'Animalia'):
@@ -1238,8 +1378,10 @@ def assign_annotation_scores_pooled(df_in, multiplier, mass_tag, mass_tolerance,
     groups = df_in.groupby('candidate_structure', sort = False).indices
     comp_map = dict(zip(unq_structs.candidate_structure, unq_structs.composition))
     charge_vals = np.asarray(df_in['charge'].values, dtype = float)
-    mz_vals, peak_vals = df_in[idx_col].values, df_in['peak_d'].values
+    mz_vals, peak_vals, spec_ids = df_in[idx_col].values, df_in['peak_d'].values, df_in['spec_id'].values
     scores_out = np.zeros(len(df_in))
+    # A spectrum is a row of every candidate structure it matched, so its deisotoped fragments are computed once per charge state
+    rounded_masses = {}
     for struct, rows in groups.items():
         grp_charges = charge_vals[rows]
         row_charge = np.nanmax(grp_charges) if not np.all(np.isnan(grp_charges)) else 1.0
@@ -1251,31 +1393,45 @@ def assign_annotation_scores_pooled(df_in, multiplier, mass_tag, mass_tolerance,
             np.any(np.abs(comp_mass + mass_dict.get(adduct, 999) - spec_masses) < mass_tolerance) or
             np.any(np.abs(comp_mass + mass_dict.get(adduct, 999) * charges_arr - spec_masses) < mass_tolerance)
             for adduct in adduct_list)
-        rounded_mass_rows = [[np.round(y, 1) for y in deisotope_ms2(x, int(abs(row_charge)), 0.05)][:15] for x in
-                             peak_vals[rows]]
-        unq_rounded_masses = set([x for y in rounded_mass_rows for x in y])
-        cc_out = CandyCrumbs(struct, unq_rounded_masses, mass_tolerance, simplify = False,
-                             charge = int(multiplier * abs(row_charge)),
-                             disable_global_mods = (not is_adduct or mode == "negative"), disable_X_cross_rings = True,
-                             max_cleavages = 2, mass_tag = modification_mass_dict.get(modification, 0) + (mass_tag or 0),
-                             sample_prep = sample_prep)
-        # Score each fragment mass by how many non-redundant Domon-Costello annotations it receives;
-        # cross-ring (A/X) and internal (M) fragments are only counted when they appear alone or in small combinations
+        rounded_mass_rows = [rounded_masses[key] if (key := (spec, row_charge)) in rounded_masses else
+                             rounded_masses.setdefault(key, [np.round(y, 1) for y in deisotope_ms2(x, int(abs(row_charge)), 0.05)][:15])
+                             for spec, x in zip(spec_ids[rows], peak_vals[rows])]
+        # MS3 spectra (if the file has them) are pooled per isolated MS2 fragment, as CandyCrumbs only explains their peaks with fragments of
+        # what that fragment is in this structure
+        ms3_rows = [[(round(p), p, [np.round(y, 1) for y in deisotope_ms2(x, int(abs(row_charge)), 0.05)][:15]) for p, x in ms3] for ms3 in
+                    df_in['ms3'].values[rows]] if 'ms3' in df_in.columns else []
+        pools = {None: (None, set([x for y in rounded_mass_rows for x in y]))}
+        if CANDYCRUMBS_SUPPORTS_MS3:
+            for key, p, masses in [x for y in ms3_rows for x in y]:
+                pools.setdefault(key, (p, set()))[1].update(masses)
         tester_mass_scores = {}
-        for _k, _v in cc_out.items():
-            if _v:
-                _filtered = []
-                for ant in _v['Domon-Costello nomenclatures']:
-                    prefs = [a.split('_')[0][-1] for a in ant]
-                    if ('A' in prefs or 'X' in prefs) and len(prefs) > 1:
-                        continue
-                    if 'M' in prefs and len(prefs) > 2:
-                        continue
-                    _filtered.append(ant)
-                tester_mass_scores[_k] = len(_filtered)
-            else:
-                tester_mass_scores[_k] = 0
-        row_scores = [sum([tester_mass_scores[x] for x in y]) for y in rounded_mass_rows]
+        for key, (ms3_precursor, unq_rounded_masses) in pools.items():
+            ms3_kwargs = {'ms3_precursor': ms3_precursor} if CANDYCRUMBS_SUPPORTS_MS3 else {}
+            cc_out = CandyCrumbs(struct, unq_rounded_masses, mass_tolerance, simplify = False,
+                                 charge = int(multiplier * abs(row_charge)),
+                                 disable_global_mods = (not is_adduct or mode == "negative"), disable_X_cross_rings = True,
+                                 max_cleavages = 2, mass_tag = modification_mass_dict.get(modification, 0) + (mass_tag or 0),
+                                 sample_prep = sample_prep, **ms3_kwargs)
+            # Score each fragment mass by how many non-redundant Domon-Costello annotations it receives;
+            # cross-ring (A/X) and internal (M) fragments are only counted when they appear alone or in small combinations
+            for _k, _v in cc_out.items():
+                if _v:
+                    _filtered = []
+                    for ant in _v['Domon-Costello nomenclatures']:
+                        prefs = [a.split('_')[0][-1] for a in ant]
+                        if ('A' in prefs or 'X' in prefs) and len(prefs) > 1:
+                            continue
+                        if 'M' in prefs and len(prefs) > 2:
+                            continue
+                        _filtered.append(ant)
+                    tester_mass_scores[(key, _k)] = len(_filtered)
+                else:
+                    tester_mass_scores[(key, _k)] = 0
+        row_scores = [sum([tester_mass_scores[(None, x)] for x in y]) for y in rounded_mass_rows]
+        # A row's MS3 evidence is the mean score of its MS3 spectra, so it does not grow with how often the instrument repeated them
+        if ms3_rows and CANDYCRUMBS_SUPPORTS_MS3:
+            row_scores = [score + (np.mean([sum(tester_mass_scores[(key, x)] for x in masses) for key, _, masses in ms3]) if ms3 else 0)
+                          for score, ms3 in zip(row_scores, ms3_rows)]
         scores_out[rows] = row_scores
     df_in['annotation_score'] = scores_out
     return df_in
@@ -1520,14 +1676,26 @@ def impute(df_out, pred_thresh, mode = 'negative', modification = 'reduced', sam
         # O-glycans may carry a sulfated GlcNAc branch that is interchangeable with the unsulfated form
         seqs = [p[0][0] for p in predictions_list if p and ("GlcNAc6S(b1-6)" in p[0][0] or "GlcNAc(b1-6)" in p[0][0])]
         variants.update(set(unwrap([_get_all_variants(s, 'GlcNAc6S(b1-6)', 'GlcNAc(b1-6)') for s in seqs])))
+    # Every empty row tries the same variants (first match in sorted order, as mass_check would find it), so their masses and ion m/z are
+    # computed once per charge state instead of once per row and variant
+    variants = sorted(variants)
+    variant_masses, ion_mzs = [], {}
+    for v in variants:
+        try:
+            variant_masses.append(glycan_to_mass(v, sample_prep = sample_prep, modification = modification))
+        except Exception:
+            variant_masses.append(np.nan)
+    variant_masses = np.array(variant_masses) + (mass_tag or 0)
     for i, k in enumerate(predictions_list):
-        if len(k) < 1:
-            for v in sorted(variants):
-                if mass_check(index_list[i], v, mode = mode, modification = modification, mass_tag = mass_tag,
-                              sample_prep = sample_prep,
-                              permitted_charges = [abs(charge_list[i])]):
-                    df_out.iat[i, 0] = [(v, pred_thresh)]
-                    break
+        if len(k) < 1 and variants:
+            z = abs(charge_list[i])
+            if z not in ion_mzs:
+                ions = get_ion_mzs(variant_masses, max_charge = int(z) * (1 if mode == 'positive' else -1), adducts = get_adduct_list(mode),
+                                   min_mass = {2: 900, 3: 1500, 4: 3500})
+                ion_mzs[z] = np.array([m for ion, m in ions.items() if int(ion.rsplit(']', 1)[1][:-1] or 1) == z])
+            hits = np.flatnonzero((np.abs(index_list[i] - ion_mzs[z]) < 0.5).any(axis = 0))
+            if hits.size:
+                df_out.iat[i, 0] = [(variants[hits[0]], pred_thresh)]
     return df_out
 
 
@@ -1715,6 +1883,9 @@ def load_spectra_filepath(spectra_filepath, extract_ms1 = False):
 
         loaded_file['peak_d'] = loaded_file['peak_d'].apply(parse_peak_dict)
         loaded_file = loaded_file[loaded_file['peak_d'].notnull()].reset_index(drop = True)
+        # MS3 spectra written by extract_spectra, as a list of (MS3 precursor m/z, peak dictionary) per MS2 spectrum
+        if 'ms3' in loaded_file.columns:
+            loaded_file['ms3'] = [ast.literal_eval(x) if isinstance(x, str) else [] for x in loaded_file['ms3']]
         # Files written by extract_spectra carry the ion mode and analyzer detected from their raw file
         for k in ('mode', 'trap'):
             if k in loaded_file.columns:
@@ -1738,12 +1909,14 @@ def extract_spectra(spectra_filepath, output_filepath = None):
    | Returns:
    | :-
    | Returns the filepath of the written .xlsx; precursor m/z values are already refined from MS1 and isotope-triggered repeat spectra removed,
-   | but MS1 itself is not kept, so predictions from the .xlsx are quantified by precursor intensity instead of XIC areas
+   | MS3 spectra are kept (column ms3), but MS1 itself is not, so predictions from the .xlsx are quantified by precursor intensity instead of XIC areas
    """
     df = load_spectra_filepath(spectra_filepath)
     # Rounding keeps the file small and every peak dictionary below Excel's 32,767-character cell limit; 4 decimals and 4 significant
     # digits sit far below the binning and fragment-annotation tolerances
     df['peak_d'] = [str({round(float(mz), 4): float(f'{i:.4g}') for mz, i in d.items()}) for d in df['peak_d']]
+    if 'ms3' in df.columns:
+        df['ms3'] = [str([(round(p, 4), {round(float(mz), 4): float(f'{i:.4g}') for mz, i in d.items()}) for p, d in x]) for x in df['ms3']]
     # Ion mode and analyzer detected from the raw file would not survive the export, so they travel as columns that load_spectra_filepath
     # turns back into the attrs wrap_inference checks
     for k in ('mode', 'trap'):
@@ -2155,7 +2328,8 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
     """wrapper function to get & curate CandyCrunch predictions\n
    | Arguments:
    | :-
-   | spectra_filepath (string): absolute filepath ending in ".raw" (Thermo), ".mzML", ".mzXML", ".mgf", or ".xlsx" pointing to a file containing spectra or preprocessed spectra
+   | spectra_filepath (string): absolute filepath ending in ".raw" (Thermo), ".mzML", ".mzXML", ".mgf", or ".xlsx" pointing to a file containing spectra or preprocessed spectra;
+   |                            MS3 spectra in it (.raw/.mzML/.mzXML, or .xlsx from extract_spectra) are used automatically, as fragment evidence and to rank isomers
    | glycan_class (string): glycan class as string, options are "O", "N", "lipid", "free"
    | model (PyTorch): trained CandyCrunch model
    | glycans (list): full list of glycans used for training CandyCrunch; don't change default without changing model
@@ -2261,25 +2435,26 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
     df_out = assign_annotation_scores_pooled(df_out, multiplier, mass_tag, mass_tolerance, modification = modification,
                                              sample_prep = sample_prep)
     df_out = df_out[df_out['compositional_vector'].notnull()].reset_index(drop = True)
-    loader, df_out, test_time_copies = process_for_inference(
+    # Spectra without an annotation above crumbs_thresh are dropped unless rescued, so their inputs get one plain pass instead of 5 augmented ones
+    loader, df_out, tta_copies = process_for_inference(
         df_out, coded_class, mode = mode, modification = modification, lc = lc, trap = trap,
-        rt_max_default = rt_max_default, model = model, max_peaks = peak_max_peaks,
-        test_time_copies = model_defaults.get('test_time_copies'),
+        rt_max_default = rt_max_default, tta_thresh = crumbs_thresh, model = model,
+        max_peaks = peak_max_peaks, test_time_copies = model_defaults.get('test_time_copies'),
         augment_mz = model_defaults.get('augment_mz'), augment_rt = model_defaults.get('augment_rt'))
     # Predict glycans from spectra
     preds, pred_conf = get_topk(loader, model, glycans, temp = True, temperature = temperature)
-    # Average over 5 augmented copies of each spectrum produced during inference
-    pred_chunks = [preds[i:i + test_time_copies] for i in range(0, len(preds), test_time_copies)]
-    conf_chunks = [pred_conf[i:i + test_time_copies] for i in range(0, len(pred_conf), test_time_copies)]
-    preds, pred_conf = [], []
-    for this_pred, this_conf in zip(pred_chunks, conf_chunks):
-        combs = [{p: c for p, c in zip(cp, cc)} for cp, cc in zip(this_pred, this_conf)]
+    # Max over the 5 augmented copies of each test-time augmented input (they come first in the loader), a plain input has one copy
+    tta = df_out.drop_duplicates('input_id')['tta'].values
+    order = np.concatenate([np.flatnonzero(tta), np.flatnonzero(~tta)])
+    sizes = np.where(tta[order], tta_copies, 1)
+    preds_in, conf_in = [None] * len(tta), [None] * len(tta)
+    for i, start, n in zip(order, np.cumsum(sizes) - sizes, sizes):
+        combs = [{p: c for p, c in zip(cp, cc)} for cp, cc in zip(preds[start:start + n], pred_conf[start:start + n])]
         combs = dict(sorted(average_dicts(combs, mode = 'max').items(), key = lambda x: x[1], reverse = True))
-        preds.append(list(combs.keys()))
-        pred_conf.append(list(combs.values()))
+        preds_in[i], conf_in[i] = list(combs.keys()), list(combs.values())
+    preds, pred_conf = preds_in, conf_in
     df_out['rel_abundance'] = df_out['intensity']
-    df_out['predictions'] = [[(pred, conf) for pred, conf in zip(pred_row, conf_row)] for pred_row, conf_row in
-                             zip(preds, pred_conf)]
+    df_out['predictions'] = [[(pred, conf) for pred, conf in zip(preds[i], pred_conf[i])] for i in df_out['input_id']]
     _raw_predictions = df_out['predictions'].tolist()
     # Check correctness of glycan class & mass
     df_out['predictions'] = [[g for g in preds if g[1] > pred_thresh and get_comp(g[0]) == comp] for preds, comp in
@@ -2379,6 +2554,27 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
         df_out = df_out.reset_index()
     df_out = df_out.sort_values(['spec_id', 'annotation_score'], ascending = False).groupby('spec_id').first()
     df_out = df_out[df_out['annotation_score'] > crumbs_thresh].drop(columns = ['candidate_structure']).set_index('m/z')
+    if 'ms3' in df_out.columns and CANDYCRUMBS_SUPPORTS_MS3:
+        # MS3 spectra resolve isomers whose MS2 fragments look alike: an isomer explaining a row's MS3 spectra with more fragments of the fragment
+        # they isolated (scored as in assign_annotation_scores_pooled) moves up, isomers explaining them equally well keep the model's order
+        reranked = []
+        for preds, ms3, charge in zip(df_out['predictions'], df_out['ms3'], df_out['charge']):
+            pools = {}
+            for p, x in ms3 if len(preds) > 1 else []:
+                pools.setdefault(round(p), (p, []))[1].append([np.round(y, 1) for y in deisotope_ms2(x, int(abs(charge)), 0.05)][:15])
+            scores = [0] * len(preds)
+            for i, (g, _) in enumerate(preds):
+                for p, ms3_spectra in pools.values():
+                    cc_out = CandyCrumbs(g, set(m for masses in ms3_spectra for m in masses), mass_tolerance, simplify = False, charge = int(charge),
+                                         disable_global_mods = True, disable_X_cross_rings = True, max_cleavages = 2,
+                                         mass_tag = modification_mass_dict.get(modification, 0) + (mass_tag or 0), sample_prep = sample_prep,
+                                         ms3_precursor = p)
+                    counts = {k: sum(not (len(a) > 1 and {c.split('_')[0][-1] for c in a} & {'A', 'X'}) and not (
+                        len(a) > 2 and 'M' in {c.split('_')[0][-1] for c in a}) for a in v['Domon-Costello nomenclatures']) if v else 0
+                              for k, v in cc_out.items()}
+                    scores[i] += np.mean([sum(counts[m] for m in masses) for masses in ms3_spectra])
+            reranked.append([preds[i] for i in sorted(range(len(preds)), key = lambda i: -scores[i])])
+        df_out['predictions'] = reranked
     df_out = df_out[
         ['predictions', 'composition', 'num_spectra', 'charge', 'RT', 'peak_d', 'annotation_score', 'rel_abundance',
          'top_fragments']]
@@ -2460,15 +2656,11 @@ def wrap_inference_batch(spectra_filepath_list, glycan_class, intra_cat_thresh, 
    | :-
    | Returns a tuple of (feature table with one row per isomer group: top1_pred, consensus m/z, RT, charge, composition, GlyTouCan_ID, number of files with MS2 evidence, then per file its rel_abundance (num_spectra if no file has intensities) and evidence_<file>; dict of per-file dataframes, or of (dataframe, spectra) tuples if spectra=True)
    """
-    mode = "negative" if max_charge < 0 else "positive"
-    mass_tolerance = ppm_thresh * MZ_REF / 1e6
-    modification = None if modification == 'custom' else modification
     model_spec = model
     loaded_model = get_model(model_spec)
     checkpoint = getattr(loaded_model, '_candycrunch_checkpoint', {})
-    model_name = _canonical_model_name(loaded_model)
     model_defaults = {
-        **MODEL_INFERENCE_DEFAULTS[model_name],
+        **MODEL_INFERENCE_DEFAULTS[_canonical_model_name(loaded_model)],
         **(checkpoint.get('inference_defaults') or {}),
     }
     if glycans is None:
@@ -2481,6 +2673,9 @@ def wrap_inference_batch(spectra_filepath_list, glycan_class, intra_cat_thresh, 
         temperature = model_defaults['temperature']
     if torch.is_tensor(temperature):
         temperature = float(temperature.detach().cpu().reshape(-1)[0])
+    mode = "negative" if max_charge < 0 else "positive"
+    mass_tolerance = ppm_thresh * MZ_REF / 1e6
+    modification = None if modification == 'custom' else modification
     print(
         f"Your chosen settings are: {glycan_class} glycans, {mode} ion mode, {modification} glycans, {lc} LC, and {trap} ion trap. If any of that seems off to you, please restart with correct parameters.")
     if df_use is None:
