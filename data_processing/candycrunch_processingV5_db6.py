@@ -589,16 +589,16 @@ def _process_downloaded_file(file_path, output_dir, reuse_existing_mzml=True):
                 )
                 mzml_files.extend(sub_mzml_files)
         try:
-            shutil.rmtree(extract_dir)
-            print(f"  Cleaned up temporary extraction directory")
+            # shutil.rmtree(extract_dir)
+            print(f"  keep the temporary extraction directory")
         except Exception as e:
             print(f"  Warning: Could not clean up {extract_dir}: {e}")
         if mzml_files:
             with open(f"{file_path}.extracted.json", "w", encoding="utf-8") as handle:
                 json.dump([os.path.basename(path) for path in mzml_files], handle)
         try:
-            os.remove(file_path)
-            print(f"  Removed original {archive_type} file")
+            # os.remove(file_path)
+            print(f"  keep the original {archive_type} file")
         except OSError:
             pass
 
