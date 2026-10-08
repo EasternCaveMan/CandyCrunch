@@ -213,7 +213,7 @@ def get_all_files_name_from_dir(path):
     If every .raw/.mzXML file has a matching .mzML file with the same base name,
     return only the .mzML files to avoid reconverting already-converted files.
     """
-    allowed_extensions = {'.raw', '.mzml', '.mzxml', '.zip', '.rar'}
+    allowed_extensions = {'.raw', '.mzml', '.mzxml', '.d', '.zip', '.rar'}
     files = []
 
     if not os.path.exists(path):
@@ -407,6 +407,49 @@ def _convert_raw_to_mzml_docker(raw_file_path, output_dir, reuse_existing=True):
         return None
 
 
+def _convert_bruker_directory_to_mzml_docker(directory_path, output_dir, reuse_existing=True):
+    """Convert a Bruker ``.D`` acquisition directory to mzML with msconvert."""
+    directory_abs_path = os.path.abspath(os.fspath(directory_path))
+    input_dir = os.path.dirname(directory_abs_path)
+    directory_name = os.path.basename(directory_abs_path.rstrip(os.sep))
+    output_abs_dir = os.path.abspath(os.fspath(output_dir))
+    os.makedirs(output_abs_dir, exist_ok=True)
+
+    base_name = directory_name[:-2] if directory_name.lower().endswith('.d') else directory_name
+    existing_mzml_path = os.path.join(output_abs_dir, f"{base_name}.mzML")
+    if reuse_existing and os.path.exists(existing_mzml_path):
+        print(f"  Found existing mzML file, reusing: {existing_mzml_path}")
+        return existing_mzml_path
+
+    mzml_path = _unique_output_path(output_abs_dir, f"{base_name}.mzML")
+    mzml_filename = os.path.basename(mzml_path)
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{input_dir}:/input",
+        "-v", f"{output_abs_dir}:/output",
+        "chambm/pwiz-skyline-i-agree-to-the-vendor-licenses",
+        "wine", "msconvert", f"/input/{directory_name}", "--mzML",
+        "--outdir", "/output",
+        "--outfile", mzml_filename
+    ]
+
+    print(f"  Running msconvert for Bruker directory: {directory_name}")
+    try:
+        subprocess.run(docker_cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"  ✗ Failed to convert {directory_name} with Docker:")
+        if e.stderr:
+            print(f"    stderr: {e.stderr}")
+        return None
+
+    if os.path.exists(mzml_path):
+        print(f"  ✓ Successfully converted {directory_name} to {mzml_filename}")
+        return mzml_path
+
+    print(f"  ✗ Conversion completed but {mzml_path} was not found")
+    return None
+
+
 def _extract_zip_file(zip_path, extract_to):
     """Extract a zip file and return list of extracted files"""
     extracted_files = []
@@ -435,6 +478,35 @@ def _list_files_under(path):
             if os.path.isfile(file_path):
                 files.append(file_path)
     return files
+
+
+def _find_processable_paths(path):
+    """Find supported inputs, treating vendor ``.D`` directories as atomic datasets."""
+    processable_paths = []
+    supported_file_extensions = ('.raw', '.mzml', '.mzxml', '.zip', '.rar')
+
+    for root, directory_names, filenames in os.walk(path):
+        vendor_directories = [
+            directory_name
+            for directory_name in directory_names
+            if directory_name.lower().endswith('.d')
+        ]
+        processable_paths.extend(
+            os.path.join(root, directory_name)
+            for directory_name in vendor_directories
+        )
+        directory_names[:] = [
+            directory_name
+            for directory_name in directory_names
+            if directory_name not in vendor_directories
+        ]
+        processable_paths.extend(
+            os.path.join(root, filename)
+            for filename in filenames
+            if filename.lower().endswith(supported_file_extensions)
+        )
+
+    return processable_paths
 
 
 def _extract_rar_file(rar_path, extract_to):
@@ -513,6 +585,7 @@ def _process_downloaded_file(file_path, output_dir, reuse_existing_mzml=True):
     - .raw: convert to mzML
     - .mzXML: convert to mzML
     - .mzML: keep as is
+    - Bruker .D directory: convert to mzML
     - .zip/.rar: extract and recursively process contents
     """
     file_path = os.fspath(file_path)
@@ -567,6 +640,19 @@ def _process_downloaded_file(file_path, output_dir, reuse_existing_mzml=True):
         else:
             print(f"  ✗ File not found: {file_path}")
 
+    elif file_lower.endswith('.d') and os.path.isdir(file_path):
+        print("  Converting Bruker .D directory to mzML...")
+        mzml_path = _convert_bruker_directory_to_mzml_docker(
+            file_path,
+            output_dir,
+            reuse_existing=reuse_existing_mzml
+        )
+        if mzml_path and os.path.exists(mzml_path):
+            mzml_files.append(mzml_path)
+            print(f"  ✓ Converted to: {os.path.basename(mzml_path)}")
+        else:
+            print("  ✗ Conversion failed")
+
     elif file_lower.endswith(('.zip', '.rar')):
         archive_type = "rar" if file_lower.endswith('.rar') else "zip"
         print(f"  Extracting {archive_type} file...")
@@ -580,8 +666,9 @@ def _process_downloaded_file(file_path, output_dir, reuse_existing_mzml=True):
         print(f"  Extracted {len(extracted_files)} files from {archive_type}")
 
         if extracted_files:
-            print(f"  Processing extracted files...")
-            for extracted_file in extracted_files:
+            processable_paths = _find_processable_paths(extract_dir)
+            print(f"  Found {len(processable_paths)} supported datasets/files in archive")
+            for extracted_file in processable_paths:
                 sub_mzml_files = _process_downloaded_file(
                     extracted_file,
                     output_dir,
@@ -589,8 +676,8 @@ def _process_downloaded_file(file_path, output_dir, reuse_existing_mzml=True):
                 )
                 mzml_files.extend(sub_mzml_files)
         try:
-            # shutil.rmtree(extract_dir)
-            print(f"  keep the temporary extraction directory")
+            shutil.rmtree(extract_dir)
+            print(f"  Cleaning the temporary extraction directory")
         except Exception as e:
             print(f"  Warning: Could not clean up {extract_dir}: {e}")
         if mzml_files:
@@ -1372,7 +1459,7 @@ def main(args):
         print("\n" + "=" * 60)
         print("STEP 2: DOWNLOADING AND PROCESSING FILES")
         print("=" * 60)
-        print("Supported formats: .raw, .mzML, .mzXML, .zip, .rar")
+        print("Supported formats: .raw, .mzML, .mzXML, Bruker .D directories, .zip, .rar")
         print("Files will be converted to mzML format")
         mzml_files = download_and_process(
             download_base_url=download_base_url,
