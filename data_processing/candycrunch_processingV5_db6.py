@@ -867,7 +867,7 @@ def _prepare_match_index(df_mz, retention=False):
 
 def _process_mzML_stack(filepath, num_peaks= None,
                         ms_level=2, intensity=False, extract_ms1=False,
-                        xic_mode="score"):
+                        xic_mode="off"):
     """function extracting all MS/MS spectra from .mzML file"""
     run = pymzml.run.Reader(filepath)
     metadata = extract_mzml_metadata(run=run, filepath=filepath)
@@ -1103,7 +1103,7 @@ def _print_match_diagnostics(label, df_before, df_after, xic_mode):
 
 
 def _glycofy_df(df, df_mz, filename, glycopost_id, ms_error=MASS_TOLERANCE, retention=False,
-                implicit_single_charge=False, ion_mode=None, xic_mode="score"):
+                implicit_single_charge=False, ion_mode=None, xic_mode="off"):
     """
     Match MS2 spectra to glycans. XIC score mode keeps XIC confidence as a
     ranking signal instead of using it as a hard filter.
@@ -1182,7 +1182,7 @@ def _glycofy_df(df, df_mz, filename, glycopost_id, ms_error=MASS_TOLERANCE, rete
 
 
 def _glycofy_df_pretrain(df, df_mz, filename, glycopost_id, glycan_class, ms_error=MASS_TOLERANCE, retention=False,
-                         implicit_single_charge=False, xic_mode="score"):
+                         implicit_single_charge=False, xic_mode="off"):
     mzml_metadata = extract_mzml_metadata(attrs=df.attrs)
     if xic_mode == "filter" and 'on_peak' in df:
         df = df[df.on_peak].reset_index(drop=True)
@@ -1208,7 +1208,7 @@ def _glycofy_df_pretrain(df, df_mz, filename, glycopost_id, glycan_class, ms_err
 
 
 def _wrap_all(filepath, glycopost_id, df_mz, num_peaks=NUMBER_PEAKS, ms_error=MASS_TOLERANCE, retention=False,
-              implicit_single_charge=False, xic_mode="score", spectrum_df=None):
+              implicit_single_charge=False, xic_mode="off", spectrum_df=None):
     filename = _filename_from_path(filepath)
     if spectrum_df is None:
         spectrum_df = _process_mzML_stack(
@@ -1228,7 +1228,7 @@ def _wrap_all(filepath, glycopost_id, df_mz, num_peaks=NUMBER_PEAKS, ms_error=MA
 
 
 def _wrap_all_pretrain(filepath, glycopost_id, df_mz, glycan_class, num_peaks=NUMBER_PEAKS, ms_error=MASS_TOLERANCE, retention=False,
-                       implicit_single_charge=False, xic_mode="score", spectrum_df=None):
+                       implicit_single_charge=False, xic_mode="off", spectrum_df=None):
     filename = _filename_from_path(filepath)
     if spectrum_df is None:
         spectrum_df = _process_mzML_stack(
@@ -1296,7 +1296,7 @@ def _process_single_mzml_for_extraction(args):
 
 
 def data_extraction(mzml_files, glycopost_id, df_mz_total, out_path, glycan_class=1, retention=True,
-                    xic_mode="score", mass_tolerance=MASS_TOLERANCE, output_id=None,
+                    xic_mode="off", mass_tolerance=MASS_TOLERANCE, output_id=None,
                     peak_workers=None):
     """Process mzML files for data extraction"""
     if xic_mode not in XIC_MODES:
@@ -1558,7 +1558,7 @@ def build_arg_parser():
                         help="Path to directory containing downloaded files")
     parser.add_argument("--files-downloaded", type=_str_to_bool, default=False,
                         help="If .raw, mzML or mzXML has been downloaded already (True/False, default: False)")
-    parser.add_argument("--xic-mode", type=str, choices=sorted(XIC_MODES), default="score",
+    parser.add_argument("--xic-mode", type=str, choices=sorted(XIC_MODES), default="off",
                         help="XIC behavior: off, annotate, filter, or score (default: score)")
     parser.add_argument("--mass-tolerance", type=float, default=MASS_TOLERANCE,
                         help=f"Mass matching tolerance (default: {MASS_TOLERANCE})")
@@ -1588,7 +1588,7 @@ def run_processing(
         retention=True,
         files_path=None,
         files_downloaded=False,
-        xic_mode="score",
+        xic_mode="off",
         mass_tolerance=MASS_TOLERANCE,
         rt_tolerance=RT_TOLERANCE,
         xic_mz_tolerance=XIC_MZ_TOLERANCE,
