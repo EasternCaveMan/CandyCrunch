@@ -73,11 +73,14 @@ def write_dataframe(df, output_file):
         raise ValueError(f"Unsupported output file type: {output_file}")
 
 
-def prepare_pretrain_dataframe(df, file_path, pretrain_columns, pretrain_required_columns):
-    """Keep only pretrain OP rows while tolerating empty legacy files."""
+def prepare_pretrain_dataframe(df, file_path, pretrain_columns, pretrain_required_columns, xic_mode):
+    """Validate pretrain data and keep only on-peak rows when XIC mode is enabled."""
     missing_required = [column for column in pretrain_required_columns if column not in df.columns]
     if missing_required:
         raise KeyError(f"{file_path} is missing required pretrain columns: {missing_required}")
+
+    if not xic_mode:
+        return df.reindex(columns=pretrain_columns)
 
     if "on_peak" not in df.columns:
         if len(df) > 0:
@@ -233,7 +236,9 @@ def main(args=None):
             print(f"Reading: {file_path}")
             df = read_dataframe(file_path)
             if data_type == "pretrain":
-                df = prepare_pretrain_dataframe(df, file_path, pretrain_columns, pretrain_required_columns)
+                df = prepare_pretrain_dataframe(
+                    df, file_path, pretrain_columns, pretrain_required_columns, xic_mode=args.xic_mode
+                )
             if not df.empty:
                 dataframes.append(df)
         if not dataframes:
@@ -257,6 +262,8 @@ def main(args=None):
             merged_df["glycan"] = merged_df["glycan"].map(mapping1).fillna(merged_df["glycan"])
             mapping2 = (cglycans2.loc[cglycans2["new_glycan"].notna()].set_index("glycan")["new_glycan"])
             merged_df["glycan"] = merged_df["glycan"].map(mapping2).fillna(merged_df["glycan"])
+            if "peak_RT" not in merged_df.columns:
+                merged_df["peak_RT"] = float("nan")
             merged_df = merged_df[train_columns]
             datasets = args.datasets
         else:
@@ -265,14 +272,23 @@ def main(args=None):
             if skipped:
                 print(f"Skipping train-only datasets for pretrain data: {', '.join(skipped)}")
 
+        if not args.xic_mode:
+            datasets = ["full"]
         for dataset in datasets:
             print(f"\n=== Creating  {dataset} dataset ===")
             threshold = 0.7
-            if data_type == "train":
-                output = (args.base_dir / f"{f'OP{threshold}S' if dataset == 'OPS' else dataset}_{date_str}.{args.output_format}")
+            if args.xic_mode:
+                if data_type == "train":
+                    output = (args.base_dir / f"{f'OP{threshold}S' if dataset == 'OPS' else dataset}{date_str}.{args.output_format}")
+                else:
+                    output = args.base_dir / f"Pre{dataset}{date_str}.{args.output_format}"
+                output_file = Path(output)
             else:
-                output = args.base_dir / f"Pre{dataset}{date_str}.{args.output_format}"
-            output_file = Path(output)
+                if data_type == "train":
+                    output = (args.base_dir / f"NoXic{dataset}{date_str}.{args.output_format}")
+                else:
+                    output = args.base_dir / f"NoXicPre{dataset}{date_str}.{args.output_format}"
+                output_file = Path(output)
             if args.xic_mode:
             ## HC
                 if dataset == "HC":
