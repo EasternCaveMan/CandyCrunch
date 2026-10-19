@@ -32,7 +32,7 @@ from glycowork.motif.tokenization import (composition_to_mass, get_ion_mzs,
                                           mz_to_composition, structure_to_basic, mass_dict, SIALIC_KEYS,
                                           sialic_linkage_splits, resolve_sialic_linkages, _carboxyl_sites)
 from glycowork.network.biosynthesis import construct_network, evoprune_network
-from candycrunch.model import (CandyCrunch_CNN, SimpleDataset, transform_mz, transform_rt)
+from candycrunch.model import (CandyCrunch_CNN,CandyCrunch_CNN2,MemmapSpectrumDataset, SimpleDataset, transform_mz, transform_rt)
 from candycrunch.analysis import CandyCrumbs, PEPTIDE_ION_TYPES, supporting_ions, run_jobs, deisotope_ms2
 from candycrunch.utils import read_mzml, read_mzxml, read_mgf, read_raw_scan_table, centroid_ion_trap, centroid_tof, mz_order, TIMS_MS1_PEAKS, TIMS_MS2_PEAKS
 

@@ -20,11 +20,11 @@ from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
 import pandas as pd
 import wandb
-from candycrunch.model_2 import CandyCrunch_CNN, MemmapSpectrumDataset, transform_mz, transform_rt
+from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, MemmapSpectrumDataset, transform_mz, transform_rt
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
 from sklearn.metrics import pairwise_distances
-from training_utils_2 import seed_worker, train_model
+from training_utils import seed_worker, train_model
 
 warnings.filterwarnings("ignore",category=RuntimeWarning,module="sklearn.utils.extmath")
 
