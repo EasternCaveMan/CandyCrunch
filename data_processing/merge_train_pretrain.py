@@ -198,6 +198,8 @@ def build_arg_parser():
                         help="Do not drop duplicate rows after merging")
     parser.add_argument('--datasets', nargs='+', type=str, default=["OPS", "HC", "OP", "XPF", "GMS", "full"]) #
     parser.add_argument('--data-type', nargs='+', choices=("train", "pretrain"), default=["train", "pretrain"])
+    parser.add_argument("--xic-mode", action="store_true")
+
     return parser
 
 
@@ -258,37 +260,43 @@ def main(args=None):
             else:
                 output = args.base_dir / f"Pre{dataset}{date_str}.{args.output_format}"
             output_file = Path(output)
+            if args.xic_mode:
             ## HC
-            if dataset == "HC":
-                final_df = merged_df[(merged_df["on_peak"] == True) & (merged_df["xic_peak_found"] == True) & (
-                            merged_df["glycan_match_status"] == "unique")]
-            ## XPF
-            elif dataset == "XPF":
-                final_df = merged_df[merged_df["xic_peak_found"] == True]
-            ## OP
-            elif dataset == "OP":
-                final_df = merged_df[merged_df["on_peak"] == True]
-            ## GMS
-            elif dataset == "GMS":
-                final_df = merged_df[merged_df["glycan_match_status"] == "unique"]
-            # # ## OPS
-            elif dataset == "OPS":
-                final_df = merged_df[merged_df["on_peak"] == True].copy()
-                passes = final_df["glycan_score"] <= threshold
-                # Glycans having at least one row that passes
-                has_passing = passes.groupby(final_df["glycan"]).transform("any")
-                # Keep passing rows from those glycans
-                passing_rows = final_df[passes & has_passing]
+                if dataset == "HC":
+                    final_df = merged_df[(merged_df["on_peak"] == True) & (merged_df["xic_peak_found"] == True) & (
+                                merged_df["glycan_match_status"] == "unique")]
+                ## XPF
+                elif dataset == "XPF":
+                    final_df = merged_df[merged_df["xic_peak_found"] == True]
+                ## OP
+                elif dataset == "OP":
+                    final_df = merged_df[merged_df["on_peak"] == True]
+                ## GMS
+                elif dataset == "GMS":
+                    final_df = merged_df[merged_df["glycan_match_status"] == "unique"]
+                # # ## OPS
+                elif dataset == "OPS":
+                    final_df = merged_df[merged_df["on_peak"] == True].copy()
+                    passes = final_df["glycan_score"] <= threshold
+                    # Glycans having at least one row that passes
+                    has_passing = passes.groupby(final_df["glycan"]).transform("any")
+                    # Keep passing rows from those glycans
+                    passing_rows = final_df[passes & has_passing]
 
-                # For glycans where nothing passes, keep the 7 smallest scores
-                fallback_rows = (
-                    final_df[~has_passing].sort_values("glycan_score").groupby("glycan", group_keys=False).head(7))
-                final_df = pd.concat([passing_rows, fallback_rows], ignore_index=True)
+                    # For glycans where nothing passes, keep the 7 smallest scores
+                    fallback_rows = (
+                        final_df[~has_passing].sort_values("glycan_score").groupby("glycan", group_keys=False).head(7))
+                    final_df = pd.concat([passing_rows, fallback_rows], ignore_index=True)
 
-            elif dataset == "full":
-                final_df = merged_df
+                elif dataset == "full":
+                    final_df = merged_df
+                else:
+                    raise ValueError(f"Unsupported dataset: {dataset}")
             else:
-                raise ValueError(f"Unsupported dataset: {dataset}")
+                if dataset == "full":
+                    final_df = merged_df
+                else:
+                    raise ValueError(f"Unsupported dataset: {dataset}")
 
             write_dataframe(final_df, output_file)
             print("\nDone")
