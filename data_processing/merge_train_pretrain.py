@@ -5,18 +5,30 @@ import pandas as pd
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+def get_dataset_columns(xic_mode):
+    if xic_mode:
+        train_columns = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'on_peak', 'xic_peak_found', 'glycan',
+                     'glycan_score',
+                     'glycan_match_status', 'filename', 'GlycoPost_ID', 'mode', 'trap', 'instrument',
+                     'fragmentation',
+                     'ion_source',
+                     'lc_type', 'modification']
+        pretrain_columns = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'on_peak', 'xic_peak_found',
+                        'glycan_match_count', 'glycan_type', 'filename', 'GlycoPost_ID', 'mode', 'trap',
+                        'instrument', 'fragmentation', 'ion_source', 'lc_type', 'modification']
+        pretrain_required_columns = [column for column in pretrain_columns if column not in {'peak_RT', 'on_peak',
+                                                                                             'xic_peak_found'}]
+    else:
 
-TRAIN_COLUMNS = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'on_peak', 'xic_peak_found', 'glycan',
-                 'glycan_score',
-                 'glycan_match_status', 'filename', 'GlycoPost_ID', 'mode', 'trap', 'instrument',
-                 'fragmentation',
-                 'ion_source',
-                 'lc_type', 'modification']
-PRETRAIN_COLUMNS = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'on_peak', 'xic_peak_found',
-                    'glycan_match_count', 'glycan_type', 'filename', 'GlycoPost_ID', 'mode', 'trap',
-                    'instrument', 'fragmentation', 'ion_source', 'lc_type', 'modification']
-PRETRAIN_REQUIRED_COLUMNS = [column for column in PRETRAIN_COLUMNS if column not in {'peak_RT', 'on_peak',
-                                                                                     'xic_peak_found'}]
+        train_columns = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'glycan',
+                     'filename', 'GlycoPost_ID', 'mode', 'trap', 'instrument',
+                     'fragmentation',
+                     'ion_source',
+                     'lc_type', 'modification']
+        pretrain_columns = ['m/z', 'peak_d', 'RT', 'precursor_charge', 'peak_RT', 'glycan_type', 'filename', 'GlycoPost_ID', 'mode', 'trap',
+                        'instrument', 'fragmentation', 'ion_source', 'lc_type', 'modification']
+        pretrain_required_columns = [column for column in pretrain_columns if column not in {'peak_RT'}]
+    return train_columns, pretrain_columns, pretrain_required_columns
 
 
 def normalize_columns(df):
@@ -61,21 +73,21 @@ def write_dataframe(df, output_file):
         raise ValueError(f"Unsupported output file type: {output_file}")
 
 
-def prepare_pretrain_dataframe(df, file_path):
+def prepare_pretrain_dataframe(df, file_path, pretrain_columns, pretrain_required_columns):
     """Keep only pretrain OP rows while tolerating empty legacy files."""
-    missing_required = [column for column in PRETRAIN_REQUIRED_COLUMNS if column not in df.columns]
+    missing_required = [column for column in pretrain_required_columns if column not in df.columns]
     if missing_required:
         raise KeyError(f"{file_path} is missing required pretrain columns: {missing_required}")
 
     if "on_peak" not in df.columns:
         if len(df) > 0:
             print(f"Skipping pretrain file without on_peak column: {file_path}")
-        return pd.DataFrame(columns=PRETRAIN_COLUMNS)
+        return pd.DataFrame(columns=pretrain_columns)
 
     df = df.loc[df["on_peak"] == True]
     if df.empty:
-        return pd.DataFrame(columns=PRETRAIN_COLUMNS)
-    return df.reindex(columns=PRETRAIN_COLUMNS)
+        return pd.DataFrame(columns=pretrain_columns)
+    return df.reindex(columns=pretrain_columns)
 
 
 def format_file_size(file_path):
@@ -205,6 +217,7 @@ def build_arg_parser():
 
 def main(args=None):
     args = build_arg_parser().parse_args(args)
+    train_columns, pretrain_columns, pretrain_required_columns = get_dataset_columns(args.xic_mode)
     date_str = datetime.today().strftime("%Y%m%d")
     drop_duplicates = not args.keep_duplicates
     data_types = list(dict.fromkeys(args.data_type))
@@ -220,7 +233,7 @@ def main(args=None):
             print(f"Reading: {file_path}")
             df = read_dataframe(file_path)
             if data_type == "pretrain":
-                df = prepare_pretrain_dataframe(df, file_path)
+                df = prepare_pretrain_dataframe(df, file_path, pretrain_columns, pretrain_required_columns)
             if not df.empty:
                 dataframes.append(df)
         if not dataframes:
@@ -244,7 +257,7 @@ def main(args=None):
             merged_df["glycan"] = merged_df["glycan"].map(mapping1).fillna(merged_df["glycan"])
             mapping2 = (cglycans2.loc[cglycans2["new_glycan"].notna()].set_index("glycan")["new_glycan"])
             merged_df["glycan"] = merged_df["glycan"].map(mapping2).fillna(merged_df["glycan"])
-            merged_df = merged_df[TRAIN_COLUMNS]
+            merged_df = merged_df[train_columns]
             datasets = args.datasets
         else:
             datasets = [dataset for dataset in args.datasets if dataset == "OP"]
