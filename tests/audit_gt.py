@@ -3,14 +3,14 @@
 Usage (from the repo root, in the CandyCrunch environment):
     python tests/audit_gt.py <spectra file> <source GT csv> --glycan_class N [--run NAME] [--modification reduced] [--mass_tag 0]
                              [--sample_prep underivatized] [--output df_mz_X.csv] [--predictions <CandyCrunch output .xlsx/.csv>]
-                             [--rt_window 1.5] [--lc PGC] [--library_cache PATH] [--data_dir tests/data]
+                             [--rt_window 1.5] [--lc PGC] [--library_cache PATH] [--data_dir tests/data] [--mode positive] [--max_charge 4]
 
 <spectra file> is a .raw/.mzML/.mzXML/.d (MS1 used) or an extract_spectra .xlsx (no MS1: only the MS2-based checks apply). <source GT csv> has Mass,
 RT (or <run>_RT), glycan, optionally charge, and the run's abundance column (<run>, the spectra file's stem unless --run says otherwise). Writes the
 audited GT (default: the source path without '_source', or with '_audited' if it has no such suffix), <output stem>_removed.csv (source rows not kept
 and predictions not added, each with its reason) and <output stem>_review.csv (cases that need a human), and prints a summary.
 
-Criteria (CLAUDE.md, GT audits 2026-10-05 to 2026-10-14): a row needs a distinct MS1 peak of its composition on the envelope XIC of one of its ions
+Criteria (.claude/notes/datasets.md, GT audits 2026-10-05 to 2026-10-14): a row needs a distinct MS1 peak of its composition on the envelope XIC of one of its ions
 (Thermo ion traps: M-0.3 to M+1.3 m/z, which holds the isotopes they merge at z >= 2; Bruker ion traps, which resolve z = 2 isotopes, and
 orbitrap/TOF: one window per isotope M..M+3 after the file's calibration), smoothed in time with a Gaussian of sigma 0.05 min (none at MS1 cycles
 above 4 s), whose valley towards the nearest higher point on either side lies below 0.7 of its apex (0.5 if that higher peak's pooled MS2 has
@@ -77,13 +77,14 @@ def composition_of(glycan):
         return None
 
 
-def ion_list(comp, mode, modification, mass_tag, sample_prep, adducts = False):
-    """(name, |z|, m/z, whether it is the (de)protonated ion) of every ion of a composition up to |z| = 4 (above the CHARGE_MIN_MASS limits)"""
+def ion_list(comp, mode, modification, mass_tag, sample_prep, adducts = False, extra_z = ()):
+    """(name, |z|, m/z, whether it is the (de)protonated ion) of every ion of a composition up to |z| = 4 (above the CHARGE_MIN_MASS limits, except for
+    the charges in extra_z, which the source GT gives for it: GPST000570's MassHunter lists [M+2H]2+ of 790-900 Da, 396.67, and 449.18)"""
     mass = composition_to_mass(comp, sample_prep = sample_prep, modification = modification) + mass_tag
     sign = -1 if mode == 'negative' else 1
     # Positive-mode glycans are mostly seen as metal adducts ([M+K+H]2+ dominated GPST000134), so all their ion forms make up the envelope
     ions = get_ion_mzs(mass, max_charge = 4 * sign, adducts = (NEGATIVE_ADDUCTS if adducts else None) if sign < 0 else POSITIVE_ADDUCTS,
-                       min_mass = CHARGE_MIN_MASS)
+                       min_mass = {z: m for z, m in CHARGE_MIN_MASS.items() if z not in extra_z})
     out = []
     for name, mz in ions.items():
         if not np.isfinite(mz):
@@ -193,11 +194,11 @@ def library_match(library, comp, z, modification, vec, exclude = ()):
 class Run:
     """MS2 spectra and flat MS1 store of one run, with envelope XICs and their chromatographic maxima"""
 
-    def __init__(self, path):
+    def __init__(self, path, mode = None):
         df = load_spectra_filepath(str(path), extract_ms1 = True)
         if df.empty:
             raise ValueError(f'{Path(path).name} has no MS2 spectra')
-        self.mode = df.attrs.get('detected_mode') or 'negative'
+        self.mode = mode or df.attrs.get('detected_mode') or 'negative'
         self.accurate = df.attrs.get('detected_ms1_trap') in ('orbitrap', 'tof')
         self.resolved, self.shift, self.half_width = False, 0.0, 0.3
         self.ms2_accurate = df.attrs.get('detected_trap') in ('orbitrap', 'other')
@@ -223,7 +224,8 @@ class Run:
         self.cycle = float(np.median(steps[steps > 0]))
         # Thermo ion traps merge centroids closer than 0.5 m/z (z >= 2 isotopes become one centroid between them); Bruker ion traps resolve z = 2
         # isotopes (665.20/665.68/666.14 in GPST000316), so their centroids are often closer than 0.45
-        gaps = np.diff(mzs.astype(np.float64))[np.repeat(np.arange(n), np.diff(offsets))[1:] == np.repeat(np.arange(n), np.diff(offsets))[:-1]]
+        scan_of = np.repeat(np.arange(n), np.diff(offsets))
+        gaps = np.diff(mzs.astype(np.float64))[scan_of[1:] == scan_of[:-1]]
         self.resolved = not self.accurate and len(gaps) > 0 and float((gaps < 0.45).mean()) > 0.02
         # Spray spikes raise every m/z at once (milk 26.22/30.61 min, 4-6x the baseline at m/z without glycans), so they show in the median centroid
         # intensity and the TIC of the scan; their trace values are interpolated from the neighbouring scans, so they never make an apex
@@ -240,9 +242,10 @@ class Run:
         if self.cycle <= SLOW_CYCLE:
             sigma = max(SIGMA, 0.7 * self.cycle)
             k = int(min(200, np.max(np.searchsorted(rts, rts + 3 * sigma, side = 'right') - np.arange(n))))
-            self.idx = np.clip(np.arange(n)[:, None] + np.arange(-k, k + 1)[None, :], 0, n - 1)
+            idx = np.arange(n)[:, None] + np.arange(-k, k + 1)[None, :]
+            self.idx = np.clip(idx, 0, n - 1)
             dt = rts[self.idx] - rts[:, None]
-            valid = (np.arange(n)[:, None] + np.arange(-k, k + 1)[None, :] >= 0) & (np.arange(n)[:, None] + np.arange(-k, k + 1)[None, :] < n)
+            valid = (idx >= 0) & (idx < n)
             w = np.where(valid & (np.abs(dt) <= 3 * sigma), np.exp(-0.5 * (dt / sigma) ** 2), 0)
             self.weights = w / w.sum(1, keepdims = True)
 
@@ -327,8 +330,9 @@ def glycan_fragments(run, hits, comp, z, precursor, cc_kwargs):
     fragmentation = sum(i for m, i in pooled.items() if not -0.6 <= m - precursor <= 3.6 / z) / (sum(pooled.values()) or 1)
     if not frags:
         return 0, 0, 0.0, fragmentation, float(np.mean(run.tic_pct[list(hits)]))
+    # Positive-mode glycans are mostly metal adducts ([M+K+H]2+ in GPST000134) whose fragments keep the cation, so global modifications count there
     out = CandyCrumbs(comp, [round(m, 1) for m in frags], cc_kwargs['tolerance'], charge = (-z if run.mode == 'negative' else z), simplify = False,
-                      disable_global_mods = True, disable_X_cross_rings = True, disable_A_cross_rings = run.mode == 'positive', max_cleavages = 2,
+                      disable_global_mods = run.mode == 'negative', disable_X_cross_rings = True, disable_A_cross_rings = run.mode == 'positive', max_cleavages = 2,
                       mass_tag = cc_kwargs['mass_tag'], sample_prep = cc_kwargs['sample_prep'])
     explained = sum(deisotoped[m] for m in frags if out.get(round(m, 1)))
     return (sum(bool(v) for v in out.values()), len(frags), explained / (sum(deisotoped[m] for m in frags) or 1), fragmentation,
@@ -354,12 +358,13 @@ def describe_fragments(f):
 
 
 def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = 'reduced', mass_tag = 0.0, sample_prep = 'underivatized',
-          predictions = None, rt_window = 1.5, library_cache = None, data_dir = DATA_DIR, lc = 'PGC'):
+          predictions = None, rt_window = 1.5, library_cache = None, data_dir = DATA_DIR, lc = 'PGC', mode = None, max_charge = 3):
     """audits a source GT against its run; returns the audited GT, the removed rows (with reasons), the review list, and a summary text"""
     t_start = time.time()
     spectra_path, gt_path = Path(spectra_path), Path(gt_path)
     run_name = run_name or Path(str(spectra_path).rstrip('/\\')).stem
-    run = Run(spectra_path)
+    run = Run(spectra_path, mode)
+    charges = tuple(range(1, max_charge + 1))
     mod = None if modification in (None, 'custom', 'unreduced') else modification
     sign = -1 if run.mode == 'negative' else 1
     cc_kwargs = {'tolerance': 0.05 if run.ms2_accurate else 0.4, 'mass_tag': modification_mass_dict.get(mod, 0) + mass_tag, 'sample_prep': sample_prep}
@@ -380,8 +385,8 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
     def flag(row, category, detail):
         review.append({'Mass': row.get('Mass'), 'charge': row.get('charge'), 'RT': row.get('RT'), 'composition': row.get('composition'),
                        'glycan': row.get('glycan'), 'category': category, 'detail': detail})
-    # Compositions and the charge each row's Mass belongs to
-    rows = []
+    # Compositions and the charge each row's Mass belongs to; charges the source gives below CHARGE_MIN_MASS are kept per composition
+    rows, given_charges = [], {}
     for idx, r in src.iterrows():
         glycan = r['glycan'].strip() if isinstance(r.get('glycan'), str) and r['glycan'].strip() else ''
         row = {'idx': idx, 'Mass_source': float(r['Mass']), 'RT_source': float(r[rt_col]) if pd.notna(r.get(rt_col)) else np.nan, 'glycan_source': glycan,
@@ -399,7 +404,7 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
             row['glycan'] = ''
         options = []
         if comp is not None:
-            fits = sorted((abs(mz - row['Mass_source']), z) for _, z, mz, prot in ion_list(comp, run.mode, mod, mass_tag, sample_prep) if prot)
+            fits = sorted((abs(mz - row['Mass_source']), z) for _, z, mz, prot in ion_list(comp, run.mode, mod, mass_tag, sample_prep, extra_z = (given_z,)) if prot)
             fits = [f for f in fits if given_z is None or f[1] == given_z] or fits
             if fits and fits[0][0] <= 0.5:
                 options = [(comp, fits[0][1], fits[0][0])]
@@ -412,12 +417,24 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
                 row['notes'].append(f'given structure ({comp_string(comp)}) does not fit Mass {row["Mass_source"]:.2f}')
                 row['glycan'], comp = '', None
         if comp is None:
+            # An open row takes the composition the source names (each of a '/' isobar group, as the GPST000403 GT writes them) where it fits the Mass at
+            # the given charge: by mass glycowork finds others first or only in another class (GPST000316's Man7 Hex7HexNAc2 [M-2H]2- in an O run became
+            # Hex4HexNAc4S1), and it cannot use the reading the source made from the MS2
+            for text in (r['composition'].split('/') if isinstance(r.get('composition'), str) else []):
+                try:
+                    c = canonicalize_composition(text.strip())
+                except Exception:
+                    continue
+                fits = sorted((abs(mz - row['Mass_source']), z) for _, z, mz, prot in ion_list(c, run.mode, mod, mass_tag, sample_prep, extra_z = (given_z,))
+                              if prot and given_z in (None, z))
+                if fits and fits[0][0] <= 0.5:
+                    options.append((c, fits[0][1], fits[0][0]))
             # Open rows of an unexpected class (O-glycan runs carry N-glycans) take compositions of any class when their own has none
-            options = compositions_for_mz(row['Mass_source'], run.mode, mod, mass_tag, sample_prep, glycan_class) or \
-                      compositions_for_mz(row['Mass_source'], run.mode, mod, mass_tag, sample_prep, 'all')
+            options = options or compositions_for_mz(row['Mass_source'], run.mode, mod, mass_tag, sample_prep, glycan_class, charges = charges) or \
+                      compositions_for_mz(row['Mass_source'], run.mode, mod, mass_tag, sample_prep, 'all', charges = charges)
             if not options:
                 flag({'Mass': row['Mass_source'], 'RT': row['RT_source'], 'glycan': row['glycan_source']}, 'no composition',
-                     'no glycowork composition fits the Mass at z = 1-3, so the row could not be audited (removed)')
+                     f'no glycowork composition fits the Mass at z = 1-{max_charge}, so the row could not be audited (removed)')
                 removed.append({**row, 'reason': 'no composition of glycan class ' + glycan_class + (' fits the Mass' if not row['glycan_source'] else
                                                   ' fits the Mass, and the given structure does not')})
                 continue
@@ -425,13 +442,16 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
                 flag({'Mass': row['Mass_source'], 'RT': row['RT_source'], 'glycan': row['glycan_source']}, 'structure contradicts mass',
                      f'{"; ".join(row["notes"])}; the Mass fits {", ".join(comp_string(c) + f" (z = {z})" for c, z, _ in options)}, structure left blank')
         row['options'] = options
+        if given_z:
+            for c, z, _ in options:
+                given_charges.setdefault(comp_key(c), set()).add(z)
         rows.append(row)
     # Calibration: the most intense MS1 centroid near the theoretical m/z of each composition (singly charged ions in ion traps, as they merge the isotopes
     # of the others) at the RT of each MS2 spectrum triggered on it
     ions_of = {}
     for row in rows:
         for comp, _, _ in row['options']:
-            ions_of.setdefault(comp_key(comp), (comp, [x for x in ion_list(comp, run.mode, mod, mass_tag, sample_prep)
+            ions_of.setdefault(comp_key(comp), (comp, [x for x in ion_list(comp, run.mode, mod, mass_tag, sample_prep, extra_z = tuple(given_charges.get(comp_key(comp), ())))
                                                        if run.mz_range[0] - 1 <= x[2] <= run.mz_range[1] + 1]))
     targets = [(mz, run.rt[k]) for comp, ions in ions_of.values() for _, z, mz, prot in ions if prot and (z == 1 or run.accurate)
                for k in np.flatnonzero(np.abs(run.prec - mz) <= (0.02 if run.accurate else 0.5))]
@@ -449,11 +469,12 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
         if key in analysed:
             return analysed[key]
         if key not in ions_of:
-            ions_of[key] = (comp, [x for x in ion_list(comp, run.mode, mod, mass_tag, sample_prep) if run.mz_range[0] - 1 <= x[2] <= run.mz_range[1] + 1])
+            ions_of[key] = (comp, [x for x in ion_list(comp, run.mode, mod, mass_tag, sample_prep, extra_z = tuple(given_charges.get(key, ())))
+                                   if run.mz_range[0] - 1 <= x[2] <= run.mz_range[1] + 1])
         ions = ions_of[key][1]
         # Precursors of each ion: refined ion-trap precursors of z >= 2 sit up to 0.4 above M (merged isotopes); accurate MS1 also takes 13C triggers
         ion_hits = []
-        for name, z, mz, prot in ions:
+        for _, z, mz, _ in ions:
             d = run.prec - mz - shift
             if run.accurate:
                 tol = max(0.01, 2e-5 * mz)
@@ -533,7 +554,7 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
         """the MS2 of a composition near an RT that lie outside its MS1 peaks, for removal reasons"""
         inside = {h for p in a['peaks'] for v in p['ms2'].values() for h in v}
         out = []
-        for k, (_, z, mz, _) in enumerate(a['ions']):
+        for _, _, mz, _ in a['ions']:
             out += [h for h in np.flatnonzero((np.abs(run.prec - mz - shift) <= 0.3) & (np.abs(run.rt - expected) <= rt_window)) if h not in inside]
         if not out:
             return none
@@ -585,7 +606,7 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
     for e in entities:
         by_comp.setdefault(comp_key(e[0]['comp']), []).append(e)
     assigned = {}
-    for key, ents in by_comp.items():
+    for ents in by_comp.values():
         a = analyse(ents[0][0]['comp'])
         peaks = a['peaks']
         if not peaks:
@@ -642,14 +663,22 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
         # envelope (which holds the lighter ion's isotopes) with the lower window
         iso_note = ''
         if run.ms1 is not None and p['i'] is not None:
-            spacing = ISOTOPE_SPACING / z
-            merged = not (run.accurate or (run.resolved and z <= 2))
-            lower = run.smooth(run.envelope(mz - spacing, z, 0))[p['i']]
-            own = a['smoothed'][k_dom][p['i']] if merged else run.smooth(run.envelope(mz, z, 0))[p['i']]
+            # Judged on the dominant ion or, where that has no monoisotopic signal at the apex, on the composition's ion with the strongest there: the
+            # dominant ion (most MS2) can be an adduct or another charge state (GPST000548 A3G3S3 [M+4H]4+ 899.96 at 40.42, 1.3e7, was judged on its
+            # empty [M+Na+2H]3+ and removed)
+            def mono(k):
+                _, zk, mzk, _ = a['ions'][k]
+                return a['smoothed'][k][p['i']] if not (run.accurate or (run.resolved and zk <= 2)) else run.smooth(run.envelope(mzk, zk, 0))[p['i']]
+            k_iso = k_dom if mono(k_dom) > 0 else max(range(len(a['ions'])), key = mono)
+            _, z_iso, mz_iso, _ = a['ions'][k_iso]
+            spacing = ISOTOPE_SPACING / z_iso
+            merged = not (run.accurate or (run.resolved and z_iso <= 2))
+            lower = run.smooth(run.envelope(mz_iso - spacing, z_iso, 0))[p['i']]
+            own = mono(k_iso)
             if own <= 0:
                 reason = (reason + '; ' if reason else '') + 'no monoisotopic signal at its apex (the envelope belongs to other ions)'
             elif lower >= (0.5 if merged else 0.7) * own:
-                iso_note = f'the envelope may be the isotope pattern of a co-eluting ion at m/z {mz + shift - spacing:.2f} ({lower / own:.2f} of its signal)'
+                iso_note = f'the envelope may be the isotope pattern of a co-eluting ion at m/z {mz_iso + shift - spacing:.2f} ({lower / own:.2f} of its signal)'
                 if reason is None:
                     flag(here, 'possible isotope pick', iso_note)
                 else:
@@ -822,7 +851,7 @@ def audit(spectra_path, gt_path, glycan_class, run_name = None, modification = '
             k['abundance'] = round(100 * k['peak']['height'] / total_height, 4)
         elif k['source'] == 'added':
             k['abundance'] = round(k['peak']['height'] * scale, 4) if scale else np.nan
-    out_col = abund_col if abund_col and abund_col == run_name else run_name
+    out_col = run_name
     audited = pd.DataFrame([{'Mass': round(k['Mass'], 4), 'charge': k['charge'], 'RT': round(k['RT'], 2), 'glycan': k['glycan'], out_col: k['abundance'],
                              'composition': k['composition'], 'source': k['source'], 'RT_source': k['row']['RT_source'] if k['row'] else np.nan,
                              'Mass_source': k['row']['Mass_source'] if k['row'] else np.nan, 'glycan_source': k['row']['glycan_source'] if k['row'] else '',
@@ -858,6 +887,8 @@ def main():
     parser.add_argument('--lc', default = 'PGC', choices = ['PGC', 'C18', 'other'], help = 'the tail rule only applies to PGC')
     parser.add_argument('--library_cache', default = str(Path.home() / '.cache' / 'candycrunch' / 'audit_gt_library.pkl'))
     parser.add_argument('--data_dir', default = str(DATA_DIR), help = 'test data folder whose curated GTs and .xlsx form the spectral library')
+    parser.add_argument('--mode', default = None, choices = ['negative', 'positive'], help = 'ion mode, for spectra files that record none (Agilent mgf/xlsx)')
+    parser.add_argument('--max_charge', type = int, default = 3, help = 'highest charge searched for the compositions of open rows (the test set\'s max_charge)')
     args = parser.parse_args()
     gt_path = Path(args.gt)
     default = gt_path.stem[:-len('_source')] + '.csv' if gt_path.stem.endswith('_source') else gt_path.stem + '_audited.csv'
@@ -866,7 +897,8 @@ def main():
         sys.exit(f'{output} is the source GT; give another --output')
     audited, removed, review, summary = audit(args.spectra, gt_path, args.glycan_class, run_name = args.run, modification = args.modification,
                                               mass_tag = args.mass_tag, sample_prep = args.sample_prep, predictions = args.predictions,
-                                              rt_window = args.rt_window, library_cache = args.library_cache, data_dir = args.data_dir, lc = args.lc)
+                                              rt_window = args.rt_window, library_cache = args.library_cache, data_dir = args.data_dir, lc = args.lc,
+                                              mode = args.mode, max_charge = args.max_charge)
     audited.to_csv(output, index = False)
     removed.to_csv(output.with_name(output.stem + '_removed.csv'), index = False)
     review.to_csv(output.with_name(output.stem + '_review.csv'), index = False)

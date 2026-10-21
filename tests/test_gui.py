@@ -96,6 +96,22 @@ def test_gui_experiments(app):
     assert [name for name, _, _ in panel.experiments()] == ['Experiment 1'] and len(panel.paths()) == 3
 
 
+def test_gui_glycan_class_list(app):
+    from candycrunch import gui
+    panel = gui.SettingsPanel()
+    # N- and O-glycans measured together are one choice, sent to wrap_inference as a list; lists from sessions come back in any order
+    panel.set_values({**panel.values(), 'glycan_class': ['O', 'N']})
+    assert panel.inputs['glycan_class'].currentData() == 'N+O' and panel.values()['glycan_class'] == ['N', 'O']
+    # A list the combo does not offer becomes a choice of its own, and a list of one class is that class
+    panel.set_values({**panel.values(), 'glycan_class': ['free', 'O']})
+    assert panel.values()['glycan_class'] == ['O', 'free'] and panel.inputs['glycan_class'].currentText() == 'O-glycans and Free oligosaccharides (e.g., milk)'
+    panel.set_values({**panel.values(), 'glycan_class': ['lipid']})
+    assert panel.values()['glycan_class'] == 'lipid'
+    panel.add_paths([os.path.abspath('a.mzML')], detect = False)
+    panel.set_values({**panel.values(), 'glycan_class': ['N', 'O']})
+    assert panel.experiments()[0][2]['glycan_class'] == ['N', 'O']
+
+
 def test_gui_supporting_ions(app):
     import time
     from candycrunch import gui
@@ -373,7 +389,9 @@ def test_gui_reports(app, monkeypatch):
 
 
 def test_gui_models_and_misprediction_report(app, tmp_path, monkeypatch):
+    import importlib.util
     import json
+    import sys
     import time
     import torch
     from candycrunch import gui
@@ -390,6 +408,15 @@ def test_gui_models_and_misprediction_report(app, tmp_path, monkeypatch):
     for name, reason in (('small.pt', 'no CandyCrunch model'), ('notes.pt', 'no PyTorch weights file')):
         with pytest.raises(ValueError, match = reason):
             gui._load_model(str(tmp_path / name))
+    # The same without PyTorch, as in the built app, where the model runs on ONNX Runtime
+    if importlib.util.find_spec('onnxruntime'):
+        with monkeypatch.context() as patch:
+            patch.setitem(sys.modules, 'torch', None)
+            assert gui._check_model(str(tmp_path / 'tuned.pt')) == len(glycans) + 1
+            assert type(gui._load_model(str(tmp_path / 'tuned.pt'))[0]).__name__ == 'CandyCrunchCNN'
+            for name, reason in (('small.pt', 'no CandyCrunch model'), ('notes.pt', 'no PyTorch weights file')):
+                with pytest.raises(ValueError, match = reason):
+                    gui._load_model(str(tmp_path / name))
     # Importing checks the file in a process of its own, then copies it into the model folder and chooses it; a session's model that no longer exists
     # falls back to the built-in one
     panel = gui.SettingsPanel()
@@ -435,3 +462,27 @@ def test_gui_models_and_misprediction_report(app, tmp_path, monkeypatch):
     assert not send.isEnabled() and dialog.correct.text() == 'Gal(b1-4)GlcNAc' and dialog.include_data.isChecked()
     gui._set_combo(dialog.problem, 'structure')
     assert send.isEnabled()
+
+
+def test_gui_progress_wrappers(monkeypatch):
+    # The app's worker runs the pipeline through the progress wrappers _install_progress puts around prediction.py: a run through them must still predict
+    # (get_topk's own batching once failed on a wrapped loader, which only the built app's self-test caught) and count get_topk's batches
+    import queue
+    from candycrunch import gui
+    import candycrunch.prediction as cp
+    # The wrappers stay on the module for the rest of the process; restoring its attributes keeps them out of later tests
+    for name, value in vars(cp).copy().items():
+        if not name.startswith('__'):
+            monkeypatch.setattr(cp, name, value)
+    monkeypatch.setattr(cp, '_progress_installed', False, raising = False)
+    messages = queue.Queue()
+    gui._install_progress(messages, gui.STAGE_WEIGHTS, 1)
+    df = cp.wrap_inference(gui.EXAMPLE_RUN, 'O')
+    stage, progress = None, []
+    while not messages.empty():
+        kind, payload = messages.get()
+        stage = payload[0] if kind == 'stage' else stage
+        if kind == 'progress' and stage == 'get_topk':
+            progress.append(payload[1])
+    # Each get_topk call reports its start; only counted batches move it on
+    assert df['top1_pred'].notna().any() and progress and max(progress) > progress[0]

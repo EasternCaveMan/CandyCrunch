@@ -3,6 +3,7 @@ build/
 dist/
 *.egg-info/
 CLAUDE.md
+.claude/notes/
 
 # Python cache files
 __pycache__/
@@ -36,6 +37,7 @@ Thumbs.db
 
 # Test coverage
 .coverage
+coverage.xml
 htmlcov/
 .pytest_cache/
 

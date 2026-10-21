@@ -97,7 +97,7 @@ def digest(*parts):
 
 def replace_file(tmp, path):
     # os.replace fails on Windows while another process (a second run sharing the cache) has the target open; it is retried for up to a minute
-    for attempt in range(120):
+    for _ in range(120):
         try:
             return os.replace(tmp, path)
         except PermissionError:
@@ -114,7 +114,7 @@ class file_lock:
     def __enter__(self):
         self.path.parent.mkdir(parents = True, exist_ok = True)
         self.f = open(self.path, 'a+b')
-        for attempt in range(600):
+        for _ in range(600):
             try:
                 if os.name == 'nt':
                     import msvcrt
@@ -167,24 +167,21 @@ class Cache:
     def save(self):
         # Merged with what another run sharing the cache saved since this one loaded it (keys are content-addressed, so entries never conflict)
         with timed('cache_write'):
-            self.write()
-
-    def write(self):
-        if self.enabled and self.new:
-            self.path.parent.mkdir(parents = True, exist_ok = True)
-            with file_lock(self.path):
-                if self.path.exists() and self.path.stat().st_mtime_ns != self.mtime:
-                    try:
-                        with open(self.path, 'rb') as f:
-                            self.data = {**pickle.load(f), **self.data}
-                    except Exception:
-                        pass
-                tmp = self.path.with_suffix(f'.{os.getpid()}.tmp')
-                with open(tmp, 'wb') as f:
-                    pickle.dump(self.data, f, protocol = 4)
-                replace_file(tmp, self.path)
-                self.mtime = self.path.stat().st_mtime_ns
-            self.new = 0
+            if self.enabled and self.new:
+                self.path.parent.mkdir(parents = True, exist_ok = True)
+                with file_lock(self.path):
+                    if self.path.exists() and self.path.stat().st_mtime_ns != self.mtime:
+                        try:
+                            with open(self.path, 'rb') as f:
+                                self.data = {**pickle.load(f), **self.data}
+                        except Exception:
+                            pass
+                    tmp = self.path.with_suffix(f'.{os.getpid()}.tmp')
+                    with open(tmp, 'wb') as f:
+                        pickle.dump(self.data, f, protocol = 4)
+                    replace_file(tmp, self.path)
+                    self.mtime = self.path.stat().st_mtime_ns
+                self.new = 0
 
 
 def file_list(root, keep = lambda p: True):
@@ -200,7 +197,7 @@ def library_fingerprint():
     if 'library' in FINGERPRINTS:
         return FINGERPRINTS['library']
     versions = []
-    for lib in ['numpy', 'pandas', 'scipy', 'networkx', 'torch', 'openpyxl', 'opentfraw', 'timsrust_pyo3']:
+    for lib in ['numpy', 'pandas', 'scipy', 'networkx', 'torch', 'openpyxl', 'zstandard']:
         try:
             versions.append((lib, importlib.metadata.version(lib)))
         except importlib.metadata.PackageNotFoundError:
@@ -526,7 +523,6 @@ def prune_stage_cache(cache_dir, max_gb):
 def install_caches(cp, cache_dir, enabled, captured, model = None, vocab = None):
     # Wraps the module globals wrap_inference looks up at call time: memoized loading, CandyCrumbs, supporting_ions and model top-k, and captures of the
     # intermediate tables of the first (main) call of each stage for the trace
-    import torch
     import candycrunch.analysis as ca
     import candycrunch.model as cm
     model, vocab = (cp.candycrunch if model is None else model), (cp.glycans if vocab is None else vocab)
@@ -584,22 +580,21 @@ def install_caches(cp, cache_dir, enabled, captured, model = None, vocab = None)
             return hit
         wrapped.__name__ = name
         return wrapped
-    def get_topk(dataloader, run_model, glycans, k = 25, temp = False, temperature = cp.temperature):
-        dataset = dataloader.dataset
-        parts = dataset.datasets if isinstance(dataset, torch.utils.data.ConcatDataset) else [dataset]
-        if run_model is not model or glycans is not vocab or any(getattr(d, 'transform_mz', None) or getattr(d, 'transform_rt', None) for d in parts):
-            # Augmentation drawn at access time (code from before content-seeded augmentation) or a model the cache was not keyed on: no cache
-            out = orig['get_topk'](dataloader, run_model, glycans, k = k, temp = temp, temperature = temperature)
+    def get_topk(batches, run_model, glycans, k = 25, temp = False, temperature = cp.temperature):
+        if run_model is not model or glycans is not vocab:
+            # A model the cache was not keyed on: no cache
+            out = orig['get_topk'](batches, run_model, glycans, k = k, temp = temp, temperature = temperature)
             first('topk', out)
             return out
         start = time.perf_counter()
         settings = (k, temp, float(temperature), model_src)
-        keys = [digest(b''.join(t.numpy().tobytes() for t in dataset[i][:9]), settings) for i in range(len(dataset))]
+        rows = [[a[i] for a in b] for b in batches for i in range(len(b[0]))]
+        keys = [digest(b''.join(np.ascontiguousarray(a).tobytes() for a in r), settings) for r in rows]
         found = [caches['topk'].get(key) for key in keys]
         missing = [i for i, f in enumerate(found) if f is None]
         if missing:
-            loader = torch.utils.data.DataLoader(torch.utils.data.Subset(dataset, missing), batch_size = dataloader.batch_size, shuffle = False)
-            preds, conf = orig['get_topk'](loader, run_model, glycans, k = k, temp = temp, temperature = temperature)
+            preds, conf = orig['get_topk']([[np.stack([rows[i][c] for i in missing[j:j + 256]]) for c in range(len(rows[0]))] for j in range(0, len(missing), 256)], run_model,
+                                           glycans, k = k, temp = temp, temperature = temperature)
             for i, p, c in zip(missing, preds, conf):
                 found[i] = (p, c)
                 caches['topk'].put(keys[i], (p, c))
@@ -681,7 +676,6 @@ class GlycoworkMemo:
 
 def z1(mz, z, sign = -1):
     # Singly charged equivalent, as the metric compares masses (an unknown charge counts as singly charged in the run's ion mode)
-    # Singly charged equivalent, as the metric compares masses (an unknown charge counts as singly charged in the run's ion mode)
     from candycrunch.prediction import PROTON_MASS
     z = np.where(np.isnan(z) | (z == 0), sign, z)
     return mz * np.abs(z) - (z - np.sign(z)) * PROTON_MASS
@@ -719,7 +713,8 @@ def peak_outcomes(preds, gt, rt_col):
             sim = 1.0 if tc.compare_glycans(glycan, pred) else max(1.0 if tc.compare_glycans(x, pred) else tc.get_glycan_similarity(x, pred) for x in options)
         peaks.append(dict(mass = float(mass), rt = float(rt), gt = glycan, pred = pred, sim = None if sim is None else round(float(sim), 4),
                           row = None if i not in matched else [round(float(p['m/z'].iloc[matched[i]]), 4), round(float(p['RT'].iloc[matched[i]]), 2)]))
-    fps = [dict(mass = round(float(m), 4), rt = round(float(r), 2), pred = g) for j, (m, r, g) in enumerate(zip(p['m/z'], p['RT'], p['top1_pred'])) if j not in set(matched.values())]
+    taken = set(matched.values())
+    fps = [dict(mass = round(float(m), 4), rt = round(float(r), 2), pred = g) for j, (m, r, g) in enumerate(zip(p['m/z'], p['RT'], p['top1_pred'])) if j not in taken]
     return peaks, fps
 
 
@@ -729,7 +724,7 @@ def trace_file(captured, preds, gt, rt_col, sign = -1, vocabulary = None):
     from tests.test_CandyCrunch import match_spectra, MASS_TOLERANCE, RT_TOLERANCE, compare_glycans, canonicalize_iupac, get_possible_topologies, graph_to_string
     from candycrunch.prediction import get_comp, glycans
     vocabulary = glycans if vocabulary is None else vocabulary
-    comp_key = lambda c: tuple(sorted((k, v) for k, v in c.items() if v)) if isinstance(c, dict) else None
+    comp_key = lambda c: tuple(sorted(sum((Counter({k.split('_a2-')[0]: v}) for k, v in c.items() if v), Counter()).items())) if isinstance(c, dict) else None
     gt_comp = lambda g: comp_key(get_comp(g)) if isinstance(g, str) else None
     vocab = {canonicalize_iupac(g) for g in vocabulary}
     gt = gt.reset_index(drop = True)

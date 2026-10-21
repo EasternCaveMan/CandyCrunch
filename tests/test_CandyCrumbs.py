@@ -1,10 +1,16 @@
 import pytest
-import unittest
 import re
+import random
+import time
+from collections import Counter
+import numpy as np
+import networkx as nx
 from pyteomics import mass
 from candycrunch.analysis import CandyCrumbs, get_fragment_mass, glycan_to_graph_monos, derivatization_sites, DERIVATIZATION_MASSES, \
-    build_glycopeptide_input, rank_glycopeptide_structures, supporting_ions, WATER_MASS, mono_attributes, smiles_mono_attributes, CHAIN_IONS, domon_costello_to_mpl, \
-    peptide_to_glycowork, infer_glycosites, AA_masses
+    build_glycopeptide_input, rank_glycopeptide_structures, rank_glycopeptide_compositions, supporting_ions, WATER_MASS, mono_attributes, smiles_mono_attributes, \
+    CHAIN_IONS, domon_costello_to_mpl, \
+    peptide_to_glycowork, infer_glycosites, AA_masses, generate_atomic_frags, get_initial_global_mods, input_to_graph, glycopeptide_string_to_input, extend_masses, \
+    subgraphs_to_domon_costello, rank_chains, X_cross_rings, peptide_to_RF_nomenclature, get_glycan_cleavages, max_fragment_charge
 from glycowork.motif.tokenization import glycan_to_mass, composition_to_mass, calculate_adduct_mass, HYDROGEN_MASS, PROTON_MASS, modification_formula_dict
 
 TEST_DICTS = [{'glycan_string':'GalNAc(b1-4)GlcNAc(b1-3)[GalNAc(b1-4)GlcNAc(b1-6)]Gal(b1-4)Glc',
@@ -58,67 +64,64 @@ TEST_DICTS = [{'glycan_string':'GalNAc(b1-4)GlcNAc(b1-3)[GalNAc(b1-4)GlcNAc(b1-6
 'ref':'https://doi.org/10.1007/s13361-018-1945-7'
 }
 ]
-THRESHOLD = 0.4
-TOP5_THRESHOLD = 0.7
+# Correctly annotated peaks (top-1, top-5) of each TEST_DICTS spectrum as of 2026-10-19: fewer fails the accuracy tests, so that a lost annotation shows
+# instead of passing under a common threshold; when a change annotates more (or deliberately fewer), these are updated with it
+REFERENCE_CORRECT = [(8, 11), (16, 17), (10, 13), (7, 13), (4, 4), (9, 11), (25, 27)]
 CHAIN_RANKS = {'Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon', 'Zeta', 'Eta', 'Theta', 'Iota', 'Kappa', 'Lambda', 'Mu'}
 
 def strip_chain_rank(name):
-	parts = name.split('_')
-	if len(parts) == 3 and parts[2] in CHAIN_RANKS:
-		return '_'.join(parts[:2])
-	return name
+    parts = name.split('_')
+    if len(parts) == 3 and parts[2] in CHAIN_RANKS:
+        return '_'.join(parts[:2])
+    return name
 
 def normalize_annotations(annotations):
-	if not annotations:
-		return []
-	if isinstance(annotations[0], str):
-		return sorted(strip_chain_rank(x) for x in annotations)
-	return sorted(tuple(sorted(strip_chain_rank(y) for y in x)) for x in annotations)
+    if not annotations:
+        return []
+    if isinstance(annotations[0], str):
+        return sorted(strip_chain_rank(x) for x in annotations)
+    return sorted(tuple(sorted(strip_chain_rank(y) for y in x)) for x in annotations)
 
 @pytest.mark.parametrize("test_dict", TEST_DICTS)
 def test_candycrumbs_accuracy(test_dict):
-    result = CandyCrumbs(test_dict['glycan_string'], test_dict['masses'], mass_threshold = 0.4, charge=test_dict['charge'],mass_tag=test_dict['label_mass'],max_cleavages=test_dict.get('max_cleavages',3))
+    result = CandyCrumbs(test_dict['glycan_string'], test_dict['masses'], mass_threshold = 0.4, charge = test_dict['charge'], mass_tag = test_dict['label_mass'], max_cleavages = test_dict.get('max_cleavages', 3))
     total_annotations = len(test_dict['annotations'])
     correct_annotations = 0
     assert len(result) == total_annotations
-    for mass, expected_annotations in zip(test_dict['masses'], test_dict['annotations']):
+    for mz, expected_annotations in zip(test_dict['masses'], test_dict['annotations']):
         if not expected_annotations:
             total_annotations=total_annotations-1
             continue
-        if mass in result:
-            if result[mass]:
-                predicted_annotations = result[mass]['Domon-Costello nomenclatures'][0]
+        if mz in result:
+            if result[mz]:
+                predicted_annotations = result[mz]['Domon-Costello nomenclatures'][0]
                 if normalize_annotations(predicted_annotations) == normalize_annotations(expected_annotations):
                     correct_annotations += 1
-            elif not expected_annotations:
-                correct_annotations += 1  # Credit for correctly predicting no annotations
     score = correct_annotations / total_annotations
-    # Set a threshold for acceptable performance (e.g., 80% correct)
-    print(f"Score: {score:.2f}, Threshold: {THRESHOLD}")
-    assert score > THRESHOLD 
+    floor = REFERENCE_CORRECT[TEST_DICTS.index(test_dict)][0]
+    print(f"Score: {score:.2f} ({correct_annotations}/{total_annotations}), reference: {floor}/{total_annotations}")
+    assert correct_annotations >= floor
 
 @pytest.mark.parametrize("test_dict", TEST_DICTS)
 def test_candycrumbs_accuracy_top5(test_dict):
-    result = CandyCrumbs(test_dict['glycan_string'], test_dict['masses'], 0.4, charge=test_dict['charge'],mass_tag=test_dict['label_mass'],simplify=False)
+    result = CandyCrumbs(test_dict['glycan_string'], test_dict['masses'], 0.4, charge = test_dict['charge'], mass_tag = test_dict['label_mass'], simplify = False)
     total_annotations = len(test_dict['annotations'])
     correct_annotations = 0
     assert len(result) == total_annotations
-    for mass, expected_annotations in zip(test_dict['masses'], test_dict['annotations']):
+    for mz, expected_annotations in zip(test_dict['masses'], test_dict['annotations']):
         if not expected_annotations:
             total_annotations=total_annotations-1
             continue
-        if mass in result:
-            if result[mass]:
-                predicted_annotations = result[mass]['Domon-Costello nomenclatures']
+        if mz in result:
+            if result[mz]:
+                predicted_annotations = result[mz]['Domon-Costello nomenclatures']
                 exp_norm = normalize_annotations(expected_annotations)
                 if any(normalize_annotations(pred) == exp_norm for pred in predicted_annotations):
                     correct_annotations += 1
-            elif not expected_annotations:
-                correct_annotations += 1  # Credit for correctly predicting no annotations
     score = correct_annotations / total_annotations
-    # Set a threshold for acceptable performance (e.g., 80% correct)
-    print(f"Score: {score:.2f}, Threshold: {TOP5_THRESHOLD}")
-    assert score > TOP5_THRESHOLD
+    floor = REFERENCE_CORRECT[TEST_DICTS.index(test_dict)][1]
+    print(f"Score: {score:.2f} ({correct_annotations}/{total_annotations}), reference: {floor}/{total_annotations}")
+    assert correct_annotations >= floor
 
 
 DERIVATIZATION_GLYCANS = ['Neu5Ac(a2-3)Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc',
@@ -218,6 +221,19 @@ def test_glycopeptide_ethcd_charges():
             assert result[mz]['Domon-Costello nomenclatures'][0] == [[name], ['M']] and result[mz]['Fragment charges'][0] == 2
 
 
+def test_glycopeptide_hydrogen_transfer_ions():
+    # ETD-type spectra also hold c and z ions after a hydrogen atom moved between the two halves: c - H (c-1, as pyteomics names it) and z. + H (z+1, y - NH,
+    # as CandyCrunch's z is the radical; pyteomics 4 calls it 'z+1', pyteomics 5 'z+2'), which only the ETD-type methods name
+    glycan = 'Neu5Ac(a2-3)Gal(b1-3)GalNAc'
+    ions = {round(mass.fast_mass('ETQ', ion_type = 'c-1', charge = 1) + glycan_to_mass(glycan) - composition_to_mass({}), 4): [['c-1_3'], ['M']],
+            round(mass.fast_mass('PATSPAR', ion_type = 'y', charge = 1) - mass.calculate_mass(formula = 'NH'), 4): [['z+1_7'], ['loss of glycan 1']]}
+    for g in (glycan, 'Hex1HexNAc1Neu5Ac1'):
+        for method in ('ETD', 'EThcD', 'HCD', None):
+            result = CandyCrumbs({'peptide': 'ETQPATSPAR', 'glycans': [g], 'glycosites': [2]}, list(ions), charge = 3, fragmentation_method = method)
+            for mz, name in ions.items():
+                assert (result[mz]['Domon-Costello nomenclatures'][0] if result[mz] else None) == (name if method in ('ETD', 'EThcD') else None), (g, method, mz)
+
+
 def test_build_glycopeptide_input_modifications():
     # Met oxidation is a peptide residue, not a glycan; an unknown modification raises instead of becoming a massless glycan
     gp = build_glycopeptide_input('EMTSPGTPAR', 'M2(Oxidation);T3(HexNAc(1)Hex(1))')
@@ -261,6 +277,20 @@ def test_rank_glycopeptide_structures():
                                           ('TPSAAYPTDR', 'S3(Hex1HexNAc1NeuAc1);T8(Hex1HexNAc1NeuAc1)', [structures] * 2, 'max_candidates')):
         with pytest.raises(ValueError, match = message):
             rank_glycopeptide_structures(pep_seq, mods, peaks, charge = 2, structures = cands, max_candidates = 3)
+
+
+def test_rank_glycopeptide_compositions():
+    # Neu5Ac + Hex and Neu5Gc + Fuc weigh the same, so the sialic acid's oxonium ions (292/274 or 308/290) decide; and of two equal candidates, the one
+    # that needs no isotope step off the precursor comes first
+    pep = mass.calculate_mass(sequence = 'TPSAAYPTDR')
+    res = {k: composition_to_mass({k: 1}) - composition_to_mass({}) for k in ('HexNAc', 'Neu5Ac', 'Neu5Gc')}
+    peaks = {res['HexNAc'] + PROTON_MASS: 100, pep + PROTON_MASS: 70, pep + res['HexNAc'] + PROTON_MASS: 90}
+    for sialic_acid in ('Neu5Ac', 'Neu5Gc'):
+        spectrum = peaks | {res[sialic_acid] + PROTON_MASS: 80, res[sialic_acid] - WATER_MASS + PROTON_MASS: 60}
+        df = rank_glycopeptide_compositions('TPSAAYPTDR', ['H1N1A1', 'N1F1G1'], spectrum, charge = 2, glycosite = 2, fragmentation_method = 'HCD')
+        assert df['composition'][0].get(sialic_acid) == 1 and df['sialic_evidence'].tolist() == [1.0, 0.0] and df['rank'].tolist() == [1, 2]
+    df = rank_glycopeptide_compositions('TPSAAYPTDR', ['H1N1', 'H1N1'], peaks, charge = 2, glycosite = 2, isotope_errors = [1, 0])
+    assert df['isotope_error'].tolist() == [0, 1]
 
 
 def test_glycopeptide_nsite_pieces():
@@ -343,3 +373,123 @@ def test_candycrumbs_label_chain_ions(modification):
     if modification == '2AB':
         assert abs(get_fragment_mass('GlcNAc(b1-4)GlcNAc', 'I_03X0-C2H5NO-H2O', -1, mass_tag) - 173.0720) < 1e-3
         assert domon_costello_to_mpl(['I_03X0-C2H5NO-H2O']) == '$^{0,3}X_0 - C_{2}H_{5}NO - H_{2}O$'
+
+
+# Settings that take generate_atomic_frags through its paths: cross-rings, global modifications (metal cation pairs, hydrogen shifts, CO2/SO4 of acidic
+# residues), derivatization, mass tags (alditol, free reducing end, 2AB), multiply charged fragments, and positive mode's reducing-end A cross-rings
+PRECHECK_CASES = [dict(glycan = 'Neu5Ac(a2-3)Gal(b1-3)[Neu5Ac(a2-6)]GalNAc', charge = -1, max_cleavages = 3),
+                  dict(glycan = IGG_G0F, charge = -2, max_cleavages = 2, mass_tag = 0.0),
+                  dict(glycan = 'Fuc(a1-2)Gal(b1-4)GlcNAc(b1-3)Gal(b1-4)Glc', charge = 1, max_cleavages = 3, sample_prep = 'permethylated'),
+                  dict(glycan = 'Neu5Ac(a2-3)Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc', charge = -2, max_cleavages = 2, x_rings = False,
+                       mass_tag = calculate_adduct_mass(modification_formula_dict['2AB'])),
+                  dict(glycan = 'GlcNS6S(a1-4)IdoA2S(a1-4)GlcNS', charge = -2, max_cleavages = 3),
+                  dict(glycan = 'Neu5Ac(a2-3)Gal(b1-4)Glc', charge = 2, max_cleavages = 2, mass_tag = 0.0, max_global_mods = 2),
+                  dict(glycan = 'Gal(b1-3)[Neu5Ac(a2-6)]GalNAc', charge = -1, max_cleavages = 2, sample_prep = 'peracetylated', hydrogen_shifts = True)]
+
+
+@pytest.mark.parametrize('case', PRECHECK_CASES)
+def test_candycrumbs_precheck_matches_full_calculation(case):
+    # generate_atomic_frags only makes the fragments near a wanted mass (all node sets checked at once in arrays, then the exact masses of the combinations
+    # found), names them per terminal option and builds a fragment's graph only when asked: they have to be the fragments of the full calculation of every
+    # fragment that are within the tolerance, with the names of their graphs
+    glycan, charge, sample_prep, mass_tag = case['glycan'], case['charge'], case.get('sample_prep', 'underivatized'), case.get('mass_tag')
+    nx_mono, _ = input_to_graph(glycopeptide_string_to_input(glycan))
+    global_mods, special_residues = get_initial_global_mods(nx_mono, charge, max_global_mods = case.get('max_global_mods', 1), sample_prep = sample_prep,
+                                                            hydrogen_shifts = case.get('hydrogen_shifts', False))
+    x_rings = X_cross_rings if case.get('x_rings', True) else []
+    kwargs = dict(max_cleavages = case['max_cleavages'], mass_tag = mass_tag, charge = charge, sample_prep = sample_prep,
+                  disable_A_cross_rings = ('non_reducing' if mass_tag == 0 else True) if charge > 0 else False)
+    full = generate_atomic_frags(nx_mono, global_mods, special_residues, x_rings, fragment_masses = [], **kwargs)
+    rng = random.Random(0)
+    masses = sorted(rng.uniform(150, max(full)) for _ in range(60))
+    found = generate_atomic_frags(nx_mono, global_mods, special_residues, x_rings, fragment_masses = masses, threshold = 0.3, **kwargs)
+    wanted, chain_rank = extend_masses(masses, charge), list(rank_chains(nx_mono))
+
+    def named(fragments):
+        # fragments by mass (rounded to 5 decimals) and name, without those this close to the tolerance's edge, which rounding can put on the other side
+        return Counter((m, tuple(name)) for m, frags in fragments.items() if abs(np.abs(wanted - m).min() - 0.3) > 1e-4
+                       for name in subgraphs_to_domon_costello(nx_mono, frags, chain_rank = chain_rank))
+    assert found and named(found) == named({m: frags for m, frags in full.items() if np.abs(wanted - m).min() < 0.3})
+    fragments = [f for frags in found.values() for f in frags]
+    assert subgraphs_to_domon_costello(nx_mono, fragments, chain_rank = chain_rank) == subgraphs_to_domon_costello(nx_mono, [f.graph for f in fragments],
+                                                                                                               chain_rank = chain_rank)
+
+
+# Glycopeptides through the same precheck: an N-glycan on a short peptide at z = 3 with two global modifications, a sialylated core 2 with X cross-rings,
+# and two O-glycans (node sets holding both reducing ends take the full calculation)
+GLYCOPEPTIDE_PRECHECK_CASES = [dict(glycopeptide = f'EEQYN*{IGG_G0F}*STYR', charge = 3, max_cleavages = 2, max_global_mods = 2),
+                               dict(glycopeptide = 'AVAVT*Neu5Ac(a2-3)Gal(b1-3)[Neu5Ac(a2-3)Gal(b1-4)GlcNAc(b1-6)]GalNAc*LQSH', charge = 3, max_cleavages = 2, x_rings = True),
+                               dict(glycopeptide = 'T*Gal(b1-3)GalNAc*TPPT*Neu5Ac(a2-3)Gal(b1-3)GalNAc*TATPIR', charge = 2, max_cleavages = 3)]
+
+
+@pytest.mark.parametrize('case', GLYCOPEPTIDE_PRECHECK_CASES)
+def test_candycrumbs_glycopeptide_precheck(case):
+    # as test_candycrumbs_precheck_matches_full_calculation for glycopeptides, whose node sets have two roots (the full calculation takes the C-terminal
+    # residue of the peptide part) and gain the water of the peptide's termini once, also with the ppm tolerance CandyCrumbs uses for them; and the names
+    # of the peptide and glycan parts and the charge cap read off a Fragment are those of its graph
+    input_dict = glycopeptide_string_to_input(case['glycopeptide'])
+    nx_mono, pep_gr = input_to_graph(input_dict)
+    charge = case['charge']
+    global_mods, special_residues = get_initial_global_mods(nx_mono, charge, max_global_mods = case.get('max_global_mods', 1))
+    x_rings = X_cross_rings if case.get('x_rings') else []
+    kwargs = dict(max_cleavages = case['max_cleavages'], charge = charge, disable_A_cross_rings = True)
+    full = generate_atomic_frags(nx_mono, global_mods, special_residues, x_rings, fragment_masses = [], **kwargs)
+    rng = random.Random(0)
+    masses = sorted([rng.choice(sorted(full)) * (1 + rng.gauss(0, 3e-6)) for _ in range(60)] + [rng.uniform(150, max(full)) for _ in range(60)])
+    wanted = extend_masses(masses, charge)
+    chain_rank = {}
+    for prefix in sorted({x.split('-')[0] for x in nx_mono} - {'0'}, key = int):
+        glyc = [x for x in nx_mono if x.split('-')[0] == prefix]
+        chain_rank[prefix] = [(rank, [f'{prefix}-{n}' for n in chain]) for rank, chain in
+                              rank_chains(nx.relabel_nodes(nx_mono.subgraph(glyc), {x: int(x.split('-')[1]) for x in glyc}))]
+    for threshold_ppm in (None, 10):
+        found = generate_atomic_frags(nx_mono, global_mods, special_residues, x_rings, fragment_masses = masses, threshold = 0.02, threshold_ppm = threshold_ppm,
+                                      **kwargs)
+
+        def described(fragments):
+            # fragments within the tolerance by mass and what they are, without those this close to its edge, which rounding can put on the other side
+            out = Counter()
+            for m, frags in fragments.items():
+                d = np.abs(wanted - m).min()
+                limit = 0.02 if threshold_ppm is None else min(0.02, m * threshold_ppm / 1e6)
+                if d < limit and abs(d - limit) > 1e-4:
+                    out.update((m, tuple(f.nodes), tuple(f.terminals), tuple(f.mono_mods), tuple(tuple(a.items()) for a in f.atom_mods), f.global_mod) for f in frags)
+            return out
+
+        assert found and described(found) == described(full)
+        fragments = [f for frags in found.values() for f in frags]
+        assert [peptide_to_RF_nomenclature(pep_gr, f) for f in fragments] == [peptide_to_RF_nomenclature(pep_gr, f.graph) for f in fragments]
+        assert get_glycan_cleavages(nx_mono, fragments, input_dict['glycosites'], chain_rank) == get_glycan_cleavages(nx_mono, [f.graph for f in fragments],
+                                                                                                                    input_dict['glycosites'], chain_rank)
+        assert [max_fragment_charge(f, peptide = True) for f in fragments] == [max_fragment_charge(f.graph, peptide = True) for f in fragments]
+
+
+def test_candycrumbs_speed(request):
+    # CandyCrumbs as the app annotates a spectrum (simplify, three cleavages, cross-rings and global modifications), as the pipeline scores a candidate
+    # (two cleavages, neither) and supporting_ions, over the reference spectra and a 150-peak N-glycan spectrum, timed against the fastest run on this
+    # machine (pytest's cache, which --cache-clear resets): printed like the scores, failing only beyond 4x, as test workers share the cores and what ran
+    # before in the process moves these by up to 2x (after rank_glycopeptide_structures, which loads glycowork's df_glycan, numpy allocates slower)
+    rng = random.Random(0)
+    spectra = [(d['glycan_string'], d['masses'], d['charge'], d['label_mass']) for d in TEST_DICTS[:6]]
+    spectra.append((IGG_G0F, sorted(round(rng.uniform(150, 1800), 2) for _ in range(150)), -2, 2.0156))
+    runs = {'app': lambda g, masses, charge, mass_tag: CandyCrumbs(g, masses, mass_threshold = 0.5, charge = charge, mass_tag = mass_tag),
+            'pipeline': lambda g, masses, charge, mass_tag: CandyCrumbs(g, masses, mass_threshold = 0.5, charge = charge, mass_tag = mass_tag, max_cleavages = 2,
+                                                                        disable_X_cross_rings = True, disable_global_mods = True, simplify = False),
+            'supporting_ions': lambda g, masses, charge, mass_tag: supporting_ions(g, {m: 100.0 - i for i, m in enumerate(masses)}, charge = charge,
+                                                                                    mass_tag = mass_tag)}
+    cache = getattr(request.config, 'cache', None)
+    for name, run in runs.items():
+        # after a run that sets up what is kept across calls (vocabulary, node sets, fragment options), as in a session, three timed ones with the peaks
+        # shifted, so that no result kept for the same peaks (supporting_ions) is reused
+        times = []
+        for shift in (0.0, 0.001, 0.002, 0.003):
+            start = time.perf_counter()
+            for glycan, masses, charge, mass_tag in spectra:
+                run(glycan, [m + shift for m in masses], charge, mass_tag)
+            times.append(time.perf_counter() - start)
+        times = times[1:]
+        best = cache.get(f'candycrumbs/speed/{name}', None) if cache else None
+        print(f"CandyCrumbs speed, {name}: {min(times) * 1000:.0f} ms" + (f", fastest on this machine {best * 1000:.0f} ms" if best else ''))
+        if cache and (best is None or min(times) < best):
+            cache.set(f'candycrumbs/speed/{name}', min(times))
+        assert best is None or min(times) < 4 * best, f"CandyCrumbs ({name}) is {min(times) / best:.1f}x slower than this machine's fastest run"

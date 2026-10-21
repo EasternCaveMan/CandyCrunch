@@ -1,13 +1,12 @@
 import pytest
-import unittest
 import os
 import base64
 import pathlib
+import sqlite3
 import struct
 import zlib
 import hashlib
 import inspect
-import sys
 import json
 from tabulate import tabulate
 import numpy as np
@@ -24,7 +23,6 @@ from glycowork.motif.processing import canonicalize_iupac, canonicalize_composit
 import time
 import random
 import torch
-import time
 
 BASE_DIR = pathlib.Path(__file__).parent.parent  # Go up one level from the test file
 # CC_TEST_DATA_DIR: an alternate data folder (e.g., hardlinks with regenerated .xlsx), for measuring regenerated inputs
@@ -37,7 +35,7 @@ TEST_DICTS = [
     {'name':'GPST000029','args': {'glycan_class':'O'}},
     {'name':'PMC8950484_CHO','args': {'glycan_class':'O'}},
     {'name':'GPST000307','args': {'glycan_class':'O'}},
-    {'name':'GPST000487','args': {'glycan_class':'N'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000487/")]},
+    {'name':'GPST000487','args': {'glycan_class':['N', 'O']},'test_files':os.listdir(f"{TEST_DATA_DIR}/GPST000487/")},
     # Four O-glycan and four N-glycan replicate runs (Bruker HCT) share one folder; 'folder' names it, 'name' the ground truth (df_mz_<name>.csv)
     {'name':'GPST000169_O','folder':'GPST000169','args': {'glycan_class':'O'},'test_files':[x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000169/") if 'OGlycan' in x]},
     {'name': 'GPST000169_N', 'folder': 'GPST000169', 'args': {'glycan_class': 'N'},
@@ -73,10 +71,14 @@ TEST_DICTS = [
     # trisialylated glycans are mostly [M+4H]4+, so max_charge 4
     {'name': 'GPST000548', 'args': {'glycan_class': 'N', 'sample_prep': 'permethylated', 'max_charge': 4, 'lc': 'C18'},
      'test_files': [x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000548/") if 'Serum_control' in x]},
-    # Permethylated reduced rat serum N-glycans with Neu5Gc (Mechref lab, C18, Q Exactive HF, positive HCD), the DDA run only (the PRM run of the sample has no
-    # survey scans and its precursors sit 18 Da above the DDA ones); .raw with --input-format mzml, its .xlsx otherwise
+    # Permethylated reduced rat serum N-glycans with Neu5Gc (Mechref lab, C18, Q Exactive HF, positive HCD), the DDA run; .raw with --input-format mzml, its
+    # .xlsx otherwise
     {'name': 'GPST000403', 'args': {'glycan_class': 'N', 'sample_prep': 'permethylated', 'max_charge': 4, 'lc': 'C18'},
      'test_files': [x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000403/") if 'Rat_Glyphosate' in x]},
+    # The PRM run of the same sample (30 scheduled targets, no survey scans, so no precursor intensities; every target sits on the 13C peak of its ion, those
+    # of z = 3 isolate [M+2H+NH4]3+ ions); ground truth from the DDA one (RT 2.2-3.7 min later), each row backed by its PRM MS2
+    {'name': 'GPST000403_PRM', 'folder': 'GPST000403', 'args': {'glycan_class': 'N', 'sample_prep': 'permethylated', 'max_charge': 4, 'lc': 'C18'},
+     'test_files': [x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000403/") if x.startswith('PRM_')]},
     # N-glycans of carcinoembryonic antigen (human, Merck preparation; Bruker amaZon speed ETD, msconvert profile mzML with MS1, its extract_spectra .xlsx otherwise)
     {'name': 'GPST000054', 'args': {'glycan_class': 'N'}, 'test_files': [x for x in os.listdir(f"{TEST_DATA_DIR}/GPST000054/") if x.startswith('CEA_Human_Merk')]},
     # Glycosphingolipid glycans of SW1116 colorectal cancer cells with a GT1b spike (Bruker HCT, profile mzXML, its extract_spectra .xlsx otherwise)
@@ -115,6 +117,11 @@ UNTRACKED_DIR = BASE_DIR / "tests" / "untracked"
 if os.path.exists(UNTRACKED_DIR / 'df_mz_timsTOF_serum.csv'):
     TEST_DICTS.append({'name': 'timsTOF_serum', 'folder': '../untracked', 'args': {'glycan_class': 'N'},
                        'test_files': [x for x in os.listdir(UNTRACKED_DIR) if x.startswith('20260831_TIMS_SC_NG') and x.lower().endswith(('.d', '.xlsx'))]})
+# Pooled human urine N-glycans labelled with 2-aminopyridine (PA), DEAE fraction A1 sub-run 1, fraction 8 after aminolysis-SALSA (a2-6 isopropylamide, a2-3/8
+# methylamide), Thermo LTQ (ion-trap MS1 and CID MS2, positive), one run (.raw with --input-format mzml, its .xlsx otherwise); in tests/untracked like timsTOF_serum
+if os.path.exists(UNTRACKED_DIR / 'GPST000750' / 'df_mz_GPST000750.csv'):
+    TEST_DICTS.append({'name': 'GPST000750', 'folder': '../untracked/GPST000750',
+                       'args': {'glycan_class': 'N', 'modification': 'PA', 'lc': 'C18', 'max_charge': 3, 'sialic_derivatization': 'SALSA'}})
 # Misprediction reports from the app (fetched from Sentry by the misprediction cell into tests/untracked/mispredictions): one set per report, the .cc of
 # the peak's surroundings and an .xlsx made from it (older reports: the pooled MS2 spectrum as a one-spectrum .xlsx)
 if os.path.exists(UNTRACKED_DIR / 'mispredictions' / 'index.json'):
@@ -202,11 +209,10 @@ def evaluate_predictions(predictions, gt, rt_col, mass_thresh, RT_thresh, verbos
       while any('{' in p for p in possible_structures):
         possible_structures = list(dict.fromkeys(q for p in possible_structures for q in ([graph_to_string(x) for x in get_possible_topologies(p, exhaustive = True)] if '{' in p else [p])))
       similarity_scores.append(1.0 if compare_glycans(gt_glycan, pred_glycan) else max([1.0 if compare_glycans(p, pred_glycan) else get_glycan_similarity(p, pred_glycan) for p in possible_structures]))
+    elif compare_glycans(gt_glycan, pred_glycan):
+      similarity_scores.append(1.0)
     else:
-      if compare_glycans(gt_glycan, pred_glycan):
-        similarity_scores.append(1.0)
-      else:
-        similarity_scores.append(get_glycan_similarity(gt_glycan, pred_glycan))
+      similarity_scores.append(get_glycan_similarity(gt_glycan, pred_glycan))
   new_md['similarity_score'] = similarity_scores
   unevaluable = len(np.where((new_md['in_ground_truth'])&(new_md['glycan'].isnull())&(new_md['batch_pred'].notnull()))[0])
   fp = len(np.where((~new_md['in_ground_truth'])&(new_md['batch_pred'].notnull()))[0])
@@ -248,7 +254,7 @@ def posthoc_process_df(df_in, posthoc_params):
             df_in = df_in[(df_in[df_arg] < posthoc_params[arg])]
         else:
             df_in = df_in[(df_in[df_arg] > posthoc_params[arg])]
-    return df_in 
+    return df_in
 
 extra_param_dict = {
         'test_dict': TEST_DICTS,
@@ -257,8 +263,8 @@ extra_param_dict = {
     }
 
 test_params = [
-    dict(zip([x for x in extra_param_dict], combo))
-    for combo in product(*[v for v in extra_param_dict.values()])
+    dict(zip(extra_param_dict, combo))
+    for combo in product(*extra_param_dict.values())
 ]
 
 
@@ -269,19 +275,18 @@ def pytest_generate_tests(metafunc):
         input_format = metafunc.config.getoption('--input-format')
         groups = ['xlsx', 'mzml'] if input_format == 'both' else [input_format]
         metafunc.parametrize('test_params, file_group', [(p, g) for p in test_params for g in groups],
-                             ids = [f"{p['test_dict']['name']}-{p['test_dict']['args']['glycan_class']}-{g}" for p in test_params for g in groups])
+                             ids = [f"{p['test_dict']['name']}-{'+'.join(glycan_classes(p['test_dict']['args']['glycan_class']))}-{g}" for p in test_params for g in groups])
 
 
-def test_candycrunch_accuracy(test_params, file_group, result_collector, input_format, verbose, test_files = None):
+def test_candycrunch_accuracy(test_params, file_group, result_collector, input_format, verbose):
     if result_collector.param_names is None:
         result_collector.param_names = {k: k for k in list(extra_param_dict.keys()) + ['format']}
-    start_time = time.time()  # Start timing
     test_outputs = []
     test_dict = test_params['test_dict']
     folder = test_dict.get('folder', test_dict['name'])
-    test_files = test_params['test_dict'].get('test_files',None)
+    test_files = test_dict.get('test_files')
     if test_files is None:
-        test_files = [x for x in os.listdir(f"{TEST_DATA_DIR}/{folder}")]
+        test_files = os.listdir(f"{TEST_DATA_DIR}/{folder}")
     test_files = [x for x in test_files if 'df_mz' not in x if not x.startswith(".")]
     # mzXML and Thermo .raw files count as mzML (raw spectra with MS1), so they never enter an xlsx run
     if file_group == "xlsx":
@@ -310,7 +315,7 @@ def test_candycrunch_accuracy(test_params, file_group, result_collector, input_f
         print(f"\nTest execution time: {execution_time:.2f} seconds")  # Print execution time
         preds_out = posthoc_process_df(preds_out,posthoc_params)
         loaded_gt = pd.read_csv(f"{TEST_DATA_DIR}/{folder}/df_mz_{test_dict['name']}.csv")
-        col_name  =  filename.split(".")[0]
+        col_name = filename.split(".")[0]
         rt_col_name = 'RT' if 'RT' in loaded_gt.columns else col_name+'_RT'
         eval_scores = evaluate_predictions(preds_out, loaded_gt[loaded_gt[col_name] > 0], rt_col_name, MASS_TOLERANCE, RT_TOLERANCE, verbose = verbose)
         print('True Positives',eval_scores[-4])
@@ -389,6 +394,30 @@ def test_reducing_end_check(capsys):
     assert capsys.readouterr().out.count("Overriding the reducing end to 'reduced'") == 2
     reduced = set(outs['reduced']['top1_pred'].dropna())
     assert len(reduced) >= 15 and all(len(set(outs[m]['top1_pred'].dropna()) & reduced) >= 0.8 * len(reduced) for m in ['custom', '2AB'])
+
+
+def test_onnx_model_matches_torch():
+    # The built app runs the weights of model.py's CandyCrunch_CNN on ONNX Runtime: same logits as PyTorch, also for a norm scale below zero (which cannot
+    # be folded into the convolution after it), and the same predictions for the example run
+    pytest.importorskip('onnxruntime')
+    from candycrunch.inference import CandyCrunchCNN, load_weights
+    from candycrunch.model import CandyCrunch_CNN
+    weights = load_weights(BASE_DIR / 'candycrunch' / 'candycrunch.pt')
+    rng = np.random.default_rng(0)
+    mz = np.zeros((8, 2, 2048), np.float32)
+    for row in mz:
+        peaks = rng.choice(2048, 40, replace = False)
+        row[:, peaks] = rng.random((2, 40))
+    inputs = (mz, rng.random((8, 12)).astype(np.float32), rng.integers(0, 3, 8), rng.random((8, 1)).astype(np.float32), *rng.integers(0, 3, (4, 8)))
+    for state in (weights, {**weights, 'res3.ln2.weight': -weights['res3.ln2.weight']}):
+        model = CandyCrunch_CNN(2048, num_classes = len(glycans), input_precursor_dim = 12)
+        model.load_state_dict({k: torch.from_numpy(v) for k, v in state.items()})
+        with torch.inference_mode():
+            logits = model.eval()(*[torch.from_numpy(x if x.ndim > 1 else x[:, None]) for x in inputs]).numpy()
+        assert np.abs(CandyCrunchCNN(state)(*inputs) - logits).max() < 1e-3
+    example = str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx')
+    onnx, default = wrap_inference(example, 'O', model = CandyCrunchCNN(weights)), wrap_inference(example, 'O')
+    assert onnx.index.equals(default.index) and onnx['top1_pred'].equals(default['top1_pred'])
 
 
 def test_xic_quantification():
@@ -491,8 +520,9 @@ def test_quantification_published(quant_set, result_collector):
     if by:
         gt = gt.groupby(by).agg(measured = ('measured', 'sum'), **{column: (column, 'first')}).reset_index()
     measured, published = gt['measured'].values / gt['measured'].sum(), gt[column].values / gt[column].sum()
-    log_ratio = np.log2(np.maximum(measured, measured[measured > 0].min() / 2) / published)
-    score = float(np.corrcoef(np.log2(np.maximum(measured, measured[measured > 0].min() / 2)), np.log2(published))[0, 1])
+    floored = np.maximum(measured, measured[measured > 0].min() / 2)
+    log_ratio = np.log2(floored / published)
+    score = float(np.corrcoef(np.log2(floored), np.log2(published))[0, 1])
     print(f'{quant_set} quantification ({len(gt)} {"compositions" if by else "peaks"}): r of log shares {score:.3f}, Spearman {spearmanr(measured, published)[0]:.3f}, '
           f'{np.mean(np.abs(log_ratio) <= 1):.2f} within 2x, median |log2 ratio| {np.median(np.abs(log_ratio)):.3f}, {(measured == 0).sum()} not found')
     result_collector.add_result({'test_dict': {'name': f'{quant_set}_quant'}, 'supplement': True, 'experimental': True, 'format': 'quant'}, score)
@@ -701,6 +731,128 @@ def test_tof_precursors():
     out, drop, intensities = refine_tof_precursors(ms1, [1111.3935, 1111.892, 1000.003], [10.0, 10.0, 10.0], [0, 0, 0], [2, 2, 1])
     assert abs(out[0] - 1111.392) < 1e-3 and abs(out[1] - 1111.392) < 1e-3 and abs(out[2] - 1000.0) < 1e-4 and not drop.any()
     assert np.allclose(intensities, [266, 266, 500])
+
+
+def test_tdf_frames(tmp_path):
+    # A DDA-PASEF .d with one survey frame and one PASEF frame, written as compression type 2 (zstd) and as type 1 (LZF per scan, as literal runs and one
+    # overlapping back reference): survey peaks come back at the m/z of their TOF index, summed over scans, and the precursor's MS2 spectrum sums only its
+    # own scans (2-5; the peak in scan 8 belongs to another precursor)
+    try:
+        from compression.zstd import compress
+    except ImportError:
+        from zstandard import compress
+    def tof(mz):
+        return round((300 + np.sqrt(1e12 / 157000 * mz) - 24864) / 0.2)
+    def mz(tof):
+        return (tof * 0.2 + 24864 - 300) ** 2 * 157000 / 1e12
+    survey = {3: [(tof(1000.0), 500)], 5: [(tof(1111.392), 100)], 6: [(tof(1111.392), 50)]}
+    pasef = {2: [(tof(500.0), 40)], 3: [(tof(600.0), 100), (tof(600.0) + 1, 100), (tof(600.0) + 2, 100)], 4: [(tof(500.0), 60), (tof(700.0), 30)],
+             8: [(tof(800.0), 1000)]}
+    outputs = []
+    for compression in ('2', '1'):
+        folder = tmp_path / f'type{compression}.d'
+        folder.mkdir()
+        frames, tims_ids = b'', []
+        for scans in (survey, pasef):
+            tims_ids.append(len(frames))
+            if compression == '2':
+                values = [10] + [2 * len(scans.get(s, [])) for s in range(9)]
+                for s in range(10):
+                    last = -1
+                    for t, i in scans.get(s, []):
+                        values += [t - last, i]
+                        last = t
+                data = compress(np.array(values, '<u4').view(np.uint8).reshape(-1, 4).T.tobytes())
+                frames += struct.pack('<2I', 8 + len(data), 10) + data
+                continue
+            blocks = []
+            for s in range(10):
+                raw, last = [], 0
+                for t, i in scans.get(s, []):
+                    raw += ([last - t] if t > last else []) + [i]
+                    last = t + 1
+                raw = np.array(raw, '<i4').tobytes()
+                if s == 3 and scans is pasef:
+                    # The three equal intensities of PASEF scan 3: the skip and the first as literals, then 8 bytes copied from 4 bytes back
+                    blocks.append(bytes([7]) + raw[:8] + bytes([0xc0, 3]))
+                else:
+                    blocks.append(b''.join(bytes([len(raw[k:k + 32]) - 1]) + raw[k:k + 32] for k in range(0, len(raw), 32)))
+            offsets = np.cumsum([8 + 44] + [len(b) for b in blocks])
+            frames += struct.pack('<2I', offsets[-1], 10) + np.array(offsets, '<u4').tobytes() + b''.join(blocks)
+        (folder / 'analysis.tdf_bin').write_bytes(frames)
+        db = sqlite3.connect(folder / 'analysis.tdf')
+        db.execute('CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT)')
+        db.execute("INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', ?)", (compression,))
+        db.execute('CREATE TABLE Frames (Id INTEGER, Time REAL, Polarity TEXT, MsMsType INTEGER, TimsId INTEGER, NumPeaks INTEGER, MzCalibration INTEGER, T1 REAL, T2 REAL)')
+        db.executemany('INSERT INTO Frames VALUES (?, ?, ?, ?, ?, ?, 1, 25.0, 25.0)', [(1, 600.0, '-', 0, tims_ids[0], 3), (2, 600.1, '-', 8, tims_ids[1], 7)])
+        db.execute('CREATE TABLE MzCalibration (Id INTEGER, ModelType INTEGER, DigitizerTimebase REAL, DigitizerDelay REAL, T1 REAL, T2 REAL, dC1 REAL, dC2 REAL, C0 REAL, C1 REAL, C2 REAL, C3 REAL, C4 REAL)')
+        db.execute('INSERT INTO MzCalibration VALUES (1, 1, 0.2, 24864, 25.0, 25.0, 0, 0, 300, 157000, 0, 0, 0)')
+        db.execute('CREATE TABLE Precursors (Id INTEGER, LargestPeakMz REAL, MonoisotopicMz REAL, Charge INTEGER, Intensity REAL, Parent INTEGER)')
+        db.execute('INSERT INTO Precursors VALUES (1, ?, ?, 2, 100, 1)', (mz(tof(1111.392)), mz(tof(1111.392))))
+        db.execute('CREATE TABLE PasefFrameMsMsInfo (Frame INTEGER, ScanNumBegin INTEGER, ScanNumEnd INTEGER, Precursor INTEGER, IsolationMz REAL, IsolationWidth REAL)')
+        db.execute('INSERT INTO PasefFrameMsMsInfo VALUES (2, 2, 6, 1, 1111.4, 3.0)')
+        db.commit()
+        db.close()
+        outputs.append(process_tdf_stack(str(folder), intensity = True, extract_ms1 = True))
+    for df in outputs:
+        _, ms1_mzs, ms1_ints, _ = df.attrs['ms1']
+        assert np.allclose(ms1_mzs, [mz(tof(1000.0)), mz(tof(1111.392))], rtol = 1e-7) and np.allclose(ms1_ints, [500, 150])
+        assert len(df) == 1 and abs(df['m/z'][0] - mz(tof(1111.392))) < 1e-4 and df['precursor_charge'][0] == 2 and abs(df['RT'][0] - 10.0) < 1e-9
+        peaks = sorted(df['peak_d'][0].items())
+        assert np.allclose([m for m, _ in peaks], [mz(tof(500.0)), mz(tof(600.0) + 1), mz(tof(700.0))], rtol = 1e-6) and np.allclose([i for _, i in peaks], [100, 300, 30])
+    assert outputs[0]['peak_d'][0] == outputs[1]['peak_d'][0]
+
+
+def test_thermo_raw(tmp_path):
+    # A version 66 Thermo .raw file with an ion-trap profile survey scan (a peak at 1000.0 on Thermo's axis, stored one bin lower) and two centroided MS2
+    # scans, one with an undetermined precursor (isolation m/z and no charge) and one with the instrument's monoisotopic m/z, charge and master scan;
+    # their scan events differ in size, and the trailer extra header sits behind the error log
+    def text(s):
+        return struct.pack('<I', len(s)) + s.encode('utf-16-le')
+    def event(level, mode, reactions):
+        preamble = bytearray(136)
+        preamble[4:7] = bytes([0, mode, level])
+        return (bytes(preamble) + struct.pack('<I', len(reactions)) + b''.join(struct.pack('<3dI28x', mz, 2.0, energy, code << 1) for mz, energy, code in reactions)
+                + struct.pack('<I2dI3I', 1, 150.0, 2000.0, 0, 0, 0, 0))
+    profile = struct.pack('<2d2I2I5f', 100.0, 0.1, 1, 0, 8997, 5, 10, 50, 100, 50, 10)
+    centroids = [[(400.1, 50.0), (600.2, 100.0)], [(300.0, 20.0)]]
+    packets = [struct.pack('<4I24x', 1, len(profile) // 4, 0, 0) + profile] + [struct.pack('<4I24x', 1, 0, 1 + 2 * len(c), 0) + struct.pack('<I', len(c))
+                                                                                  + b''.join(struct.pack('<2f', *p) for p in c) for c in centroids]
+    events = event(1, 1, []) + event(2, 0, [(1000.0, 35.0, 0)]) + event(2, 0, [(1000.5, 30.0, 5)])
+    header = struct.pack('<I', 3) + b''.join(struct.pack('<2I', kind, 0) + text(label) for kind, label in [(11, 'Monoisotopic M/Z:'), (6, 'Charge State:'), (8, 'Master Scan Number:')])
+    trailer = struct.pack('<dhi', 0, 0, 0) + struct.pack('<dhi', 0, 0, 1) + struct.pack('<dhi', 1000.02, 2, 1)
+    start = 1356 + 64 + 32 * 4 + 24 + 4
+    run_header, data = start + 824 + 32, start + 824 + 32 + 7464
+    index = data + sum(len(p) for p in packets)
+    errors = index + 3 * 88
+    events_addr = errors + 4 + len(header)
+    params = events_addr + 4 + len(events)
+    head = bytearray(1356)
+    head[0:18], head[36:40] = b'\x01\xa1' + 'Finnigan'.encode('utf-16-le'), struct.pack('<I', 66)
+    info = bytearray(824)
+    info[28:32] = struct.pack('<I', 1)
+    rh = bytearray(7464)
+    rh[8:24] = struct.pack('<4I', 1, 3, 0, 0)
+    rh[7376:7380] = struct.pack('<I', 3)
+    rh[7408:7464] = struct.pack('<7Q', index, data, 0, errors, 0, events_addr, params)
+    entries = b''
+    for rt, packet in zip([10.0, 10.01, 10.02], np.cumsum([0] + [len(p) for p in packets[:-1]])):
+        entry = bytearray(88)
+        entry[24:32], entry[72:80] = struct.pack('<d', rt), struct.pack('<Q', int(packet))
+        entries += bytes(entry)
+    path = tmp_path / 'run.raw'
+    path.write_bytes(bytes(head) + bytes(64) + text('') * 16 + bytes(4) + text('') * 15 + bytes(24) + text('') + bytes(info) + struct.pack('<Q24x', run_header)
+                     + bytes(rh) + b''.join(packets) + entries + bytes(4) + header + bytes(4) + events + trailer)
+    table = candycrunch.utils.read_raw_scan_table(str(path))
+    assert table['ms_level'] == [1, 2, 2] and table['filter_string'] == ['', '1000.0000@cid35.00', '1000.5000@hcd30.00']
+    assert table['precursor_mz'] == [None, 1000.0, 1000.02] and table['charge'] == [None, None, 2] and table['master_scan'] == [None, 1, 1]
+    df = process_raw_stack(str(path), intensity = True, extract_ms1 = True)
+    _, ms1_mzs, ms1_ints, _ = df.attrs['ms1']
+    assert np.allclose(ms1_mzs, [1000.0]) and np.allclose(ms1_ints, [220])
+    assert df.attrs['detected_mode'] == 'negative' and df.attrs['detected_trap'] == df.attrs['detected_ms1_trap'] == 'linear'
+    assert np.allclose(df['m/z'], [1000.0, 1000.02]) and pd.isna(df['precursor_charge'][0]) and df['precursor_charge'][1] == 2
+    assert list(df['scan']) == [2, 3] and list(df['activation']) == ['CID', 'HCD'] and np.allclose(df['intensity'], [220, 220]) and np.allclose(df['RT'], [10.01, 10.02])
+    assert np.allclose(list(df['peak_d'][0]), [600.2, 400.1]) and list(df['peak_d'][0].values()) == [100, 50]
 
 
 def test_qtof_mzml(tmp_path):
