@@ -45,8 +45,8 @@ class MemmapSpectrumDataset(torch.utils.data.Dataset):
 
     def __init__(self,cache_dir,targets,composition_vectors,model_type,transform_mz=None,transform_rt=None,
                  *, arrays=None, repeats=1, default_composition=None):
-        if model_type != "CNN":
-            raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN'.")
+        if model_type not in {"CNN", "CNN2"}:
+            raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN' or 'CNN2'.")
         if (cache_dir is None) == (arrays is None):
             raise ValueError("Provide either cache_dir or in-memory arrays.")
         if not isinstance(repeats, (int, np.integer)) or repeats < 1:

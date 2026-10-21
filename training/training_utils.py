@@ -242,7 +242,7 @@ def _classifier_routing_wandb_payload(
 
 def prepare_batch(data, model_type):
 
-    if model_type == "CNN":
+    if model_type in {"CNN", "CNN2"}:
         mz_list,_,mz_remainder,precursor,glycan_type,rt,mode_in,lc,modification,trap,y= data
         mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
         inputs = [mz_features,precursor,glycan_type,rt,mode_in,lc,modification,trap]
@@ -250,7 +250,7 @@ def prepare_batch(data, model_type):
         y = y.reshape(-1).to(device)
 
     else:
-        raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN'.")
+        raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN' or 'CNN2'.")
     return inputs, y
 
 
@@ -310,7 +310,7 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
                 glycan_compositions=None,save_dir="./models",wandb_prefix=None,
                 contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,):
     """
-    Train a CNN with SAM and optional classifier MoE load balancing.
+    Train a CNN or CNN2 with SAM and optional CNN2 classifier MoE load balancing.
 
     When contrastive_criterion is provided, fine-tuning optimizes the selected
     classification loss plus contrastive_loss_weight times supervised
@@ -362,7 +362,7 @@ def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epoc
     base_model = get_base_model(model)
     mask_predictions = getattr(criterion, "mask_logits", None)
     uses_embedding_loss = getattr(criterion, "uses_embeddings", False)
-    supports_aux_losses = model_type == "CNN"
+    supports_aux_losses = callable(getattr(base_model, "get_classifier_aux_loss", None))
     classifier_moe_enabled = supports_aux_losses and getattr(base_model, "classifier_moe", False)
     classifier_routing_enabled = log_to_wandb and classifier_moe_enabled
     classifier_num_experts = (base_model.classifier_out.num_experts if classifier_routing_enabled else 0)

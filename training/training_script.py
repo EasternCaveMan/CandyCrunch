@@ -83,6 +83,10 @@ def resolve_prepared_dataset_dir(dataset):
 
 def main(args):
     set_seed(args.current_seed)
+    if args.model not in {"CNN", "CNN2"}:
+        raise ValueError(f"Unknown model={args.model!r}. Expected 'CNN' or 'CNN2'.")
+    if args.model == "CNN" and args.classifier_moe:
+        raise ValueError("--classifier_moe requires --model CNN2.")
     pretraining_enabled = args.sup_pretraining or args.unsup_pretraining
     if args.sup_pretraining and args.unsup_pretraining:
         raise ValueError("Use either --sup-pretraining True or --unsup-pretraining True, not both.")
@@ -326,11 +330,18 @@ def main(args):
     else:
         pretraining_tag = ""
     combine_loss_tag = (f"_CombSupConW{args.contrastive_loss_weight:g}T{args.supcon_temperature:g}" if args.combine_loss else "")
-    model_kwargs = {"input_dim": 2048,"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order),
-        "classifier_moe": args.classifier_moe,"classifier_num_experts": args.classifier_num_experts,
-        "classifier_top_k": args.classifier_top_k,"classifier_expert_hidden_dim": args.classifier_expert_hidden_dim}
-    model = CandyCrunch_CNN(**model_kwargs)
-    checkpoint_model_class = ("CandyCrunch_CNN")
+    model_kwargs = {"input_dim": 2048,"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order)}
+    model_class = CandyCrunch_CNN
+    if args.model == "CNN2":
+        model_class = CandyCrunch_CNN2
+        model_kwargs.update(
+            classifier_moe=args.classifier_moe,
+            classifier_num_experts=args.classifier_num_experts,
+            classifier_top_k=args.classifier_top_k,
+            classifier_expert_hidden_dim=args.classifier_expert_hidden_dim,
+        )
+    model = model_class(**model_kwargs)
+    checkpoint_model_class = model_class.__name__
     if args.classifier_moe:
         classifier_tag = (f"MoC{args.classifier_num_experts}K{args.classifier_top_k}")
         if args.classifier_expert_hidden_dim is not None:
@@ -475,7 +486,7 @@ if __name__ == "__main__":
     # ============================================================
     parser.add_argument("--dataset",type=str,required=True)
     parser.add_argument("--split", type=str,required=True)
-    parser.add_argument("--model",type=str,required=True,choices=["CNN"])
+    parser.add_argument("--model",type=str,required=True,choices=["CNN","CNN2"])
     # ============================================================
     # Training
     # ============================================================
@@ -530,7 +541,7 @@ if __name__ == "__main__":
     # ============================================================
     # NEW: spectrum-level classifier MoE
     # ============================================================
-    parser.add_argument("--classifier_moe", action="store_true", help=("Replace the shared final classifier with a spectrum-level MoE classifier."))
+    parser.add_argument("--classifier_moe", action="store_true", help=("Replace the CNN2 shared final classifier with a spectrum-level MoE classifier (requires --model CNN2)."))
     parser.add_argument("--classifier_num_experts",type=int,default=4,help=("Number of classifier experts."))
     parser.add_argument("--classifier_top_k",type=int,default=2,help=("Number of classifier experts selected for each spectrum."))
     parser.add_argument("--classifier_expert_hidden_dim",type=int,default=None,help=("Hidden dimension inside each classifier expert. If omitted, every expert is a"
