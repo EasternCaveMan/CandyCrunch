@@ -47,16 +47,23 @@ with open(os.path.join(this_dir, 'glycans.pkl'), 'rb') as f:
 with open(os.path.join(this_dir, 'glytoucan_mapping.pkl'), 'rb') as f:
     glytoucan_mapping = pickle.load(f)
 sdict = os.path.join(this_dir, 'candycrunch.pt')
+checkpoint_path = pathlib.Path(this_dir).parent / 'training' / 'models' / 'CandyCrunch_CNN2_ShCl_GShS_CMLOSS_NoCS_full20261021.pt'
+bin_num = 2048
+temperature = 1.15
+comp_vector_order = ['dHex', 'Hex', 'HexA', 'HexN', 'HexNAc', 'Kdn', 'Me', 'Neu5Ac', 'Neu5Gc', 'P', 'Pen', 'S']
 if torch is not None:
+    from candycrunch.checkpoint import load_checkpoint
+
     # Choose the correct computing architecture
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda:0"
-    sdict = torch.load(sdict, map_location = device, weights_only = True)
-    sdict = {k.replace('module.', ''): v for k, v in sdict.items()}
-    candycrunch = CandyCrunch_CNN(2048, num_classes = len(glycans), input_precursor_dim = 12).to(device)
-    candycrunch.load_state_dict(sdict)
-    candycrunch = candycrunch.eval()
+    checkpoint = load_checkpoint(checkpoint_path, device = device)
+    candycrunch = checkpoint['model']
+    glycans = checkpoint['glycans']
+    bin_num = checkpoint['bin_num']
+    comp_vector_order = checkpoint['comp_vector_order']
+    temperature = checkpoint['temperature']
 else:
     candycrunch = CandyCrunchCNN(load_weights(sdict))
 _trapezoid = getattr(np, 'trapezoid', None) or np.trapz
@@ -74,8 +81,7 @@ MZXML_ANALYZER_TRAPS = {'amazon': 'amazon', 'orbitrap': 'orbitrap', 'fourier tra
                         'ft-icr': 'orbitrap', 'ion trap': 'linear',
                         'time-of-flight': 'other', 'tof': 'other'}
 POSITIVE_ADDUCTS = ['Na+', 'K+', 'NH4+']
-temperature = torch.Tensor([1.15]).to(device) if torch is not None else 1.15
-comp_vector_order = ['dHex', 'Hex', 'HexA', 'HexN', 'HexNAc', 'Kdn', 'Me', 'Neu5Ac', 'Neu5Gc', 'P', 'Pen', 'S']
+temperature = torch.Tensor([temperature]).to(device) if torch is not None else temperature
 MZ_REF = 1600  # reference m/z used internally to turn the user's single ppm tolerance into the flat-Da window for binning/fragments; corresponds to ~0.5 Da at 300ppm
 ISOTOPE_SPACING = 1.003355  # 13C - 12C
 # Whether Python's sum adds floats with compensation (from 3.12), which numpy versions of it have to follow to be bitwise identical
@@ -3713,7 +3719,7 @@ def check_reducing_end(spectra_filepath, glycan_class, run_args, loaded = None, 
     return out
 
 
-def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans = glycans, bin_num = 2048,
+def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans = glycans, bin_num = bin_num,
                    max_charge = -3, frag_num = 100, modification = 'reduced', mass_tag = None, lc = 'PGC', trap = 'linear',
                    rt_min = 0, rt_max = 0, rt_diff = 1.0, rt_max_default = 30.0,
                    pred_thresh = 0.01, temperature = temperature, spectra = False, get_missing = False,
@@ -4558,7 +4564,7 @@ def acidic_count(composition):
 
 
 def wrap_inference_batch(spectra_filepath_list, glycan_class, intra_cat_thresh, top_n_isomers = 5, model = candycrunch,
-                         glycans = glycans, bin_num = 2048, max_charge = -3,
+                         glycans = glycans, bin_num = bin_num, max_charge = -3,
                          frag_num = 100, modification = 'reduced', mass_tag = None, lc = 'PGC',
                          trap = 'linear', rt_min = 0, rt_max = 0, rt_diff = 1.0, rt_max_default = 30.0,
                          pred_thresh = 0.01, temperature = temperature, spectra = False, get_missing = False,
