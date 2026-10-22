@@ -413,7 +413,7 @@ def main(args):
         raise ValueError(f"Unknown fine-tuning loss_function={args.loss_function!r}.")
 
     wandb.init(
-        project="CandyCrunch_3",
+        project="CandyCrunch_4",
         entity=("vahid-atabaigielmi-university-of-gothenburg"),name=setting_name,save_code=True)
     # Runs with several seeds share one setting_name, so each seed gets its own folder instead of overwriting the previous seed's checkpoint and metrics
     model_dir = Path("./models") if len(args.random_seeds) == 1 else Path("./models") / f"seed{args.current_seed}"
