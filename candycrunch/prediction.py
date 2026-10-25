@@ -13,7 +13,7 @@ import struct
 import tempfile
 import zlib
 from collections import Counter, defaultdict
-from itertools import combinations_with_replacement, groupby
+from itertools import combinations_with_replacement, groupby, islice
 from concurrent.futures import ProcessPoolExecutor
 import json
 from typing import Dict
@@ -580,7 +580,7 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
    | was validated on
    """
     table = read_raw_scan_table(filepath)
-    peak_ds, rts, intensities, mzs, charges, scans, activations, details = [], [], [], [], [], [], [], []
+    peak_ds, rts, intensities, mzs, charges, scans, activations, details, real_energies = [], [], [], [], [], [], [], [], []
     detected_mode, detected_trap, detected_ms1_trap = None, None, None
     ms1_rts, ms1_mzs, ms1_ints, ms1_scans, refine, ms1_index = [], [], [], [], [], {}
     # One handle for the packets of every scan (opening the file per scan took a quarter of the reading time)
@@ -650,6 +650,7 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
         energy = re.findall(r'@(?:cid|hcd)([\d.]+)', stage[-1][1]) if stage else []
         details.append(({'ITMS': 'linear', 'FTMS': 'orbitrap'}.get(table['analyzer'][i], 'other'), table['polarity'][i], float(energy[0]) if energy else None,
                         table['isolation_width'][i], (table['scan_range'][i] or (None,))[0], precursor_mz))
+        real_energies.append(table['RealEnergy'][i])
         raw_charge = table['charge'][i]
         ms1_scans.append(len(ms1_rts) - 1)
         refine.append(raw_charge is None)
@@ -671,6 +672,7 @@ def process_raw_stack(filepath, num_peaks = 1000, ms_level = 2, intensity = Fals
         'peak_d': peak_ds,
         'RT': rts,
         'precursor_charge': charges,
+        'RealEnergy': real_energies,
     })
     if intensity:
         df_out['intensity'] = intensities
@@ -771,7 +773,7 @@ def process_tdf_stack(filepath, num_peaks = 1000, intensity = False, extract_ms1
             pairs = values[num_scans:].reshape(-1, 2).astype(np.int64)
             offsets = np.concatenate([[0], np.cumsum(values[1:num_scans] // 2, dtype = np.int64), [len(pairs)]])
             steps = np.concatenate([[0], np.cumsum(pairs[:, 0])])
-            return offsets, steps[1:] - np.repeat(steps[offsets[:-1]], np.diff(offsets)) - 1, pairs[:, 1].astype(np.float64)
+            return offsets, steps[1:] - np.repeat(steps[offsets[:-1]], np.diff(offsets).astype(np.intp)) - 1, pairs[:, 1].astype(np.float64)
         tofs, ints = [], []
         scan_bytes = np.frombuffer(blob, '<u4', num_scans + 1).astype(np.int64) - 8
         for begin, end in zip(scan_bytes[:-1].tolist(), scan_bytes[1:].tolist()):
@@ -1266,20 +1268,26 @@ def process_for_inference(df, glycan_class, mode = 'negative', modification = 'r
     # input no longer depends on how many inputs came before it: with one global random stream, a change adding or dropping a single candidate row
     # reshuffled the augmentation of every later input (up to 0.02 F1 per dataset), and comparisons needed several seeds. The global random states are
     # left as they were
+
+    def inputs():
+        # The 5 augmented copies of each test-time augmented input, then the plain inputs, made as the batches take them
+        for k in [k for k, t in zip(X, tta) if t]:
+            seed = zlib.crc32(b''.join(np.asarray(v, dtype = np.float32).tobytes() for v in k[:3]))
+            random.seed(seed)
+            np.random.seed(seed)
+            for _ in range(5):
+                yield (transform_mz(np.asarray(k[0])), *k[1:4], transform_rt(k[4]), *k[5:])
+        yield from (k for k, t in zip(X, tta) if not t)
+
     state = (random.getstate(), np.random.get_state())
-    X_tta = []
-    for k in [k for k, t in zip(X, tta) if t]:
-        seed = zlib.crc32(b''.join(np.asarray(v, dtype = np.float32).tobytes() for v in k[:3]))
-        random.seed(seed)
-        np.random.seed(seed)
-        X_tta.extend((transform_mz(np.asarray(k[0])), *k[1:4], transform_rt(k[4]), *k[5:]) for _ in range(5))
+    # Batches as the model takes them: binned intensities and m/z remainders as two channels, composition vector, glycan type, RT, mode, LC, modification, trap
+    batches, stream = [], inputs()
+    while b := list(islice(stream, 256)):
+        batches.append((np.stack([np.asarray([x[0] for x in b], dtype = np.float32), np.asarray([x[1] for x in b], dtype = np.float32)], axis = 1),
+                        np.asarray([x[2] for x in b], dtype = np.float32), np.asarray([x[3] for x in b], dtype = np.int64), np.asarray([[x[4]] for x in b], dtype = np.float32),
+                        *[np.asarray([x[c] for x in b], dtype = np.int64) for c in range(5, 9)]))
     random.setstate(state[0])
     np.random.set_state(state[1])
-    X = X_tta + [k for k, t in zip(X, tta) if not t]
-    # Batches as the model takes them: binned intensities and m/z remainders as two channels, composition vector, glycan type, RT, mode, LC, modification, trap
-    batches = [(np.stack([np.asarray([x[0] for x in b], dtype = np.float32), np.asarray([x[1] for x in b], dtype = np.float32)], axis = 1),
-                np.asarray([x[2] for x in b], dtype = np.float32), np.asarray([x[3] for x in b], dtype = np.int64), np.asarray([[x[4]] for x in b], dtype = np.float32),
-                *[np.asarray([x[c] for x in b], dtype = np.int64) for c in range(5, 9)]) for b in (X[i:i + 256] for i in range(0, len(X), 256))]
     idx_col = 'm/z' if 'm/z' in df.columns else 'reducing_mass'
     df.set_index(idx_col, inplace = True)
     drop_cols = ['mode', 'modification', 'trap', 'lc'] + ([] if keep_inputs else ['binned_intensities', 'mz_remainder', 'RT2', 'glycan_type'])
@@ -1355,7 +1363,10 @@ def fit_sialic_linkages(glycan, comp, scoring = False):
     unknown ones are set where the composition decides them (glycowork's resolve_sialic_linkages), and where the structure states other linkages, the
     composition's replace them, all of them if its sialic acids are of one kind, while a mix of a2-6 and a2-3 leaves them open (a2-3/6), as the mass does
     not say which sits where. With scoring (for CandyCrumbs, whose glycosidic fragment masses do not depend on that), every sialic acid gets one: the stated
-    ones as far as the composition has them, the rest its a2-6, then its a2-3 ones in written order. None if its sialic acids cannot have these linkages"""
+    ones as far as the composition has them, the rest its a2-6, then its a2-3 ones in written order. None if its sialic acids cannot have these linkages.
+    A composition without linkages (a derivatization making the same product of every sialic acid) leaves the structure as it is"""
+    if not any(comp.get(k) for keys in SIALIC_KEYS.values() for k in keys):
+        return glycan
     resolved = resolve_sialic_linkages(glycan, comp)
     sites = [s for s in _carboxyl_sites(resolved or glycan) if s[0] in SIALIC_KEYS]
     if resolved is not None and (not scoring or all(i is not None for _, i, _, _ in sites)):
@@ -1424,7 +1435,8 @@ def mass_check(mass, glycan, mode = 'negative', modification = 'reduced', sample
                 if sialic_derivatization is not None:
                     # every product its carboxyls can carry, a sialic acid of unknown linkage being either
                     sites = Counter(base if base == 'HexA' or i is None else SIALIC_KEYS[base][i] for base, i, _, _ in _carboxyl_sites(glycan))
-                    mz = np.array([mz + composition_to_mass(c, sialic_derivatization = sialic_derivatization) - composition_to_mass(c) for c in sialic_linkage_splits(sites)])
+                    mz = np.array([mz + composition_to_mass(c, sample_prep = sample_prep, sialic_derivatization = sialic_derivatization) - composition_to_mass(c, sample_prep = sample_prep)
+                                   for c in sialic_linkage_splits(sites, sialic_derivatization = sialic_derivatization)])
             else:
                 mz = glycan + composition_to_mass({}, sample_prep = sample_prep,
                                                   modification = modification) - composition_to_mass({},
@@ -1745,7 +1757,7 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
     # chained into one cluster reported between them, while a broad peak that kept triggering MS2 for minutes became a cluster every rt_diff
     if ms1 is not None and len(ms1[0]) > 5:
         rts1, mzs1, ints1, offs1 = ms1
-        keys1 = np.repeat(np.arange(len(rts1)) * 1e4, np.diff(offs1)) + mzs1.astype(np.float64)
+        keys1 = np.repeat(np.arange(len(rts1)) * 1e4, np.diff(offs1).astype(np.intp)) + mzs1.astype(np.float64)
         order1 = np.argsort(keys1, kind = 'stable')
         keys1, cum1, base1 = keys1[order1], np.concatenate([[0], np.cumsum(ints1[order1], dtype = np.float64)]), np.arange(len(rts1)) * 1e4
         clusters.sort(key = lambda c: c['apex_mz'])
@@ -1824,14 +1836,17 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
     # bin_intensities gives it, bitwise (one call per spectrum was ~15% of condensing a large run); peaks of other types than Python floats go through it
     todo = list({id(s): s for c in clusters if (tuple(map(id, c['peak_d'])), mz_diff, min_mz, max_mz, bin_num) not in merged for s in c['peak_d']
                  if ('bin', id(s), min_mz, max_mz, bin_num) not in merged and set(map(type, s)).union(map(type, s.values())) <= {float}}.values())
-    if todo:
-        sizes = [len(s) for s in todo]
-        mzs = np.fromiter((m for s in todo for m in s), np.float64, sum(sizes)).astype(np.float32)
-        ints = np.fromiter((i for s in todo for i in s.values()), np.float64, sum(sizes))
-        owner = np.repeat(np.arange(len(todo)), sizes)
+    # In chunks of 2048 spectra, each kept as its occupied bins (indices, intensities, remainders): an MS2 spectrum fills a median ~190 of the 2048 bins,
+    # and the dense arrays of every spectrum took 0.54 GB on GPST000403 (17,606 MS2)
+    for first in range(0, len(todo), 2048):
+        chunk = todo[first:first + 2048]
+        sizes = [len(s) for s in chunk]
+        mzs = np.fromiter((m for s in chunk for m in s), np.float64, sum(sizes)).astype(np.float32)
+        ints = np.fromiter((i for s in chunk for i in s.values()), np.float64, sum(sizes))
+        owner = np.repeat(np.arange(len(chunk)), sizes)
         in_range = (mzs > frames[0]) & (mzs <= frames[-1])
         mzs, ints, owner = mzs[in_range], ints[in_range], owner[in_range]
-        binned_all, remainder_all = np.zeros((len(todo), bin_num)), np.zeros((len(todo), bin_num))
+        binned_all, remainder_all = np.zeros((len(chunk), bin_num)), np.zeros((len(chunk), bin_num))
         if len(mzs):
             bins = np.digitize(mzs, frames, right = True)
             keys = owner * (bin_num + 1) + bins
@@ -1840,8 +1855,9 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
             remainders = (mzs - frames[bins - 1]) * (ints == np.maximum.reduceat(ints[order], starts)[np.searchsorted(unique_keys, keys)])
             binned_all[unique_keys // (bin_num + 1), unique_keys % (bin_num + 1) - 1] = np.add.reduceat(ints[order], starts)
             remainder_all[unique_keys // (bin_num + 1), unique_keys % (bin_num + 1) - 1] = np.maximum.reduceat(remainders[order], starts)
-        for k, s in enumerate(todo):
-            merged[('bin', id(s), min_mz, max_mz, bin_num)] = (s, binned_all[k], remainder_all[k])
+        for k, s in enumerate(chunk):
+            nz = np.flatnonzero((binned_all[k] != 0) | (remainder_all[k] != 0)).astype(np.int16)
+            merged[('bin', id(s), min_mz, max_mz, bin_num)] = (s, nz, binned_all[k][nz], remainder_all[k][nz])
     for cluster in clusters:
         highest_intensity_index = np.argmax(cluster['intensity'])
         highest_intensity = cluster['intensity'][highest_intensity_index]
@@ -1863,7 +1879,7 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
         key = (tuple(map(id, cluster['peak_d'])), mz_diff, min_mz, max_mz, bin_num)
         if key in merged:
             _, peaks, binned_intensities, mz_remainder = merged[key]
-            condensed_data.append([rep_mz, mean_rt, highest_intensity, peaks, binned_intensities.copy(), mz_remainder.copy(), len(cluster['RT']),
+            condensed_data.append([rep_mz, mean_rt, highest_intensity, peaks, binned_intensities, mz_remainder, len(cluster['RT']),
                                    cluster['precursor_charge'][highest_intensity_index]])
             continue
         # Cluster fragment peaks across spectra by mass proximity, then weight-average mass and sum intensity
@@ -1938,18 +1954,23 @@ def condense_dataframe(df, mz_diff = 0.5, rt_diff = 1.0, min_mz = 39.714, max_mz
                 elif sum(ints) != 0:
                     pk[np.average(ms, weights = ints)] = sum(ints)
         peaks = dict(sorted(pk.items(), key = lambda x: x[1], reverse = True))
-        binned = []
-        for spec in cluster['peak_d']:
+        # The spectra binned (dense again from their occupied bins) and averaged
+        binned_intensities, mz_remainder = np.zeros((len(cluster['peak_d']), bin_num)), np.zeros((len(cluster['peak_d']), bin_num))
+        for row, spec in enumerate(cluster['peak_d']):
             k = ('bin', id(spec), min_mz, max_mz, bin_num)
             if k not in merged:
-                merged[k] = (spec, *bin_intensities(spec, frames))
-            binned.append(merged[k][1:])
-        binned_intensities, mz_remainder = zip(*binned)
-        binned_intensities = np.mean(np.array(binned_intensities), axis = 0)
-        mz_remainder = np.mean(np.array(mz_remainder), axis = 0)
+                b, r = bin_intensities(spec, frames)
+                nz = np.flatnonzero((b != 0) | (r != 0)).astype(np.int16)
+                merged[k] = (spec, nz, b[nz], r[nz])
+            nz, b, r = merged[k][1:]
+            binned_intensities[row, nz], mz_remainder[row, nz] = b, r
+        binned_intensities = np.mean(binned_intensities, axis = 0)
+        mz_remainder = np.mean(mz_remainder, axis = 0)
         # Bin intensity normalization
         binned_intensities = binned_intensities / binned_intensities.sum()
-        merged[key] = (cluster['peak_d'], peaks, binned_intensities.copy(), mz_remainder.copy())
+        # Read-only, as the tables condensed from these spectra share them (the reducing end and class checks condense a run up to 5 more times)
+        binned_intensities.flags.writeable = mz_remainder.flags.writeable = False
+        merged[key] = (cluster['peak_d'], peaks, binned_intensities, mz_remainder)
         num_spectra = len(cluster['RT'])
         rep_charge = cluster['precursor_charge'][highest_intensity_index]
         # Without MS1, the apex precursor intensity is the abundance: it tracks MS1 peak areas far better than summing or integrating
@@ -2005,7 +2026,7 @@ def create_struct_map(df_glycan, glycan_class, filter_out = None, phylo_level = 
         ref_counts = processed_df_use.loc[:, 'ref'].map(len) + processed_df_use.loc[:, 'tissue_ref'].map(len) +
                      processed_df_use.loc[:, 'disease_ref'].map(len))
     processed_df_use = processed_df_use[~(processed_df_use['glycan'].str.contains("}"))]
-    processed_df_use = processed_df_use.sort_values('ref_counts', ascending = False)
+    processed_df_use = processed_df_use.sort_values('ref_counts', ascending = False, kind = 'stable')
     small = np.array([0 < sum(x.values()) < 6 for x in processed_df_use.Composition], dtype = bool)
     # Only the topology map of compositions below 6 residues needs topologies; every run builds these maps (also for the other classes with accurate
     # MS1), so they are kept across calls
@@ -2055,7 +2076,7 @@ def assign_candidate_structures(df_in, df_glycan_in, comp_struct_map, topo_struc
         pool_comps = pool_df.groupby('comp_str').first()['Composition']
         comps_in = [x for c, x in pool_comps.items() if not fallback or c not in comp_struct_map]
         if sialic_derivatization is not None:  # a linkage-specific derivatization gives each way of linking the sialic acids a mass of its own
-            comps_in = [split for x in comps_in for split in sialic_linkage_splits(x)]
+            comps_in = [split for x in comps_in for split in sialic_linkage_splits(x, sialic_derivatization = sialic_derivatization)]
         comp_masses = np.array([composition_to_mass(x, mass_value = 'monoisotopic', sample_prep = sample_prep, modification = modification,
                                                     sialic_derivatization = sialic_derivatization) + tag for x in comps_in])
         comps_with_none = [(x, pool_comp_map, pool_topo_map) for x in comps_in] + [None]
@@ -2408,8 +2429,8 @@ def domain_filter(df_out, glycan_class, mode = 'negative', modification = 'reduc
         res_mass = {r: composition_to_mass({r: 1}, sample_prep = sample_prep) - base for r in ('Hex', 'HexNAc', 'dHex', 'Pen', 'Neu5Ac', 'Neu5Gc', 'Kdn', 'HexA', 'HexN')}
         cap = (base - composition_to_mass({})) / 2
     # A derivatized sialic acid leaves its ion, or is lost, as its a2-6 or its lactone-derived product
-    sia_masses = {sia: [res_mass[sia] + cap] if sialic_derivatization is None else [composition_to_mass({k: 1}, sialic_derivatization = sialic_derivatization) - composition_to_mass({})
-                                                                                   for k in SIALIC_KEYS[sia]] for sia in SIALIC_KEYS}
+    sia_masses = {sia: [res_mass[sia] + cap] if sialic_derivatization is None else [composition_to_mass({k: 1}, sample_prep = sample_prep, sialic_derivatization = sialic_derivatization) -
+                                                                                   composition_to_mass({}, sample_prep = sample_prep) + cap for k in SIALIC_KEYS[sia]] for sia in SIALIC_KEYS}
     charges_abs = np.abs(df_out['charge'].values)
     raw_masses = df_out.index.values * charges_abs
     df_out['adduct'] = None
@@ -2714,7 +2735,7 @@ def make_mass_dic(glycans, glycan_class, filter_out, df_use, sample_prep = 'unde
             if filter_out.intersection(composition):
                 mass_dic[9999].append(k)
             elif sialic_derivatization is not None:
-                for split in sialic_linkage_splits(composition):
+                for split in sialic_linkage_splits(composition, sialic_derivatization = sialic_derivatization):
                     if (resolved := resolve_sialic_linkages(k, split)) is not None:
                         mass_dic.setdefault(composition_to_mass(split, sample_prep = sample_prep, sialic_derivatization = sialic_derivatization), []).append(resolved)
             else:
@@ -3409,8 +3430,8 @@ def finalise_predictions(df_out, get_missing, mode, modification, mass_tag, ppm_
                                  zip(df_out['predictions'], df_out['composition'])]
     else:
         # the sialic linkages of the composition are those whose derivatized mass is the precursor's, of the ones the structure allows
-        df_out['composition'] = [val if not k else next((c for c in sialic_linkage_splits(get_comp(k[0][0])) if resolve_sialic_linkages(k[0][0], c) is not None and mass_check(
-            obs, composition_to_mass(c, sialic_derivatization = sialic_derivatization), modification = modification, mass_tag = mass_tag, mode = mode,
+        df_out['composition'] = [val if not k else next((c for c in sialic_linkage_splits(get_comp(k[0][0]), sialic_derivatization = sialic_derivatization) if resolve_sialic_linkages(k[0][0], c) is not None and mass_check(
+            obs, composition_to_mass(c, sample_prep = sample_prep, sialic_derivatization = sialic_derivatization), modification = modification, mass_tag = mass_tag, mode = mode,
             sample_prep = sample_prep, mass_tolerance = mass_tolerance)), val) for k, val, obs in zip(df_out['predictions'], df_out['composition'], df_out.index)]
     df_out['charge'] = round(df_out['composition'].apply(lambda x: composition_to_mass(x, sample_prep = sample_prep, modification = modification,
                                                                                        sialic_derivatization = sialic_derivatization)) /
@@ -3913,8 +3934,8 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
     # Several glycan classes measured in one run (e.g., N- and O-glycans of one sample) are a list; a list of one class is that class
     classes = glycan_classes(glycan_class)
     glycan_class = classes[0] if len(classes) == 1 else classes
-    if sialic_derivatization is not None and sample_prep != 'underivatized':
-        raise ValueError(f"sialic_derivatization is a derivatization of underivatized glycans, not of {sample_prep} ones.")
+    if sialic_derivatization is not None and sample_prep not in ('underivatized', 'permethylated'):
+        raise ValueError(f"sialic_derivatization is a derivatization of underivatized glycans or of glycans permethylated after it, not of {sample_prep} ones.")
     # A pair of products read from JSON settings is a list, which the caches keyed by the settings cannot hold
     sialic_derivatization = tuple(sialic_derivatization) if isinstance(sialic_derivatization, list) else sialic_derivatization
     if not _return_intermediate:
@@ -3992,7 +4013,7 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
         known = loaded_file['precursor_charge'].notna().values
         charges = np.abs(loaded_file['precursor_charge'].values[known].astype(float)).reshape(-1, 1)
         neutral = np.array([composition_to_mass(c, sample_prep = sample_prep, modification = modification, sialic_derivatization = sialic_derivatization)
-                            for comp in df_use.groupby('comp_str').first()['Composition'] for c in ([comp] if sialic_derivatization is None else sialic_linkage_splits(comp))]) + (mass_tag or 0)
+                            for comp in df_use.groupby('comp_str').first()['Composition'] for c in ([comp] if sialic_derivatization is None else sialic_linkage_splits(comp, sialic_derivatization = sialic_derivatization))]) + (mass_tag or 0)
         mzs, z_all = loaded_file[idx_col].values[known], charges.ravel()
         def isotope_ppm(k, width):
             # The ppm errors of precursors (less k isotope spacings) to the composition ions of their charge, only for the compositions in a window of a
@@ -4110,6 +4131,7 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
     if isinstance(model, CandyCrunchCNN) or (torch is not None and isinstance(model, torch.nn.Module)):
         # Predict glycans from spectra
         preds, pred_conf = get_topk(loader, model, glycans, temp = True, temperature = temperature)
+        del loader
         # Max over the 5 augmented copies of each test-time augmented input (they come first in the loader), a plain input has one copy
         tta = df_out.drop_duplicates('input_id')['tta'].values
         order = np.concatenate([np.flatnonzero(tta), np.flatnonzero(~tta)])
@@ -4194,9 +4216,9 @@ def wrap_inference(spectra_filepath, glycan_class, model = candycrunch, glycans 
             _pred_comp = get_comp(_struct)
             if _pred_comp and sialic_derivatization is not None:
                 # the sialic linkages whose derivatized mass is the precursor's, which the structure then gets for CandyCrumbs
-                _pred_comp = next((c for c in sialic_linkage_splits(_pred_comp) if mass_check(
-                    df_out.index[_indices[0]], composition_to_mass(c, sialic_derivatization = sialic_derivatization), mode = mode, modification = modification,
-                    mass_tag = mass_tag, permitted_charges = [abs(int(df_out['charge'].iloc[_indices[0]]))], mass_tolerance = mass_tolerance)), None)
+                _pred_comp = next((c for c in sialic_linkage_splits(_pred_comp, sialic_derivatization = sialic_derivatization) if mass_check(
+                    df_out.index[_indices[0]], composition_to_mass(c, sample_prep = sample_prep, sialic_derivatization = sialic_derivatization), mode = mode, modification = modification,
+                    sample_prep = sample_prep, mass_tag = mass_tag, permitted_charges = [abs(int(df_out['charge'].iloc[_indices[0]]))], mass_tolerance = mass_tolerance)), None)
                 _fitted = fit_sialic_linkages(_struct, _pred_comp, scoring = True) if _pred_comp else None
                 if _fitted is None:
                     continue

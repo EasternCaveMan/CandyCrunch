@@ -11,7 +11,7 @@ import numpy as np
 # in ASCII or UTF-16, are not read)
 RAW_FIELD_TYPES = {0: 'V0', 1: 'i1', 2: 'u1', 3: 'u1', 4: 'u1', 5: 'u1', 6: '<i2', 7: '<u2', 8: '<i4', 9: '<u4', 10: '<f4', 11: '<f8'}
 # The trailer extra fields read per scan (Thermo writes 0 for a monoisotopic m/z or charge state it did not determine)
-RAW_TRAILER_FIELDS = ('Monoisotopic M/Z:', 'Charge State:', 'MS2 Isolation Width:', 'MSn Isolation Width:', 'Master Scan Number:')
+RAW_TRAILER_FIELDS = ('Monoisotopic M/Z:', 'Charge State:', 'MS2 Isolation Width:', 'MSn Isolation Width:', 'Master Scan Number:', 'HCD Energy:')
 # Activation of a scan event reaction, bits 1 and up of the u32 after its energy (Thermo's ActivationType)
 RAW_ACTIVATIONS = {0: 'cid', 1: 'mpd', 2: 'ecd', 3: 'pqd', 4: 'etd', 5: 'hcd', 8: 'ptr', 9: 'netd', 10: 'nptr', 11: 'uvpd'}
 # A timsTOF survey frame summed over its ion mobility scans holds ~40k centroids, mostly single-ion noise; the 5000 most intense reach down to ~0.04%
@@ -109,7 +109,12 @@ def centroid_tof(mzs, ints, max_peaks = None):
     peak_ints = np.add.reduceat(ints, bounds)
     peak_mzs = np.add.reduceat(ints * mzs, bounds) / peak_ints
     if max_peaks is not None and len(peak_ints) > max_peaks:
-        top = np.sort(np.argpartition(peak_ints, -max_peaks)[-max_peaks:])
+        # The most intense centroids and, of those at the cut-off intensity, the first in m/z order: argpartition left which of these ties stay to its
+        # algorithm, which differs between numpy builds (x86 SIMD vs the browser's wasm), and so did the survey frames of a timsTOF run
+        kth = np.partition(peak_ints, -max_peaks)[-max_peaks]
+        above = np.flatnonzero(peak_ints > kth)
+        top = np.concatenate([above, np.flatnonzero(peak_ints == kth)[:max_peaks - len(above)]])
+        top.sort()
         peak_mzs, peak_ints = peak_mzs[top], peak_ints[top]
     return np.stack([peak_mzs, peak_ints], axis = 1)
 
@@ -451,10 +456,19 @@ def read_raw_scan_table(filepath):
                 # First field of each label, as the instrument's software reads them
                 columns = {label: (RAW_FIELD_TYPES[kind], int(o)) for (kind, _, label), o in reversed(list(zip(fields, np.cumsum([0] + sizes))))
                            if label in RAW_TRAILER_FIELDS and kind in RAW_FIELD_TYPES}
+                record_size = sum(sizes)
                 f.seek(params_addr)
-                records = np.frombuffer(f.read(n_scans * sum(sizes)), {'names': list(columns), 'formats': [t for t, _ in columns.values()],
+                raw_records = f.read(n_scans * record_size)
+                records = np.frombuffer(raw_records, {'names': list(columns), 'formats': [t for t, _ in columns.values()],
                                                                         'offsets': [o for _, o in columns.values()], 'itemsize': sum(sizes)})
                 trailer = {label: records[label].tolist() for label in columns}
+                # HCD Energy: is text on newer orbitraps (kind 12 one byte per character, 13 UTF-16), e.g., 30.00,42.00,72.00 for stepped energies, and a
+                # float on older ones, which the records above read
+                energy_idx = next((i for i, (_, _, label) in enumerate(fields) if label == 'HCD Energy:'), None)
+                if energy_idx is not None and fields[energy_idx][0] in (12, 13):
+                    energy_offset, energy_size = sum(sizes[:energy_idx]), sizes[energy_idx]
+                    trailer['HCD Energy:'] = [raw_records[i * record_size + energy_offset:i * record_size + energy_offset + energy_size].decode(
+                        'utf-16-le' if fields[energy_idx][0] == 13 else 'latin-1', 'replace').split('\x00')[0].strip() or None for i in range(n_scans)]
                 break
     # Scan events, one per scan, are self-describing: a preamble (120 bytes in version 62, 128 in 63 and 64, 136 from 66) with polarity at byte 4,
     # profile mode at 5, MS level at 6 and analyzer at 40, then counted reactions (isolation m/z, isolation width and energy as doubles, then the
@@ -474,13 +488,13 @@ def read_raw_scan_table(filepath):
         raise ValueError(f"{filepath} stores its scan events in a layout CandyCrunch does not know; convert it to mzML with ThermoRawFileParser or "
                          f"msconvert first.")
     table = {key: [] for key in ['scan', 'ms_level', 'polarity', 'scan_mode', 'analyzer', 'filter_string', 'precursor_mz', 'charge',
-                                 'isolation_width', 'master_scan', 'retention_time', 'scan_range', 'packet']}
+                                 'isolation_width', 'master_scan', 'retention_time', 'scan_range', 'packet', 'RealEnergy']}
     for i, s in enumerate(starts):
         level = max(stream[s + 6], 1)
         # MS1 events of some orbitraps carry their scan range as a reaction
         reactions = [struct.unpack_from('<3dI', stream, s + preamble + 4 + reaction * k)
                      for k in range(int.from_bytes(stream[s + preamble:s + preamble + 4], 'little'))] if level > 1 else []
-        mono, charge, ms2_width, msn_width, master = (trailer[label][i] if label in trailer and level > 1 else None for label in RAW_TRAILER_FIELDS)
+        mono, charge, ms2_width, msn_width, master, real_energy = (trailer[label][i] if label in trailer and level > 1 else None for label in RAW_TRAILER_FIELDS)
         table['scan'].append(first + i)
         table['ms_level'].append(level)
         table['polarity'].append({0: '-', 1: '+'}.get(stream[s + 4]))
@@ -500,6 +514,7 @@ def read_raw_scan_table(filepath):
         table['isolation_width'].append(ms2_width or msn_width)
         table['master_scan'].append(master)
         table['retention_time'].append(float(index['rt'][i]))
+        table['RealEnergy'].append(real_energy)
         # The scan windows (two doubles each) after the reactions
         w = s + preamble + 4 + reaction * int.from_bytes(stream[s + preamble:s + preamble + 4], 'little')
         windows = [struct.unpack_from('<2d', stream, w + 4 + 16 * k) for k in range(int.from_bytes(stream[w:w + 4], 'little'))]

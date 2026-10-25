@@ -25,7 +25,7 @@ import pandas as pd
 from glycowork.motif.processing import canonicalize_composition, is_composition, rescue_glycans, get_class
 from glycowork.motif.tokenization import map_to_basic as glycowork_map_to_basic, HYDROGEN_MASS, PROTON_MASS, ELECTRON_MASS, calculate_adduct_mass, \
     composition_to_mass, glycan_to_composition, get_core, get_modification, compositions_to_structures, AMINO_ACID_FORMULAS, PEPTIDE_MODIFICATIONS, \
-    SIALIC_DERIVATIZATIONS, SIALIC_PRODUCTS, SIALIC_KEYS, _carboxyl_sites, modification_formula_dict
+    SIALIC_DERIVATIZATIONS, SIALIC_PRODUCTS, SIALIC_PRODUCT_CAPS, SIALIC_KEYS, _carboxyl_sites, modification_formula_dict
 from glycowork.motif.graph import glycan_to_nxGraph, get_possible_topologies, graph_to_string
 from glycowork.motif.smiles import glycan_to_smiles, parse_smiles, _rings_of_atoms, _number_residue, _split_token
 from glycowork.motif.draw import plot_glycans_excel
@@ -101,6 +101,9 @@ W_SIDE_CHAIN_LOSSES['m'] = W_SIDE_CHAIN_LOSSES['M'] + 15.994915  # Met sulfoxide
 # the radical lost by a labeled Lys keeps the label on its Nepsilon (j: guanidinyl CH2N2, k: TMT)
 W_SIDE_CHAIN_LOSSES['j'] = W_SIDE_CHAIN_LOSSES['K'] + 42.02180
 W_SIDE_CHAIN_LOSSES['k'] = W_SIDE_CHAIN_LOSSES['K'] + 229.16293
+# deamidated Asn and Gln are Asp and Glu
+W_SIDE_CHAIN_LOSSES['n'] = W_SIDE_CHAIN_LOSSES['D']
+W_SIDE_CHAIN_LOSSES['q'] = W_SIDE_CHAIN_LOSSES['E']
 cut_type_dict = {'bond': 'Y', 'no_bond': 'Z', 'red_bond': 'C', 'red_no_bond': 'B',
                  '13A': '13A', '14A': '14A', '15A': '15A', '24A': '24A', '04A': '04A', '35A': '35A', '03A': '03A',
                  '25A': '25A', '02A': '02A',
@@ -112,14 +115,17 @@ ranks = ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon', 'Zeta', 'Eta', 'Theta', '
 # Residue masses from glycowork's formulas (the old 4-decimal table was up to 0.1 mDa off), plus the modified residues CandyCrumbs encodes
 AA_masses = {aa: calculate_adduct_mass(f) for aa, f in AMINO_ACID_FORMULAS.items()}
 # the tokens of the modified residues, by residue and the modification's Unimod name in glycowork's PEPTIDE_MODIFICATIONS (TMT-labeled Lys, Carbamidomethyl Cys,
-# Guanidinyl Lys, and Met sulfoxide, the variable modification of nearly every glycoproteomics search), so that peptide_to_glycowork can write them as glycowork does
-TOKEN_MODIFICATIONS = {'k': ('K', 'TMT6plex'), 'c': ('C', 'Carbamidomethyl'), 'j': ('K', 'Guanidinyl'), 'm': ('M', 'Oxidation')}
+# Guanidinyl Lys, Met sulfoxide, the variable modification of nearly every glycoproteomics search, and deamidated Asn and Gln, which PNGase F leaves at
+# released N-glycosites), so that peptide_to_glycowork can write them as glycowork does
+TOKEN_MODIFICATIONS = {'k': ('K', 'TMT6plex'), 'c': ('C', 'Carbamidomethyl'), 'j': ('K', 'Guanidinyl'), 'm': ('M', 'Oxidation'), 'n': ('N', 'Deamidated'),
+                       'q': ('Q', 'Deamidated')}
 AA_masses |= {token: AA_masses[aa] + (float(PEPTIDE_MODIFICATIONS[name]) if re.fullmatch(r'[+-]\d*\.?\d+', PEPTIDE_MODIFICATIONS[name]) else calculate_adduct_mass(PEPTIDE_MODIFICATIONS[name]))
               for token, (aa, name) in TOKEN_MODIFICATIONS.items()}
 MODIFICATION_TOKENS = {
     'Carbamidomethyl': {'C': 'c'},
     'Guanidinyl': {'K': 'j'},
     'Oxidation': {'M': 'm'},
+    'Deamidated': {'N': 'n', 'Q': 'q'},
 }
 # Relative abundance of the backbone ion types within a fragmentation method; the method already gates
 # which types can occur, so these only rank the allowed types against each other
@@ -364,19 +370,23 @@ def derivatize_carboxyls(glycan, sialic_derivatization):
     if products is None or len(products) != 2 or not set(products) <= SIALIC_PRODUCTS.keys():
         raise ValueError(f"Unknown sialic_derivatization {sialic_derivatization!r}; use one of {list(SIALIC_DERIVATIZATIONS)} or a pair of products for a2-6 and a2-3/8/9 sialic acids from {list(SIALIC_PRODUCTS)}.")
     deltas = [sum(calculate_adduct_mass(f) for f in SIALIC_PRODUCTS[p]) for p in products]
-    linked = {k: (base, i) for base, keys in SIALIC_KEYS.items() for i, k in enumerate(keys)} | {'HexA': ('HexA', 0)}
+    # a product permethylated after the derivatization has its N-H capped instead of the carboxyl
+    caps = [SIALIC_PRODUCT_CAPS[p] - 1 if SIALIC_PRODUCT_CAPS[p] is not None else 0 for p in products]
+    # one product for every sialic acid needs no linkages
+    same = products[0] == products[1]
+    linked = {k: (base, i) for base, keys in SIALIC_KEYS.items() for i, k in enumerate(keys)} | {'HexA': ('HexA', 0)} | ({base: (base, 0) for base in SIALIC_KEYS} if same else {})
     composition = glycan if isinstance(glycan, dict) else canonicalize_composition(glycan) if is_composition(glycan) else None
     if composition is not None:
-        if unknown := [k for k in SIALIC_KEYS if composition.get(k)]:
+        if not same and (unknown := [k for k in SIALIC_KEYS if composition.get(k)]):
             raise ValueError(f"A linkage-specific derivatization makes something else of each sialic acid by its linkage, which {unknown} of {glycan} do not give; write them as a2-6 or a2-3 (e.g., 'H5N4E1L1').")
         sites = [(*linked[k], linked[k][0]) for k in composition if k in linked]
     else:
         sites = _carboxyl_sites(glycan)
-        if unknown := [glycan[span[0]:span[1]] for _, i, span, _ in sites if i is None]:
+        if not same and (unknown := [glycan[span[0]:span[1]] for _, i, span, _ in sites if i is None]):
             raise ValueError(f"A linkage-specific derivatization makes something else of each sialic acid by its linkage, which is unknown for {unknown} in '{glycan}' "
                              f"(a2-3/6, a2-?, or the reducing end); glycowork's resolve_sialic_linkages fills it in from a linkage-resolved composition.")
         glycan_to_graph_monos(glycan)  # the tables of the residues as written, which the derivatized ones build on
-        sites = [(base, i, glycan[start:end], start, end) for base, i, (start, end), _ in sites]
+        sites = [(base, 0 if i is None else i, glycan[start:end], start, end) for base, i, (start, end), _ in sites]
     labels = {}
     for base, i, label, *_ in sites:
         new = label[:3] + '1' + CARBOXYL_TOKENS[products[i]] + label[3:] if base in SIALIC_KEYS else label + '6' + CARBOXYL_TOKENS[products[i]]
@@ -384,7 +394,7 @@ def derivatize_carboxyls(glycan, sialic_derivatization):
         if new_key not in mono_attributes and old_key in mono_attributes:
             carbon, table = 1 if base in SIALIC_KEYS else 6, mono_attributes[old_key]
             mono_attributes[new_key] = {'atoms': {new_key if f == old_key else f: a for f, a in table['atoms'].items()}} | {
-                prop: {new_key if f == old_key else f: v + deltas[i] * (prop == 'mass' and carbon in table['atoms'][f]) for f, v in table[prop].items()}
+                prop: {new_key if f == old_key else f: v + (deltas[i] if prop == 'mass' else caps[i] if prop == 'permethylated' else 0) * (carbon in table['atoms'][f]) for f, v in table[prop].items()}
                 for prop in ['mass', *DERIVATIZATION_MASSES] if prop in table}
         CARBOXYL_LABELS.add(new_key)
         labels[(label, i)] = new
@@ -2184,7 +2194,7 @@ def infer_glycosites(peptide_seq, glycan_class = None):
 
 
 def peptide_to_glycowork(peptide):
-    """Writes a peptide in CandyCrunch's one-letter code (c, j, k, m for modified residues) in glycowork's notation, for glycowork's glycopeptide masses and formulas\n
+    """Writes a peptide in CandyCrunch's one-letter code (c, j, k, m, n, q for modified residues) in glycowork's notation, for glycowork's glycopeptide masses and formulas\n
     | Arguments:
     | :-
     | peptide (string): amino acid sequence, e.g., 'NcSK'\n
@@ -2830,8 +2840,8 @@ def CandyCrumbs(input_string, fragment_masses, mass_threshold = None,
     if not len(fragment_masses):
         return {}
     if sialic_derivatization is not None:
-        if sample_prep != 'underivatized':
-            raise ValueError(f"sialic_derivatization is a derivatization of underivatized glycans, not of {sample_prep} ones.")
+        if sample_prep not in ('underivatized', 'permethylated'):
+            raise ValueError(f"sialic_derivatization is a derivatization of underivatized glycans or of glycans permethylated after it, not of {sample_prep} ones.")
         if isinstance(input_string, dict) and 'peptide' in input_string:
             input_string = input_string | {'glycans': [derivatize_carboxyls(g, sialic_derivatization) for g in input_string.get('glycans', [])]}
         elif isinstance(input_string, str) and '*' in input_string:
@@ -3371,8 +3381,8 @@ def supporting_ions(glycan, peaks, charge = -1, candidates = (), mass_tolerance 
 
 
 def rank_glycopeptide_structures(peptide, modification_str, fragment_masses, intensities = None, charge = 2, structures = None,
-                                 fragmentation_method = None, mass_threshold = 0.5, mass_threshold_ppm = 10, kingdom = 'Animalia',
-                                 top_n_peaks = 150, max_candidates = 100, **kwargs):
+                                 fragmentation_method = None, mass_threshold = 0.2, mass_threshold_ppm = 10, kingdom = 'Animalia',
+                                 top_n_peaks = 150, max_candidates = 100, o_glycan_root = 'GalNAc', hexnac_penalty = 0.5, **kwargs):
     """Ranks the candidate glycan structures of a glycoproteomics identification (peptide, modifications, glycan composition) by their fragment evidence in its MS2 spectrum\n
     | Arguments:
     | :-
@@ -3383,23 +3393,36 @@ def rank_glycopeptide_structures(peptide, modification_str, fragment_masses, int
     | charge (int): precursor charge state; default:2
     | structures (list): candidate IUPAC-condensed structures, or one such list per glycan of a multiply glycosylated peptide; default:None (every glycowork database structure of each composition)
     | fragmentation_method (string): 'CID'/'HCD'/'ETD'/'ECD'/'EThcD'/'ETciD', e.g., the activation column of load_spectra_filepath; default:None (all peptide ion types)
-    | mass_threshold (float): fragment mass tolerance in Da; default:0.5
+    | mass_threshold (float): fragment mass tolerance in Da, the tolerance of ion-trap spectra; default:0.2
     | mass_threshold_ppm (float): relative tolerance in ppm, applied on top of mass_threshold; None for low-resolution spectra; default:10
     | kingdom (string): taxonomic kingdom of the database structures; default:'Animalia'
     | top_n_peaks (int): how many of the most intense peaks are scored; default:150
     | max_candidates (int): most candidates (structure combinations, for several glycans) to score, at ~1 s each for N-glycans; default:100
+    | o_glycan_root (string): reducing-end residue the database candidates of an O-site need (GalNAc: mucin-type); a composition without such a candidate
+    |                         keeps all; default:'GalNAc' (None for O-GlcNAc, O-Man or O-Fuc glycopeptides)
+    | hexnac_penalty (float): factor on the score of candidates the HexNAc oxonium ions contradict (see 'oxonium_ratio'); default:0.5 (1 to ignore them)
     | **kwargs: passed on to CandyCrumbs, e.g., max_cleavages\n
     | Returns:
     | :-
     | Returns a dataframe with one row per candidate ('structures', one per glycan; candidates with residues CandyCrumbs has no tables for are left out),
-    | best first, with 'score' (the product of the next two), 'rank' (candidates with identical fragment masses, such as linkage isomers, tie), 'explained'
+    | best first, with 'score' (the product of the next three), 'rank' (candidates with identical fragment masses, such as linkage isomers, tie), 'explained'
     | (share of square-root intensity that CandyCrumbs annotates, weighted by the fragmentation prior of each annotation), 'direct_fragments' (share of the
-    | candidate's single-cleavage fragments observed), and 'missing_fragments' (singly protonated m/z of those the spectrum lacks at every charge)
+    | candidate's single-cleavage fragments observed), 'hexnac_evidence' (hexnac_penalty for a candidate with GlcNAc when the oxonium ratio is below 1 and
+    | for one without when it is above 2, among candidates that differ in having GlcNAc, else 1), 'oxonium_ratio' ((138 + 168) / (126 + 144) of the HexNAc
+    | oxonium ions, None without 126 and 144), and 'missing_fragments' (singly protonated m/z of those the spectrum lacks at every charge)
     """
     if not isinstance(fragment_masses, dict):
         fragment_masses = dict(zip(fragment_masses, [1.0] * len(fragment_masses) if intensities is None else intensities))
     if not fragment_masses:
         raise ValueError("No peaks to score")
+    # The HexNAc oxonium ions of GlcNAc and GalNAc differ in their ring fragments: (138 + 168) / (126 + 144) was below 1 in 85% of the collisional spectra
+    # of one-site O-glycopeptides with one HexNAc (GalNAc, median 0.56) and in 0.9% of N-glycopeptides (GlcNAc, median 3.14), above 2 in 77% of these and
+    # 2% of those; electron-transfer spectra rarely record these ions
+    mzs, ints = np.array(list(fragment_masses), dtype = float), np.array(list(fragment_masses.values()), dtype = float)
+    ox = [ints[np.abs(mzs - m) <= (min(mass_threshold, m * mass_threshold_ppm / 1e6) if mass_threshold_ppm else mass_threshold)].sum()
+          for m in (OXONIUM_IONS[k] for k in ('HexNAc-C2H4O2-H2O', 'HexNAc-CH2O-2H2O', 'HexNAc-C2H4O2', 'HexNAc-2H2O'))]
+    oxonium_ratio = float((ox[1] + ox[3]) / (ox[0] + ox[2])) if ox[0] + ox[2] > 0 else None
+    hexnac = None if oxonium_ratio is None else 'GalNAc' if oxonium_ratio < 1 else 'GlcNAc' if oxonium_ratio > 2 else None
     # An accurate spectrum is scored deisotoped, as the app annotates it: the 13C peaks of the oxonium and Y ions are no fragments of their own, but took
     # chance labels from candidates with more residue kinds (ETD runs: database structures of every composition within 10 ppm and -1 to +2
     # isotopes of 516 spectra, the Byonic glycan ranked first 0.576 -> 0.584; CandyCrumbs told it from its isobar Neu5Gc + Fuc in HCD 0.45 -> 0.67)
@@ -3417,6 +3440,10 @@ def rank_glycopeptide_structures(peptide, modification_str, fragment_masses, int
         for comp, site in zip(input_dict['glycans'], input_dict['glycosites']):
             candidates = compositions_to_structures(comp, glycan_class = 'N' if peptide[site] == 'N' else 'O', kingdom = kingdom)
             candidates = list(candidates['glycan']) if len(candidates) else []
+            # mucin-type O-glycans start with GalNAc; the database's other O-site candidates (Gal-rooted glycolipid-like ones, O-Man, O-Fuc, O-GlcNAc) were 7%
+            # of those of the compositions of O-glycoprotease digests
+            if o_glycan_root and peptide[site] != 'N':
+                candidates = [g for g in candidates if re.sub(r'^.*[)\]]', '', g).startswith(o_glycan_root)] or candidates
             # a floating part would be placed at one arbitrary position, while its placed versions are candidates of their own
             structures.append([g for g in candidates if '{' not in g] or candidates)
     elif structures and isinstance(structures[0], str):
@@ -3461,7 +3488,14 @@ def rank_glycopeptide_structures(peptide, modification_str, fragment_masses, int
         rows.append([list(combo), explained * direct, explained, direct, sorted({round(float(mzs[0]), 4) for mzs, f in zip(expected, found) if not f})])
     if not rows:
         raise ValueError("None of the candidate structures consists of residues CandyCrumbs can fragment")
-    df_out = pd.DataFrame(rows, columns = ['structures', 'score', 'explained', 'direct_fragments', 'missing_fragments'])
+    # a generic HexNAc could be either, so the ratio only weighs candidates whose HexNAc are named
+    glcnac = [None if any(re.search(r'HexNAc(?![a-z])', g) for g in row[0]) else any('GlcNAc' in g for g in row[0]) for row in rows]
+    weighable = {x for x in glcnac if x is not None} == {True, False} and hexnac is not None
+    for row, has_glcnac in zip(rows, glcnac):
+        factor = hexnac_penalty if weighable and has_glcnac is not None and has_glcnac == (hexnac == 'GalNAc') else 1.0
+        row[1] *= factor
+        row[4:4] = [factor, oxonium_ratio]
+    df_out = pd.DataFrame(rows, columns = ['structures', 'score', 'explained', 'direct_fragments', 'hexnac_evidence', 'oxonium_ratio', 'missing_fragments'])
     df_out = df_out.sort_values('score', ascending = False, kind = 'stable').reset_index(drop = True)
     df_out.insert(2, 'rank', df_out['score'].round(10).rank(ascending = False, method = 'min').astype(int))
     return df_out
@@ -3473,12 +3507,15 @@ def rank_glycopeptide_compositions(peptide, compositions, fragment_masses, inten
     errors of the precursor) by their fragment evidence in its MS2 spectrum\n
     | Arguments:
     | :-
-    | peptide (string): amino acid sequence, in CandyCrunch's one-letter code (c, j, k, m for modified residues)
+    | peptide (string): amino acid sequence, in CandyCrunch's one-letter code (c, j, k, m, n, q for modified residues)
     | compositions (list): candidate compositions of the peptide's one glycan, as dicts or strings ('H5N4F1A1', 'Hex5HexNAc4Neu5Ac1')
     | fragment_masses (list or dict): observed m/z values, or a peak dictionary of m/z : intensity such as the peak_d of load_spectra_filepath
     | intensities (list): intensities of the m/z values if fragment_masses is a list; default:None (all equal)
     | charge (int): precursor charge state; default:2
-    | glycosite (int): 0-based position of the glycosylated residue; default:None (the first site infer_glycosites finds)
+    | glycosite (int): 0-based position of the glycosylated residue; default:None (the first site infer_glycosites finds). A peptide with several glycans
+    |                  is ranked by its total composition on one of its sites: on 701 multi-site O-glycopeptide spectra that ranked the search engine's
+    |                  composition first as often as scoring each candidate by its best distribution over the identified sites (two sites: ion-trap ETD
+    |                  0.838 vs 0.848, EThcD 0.954 vs 0.949; three or four: equal), which costs one CandyCrumbs call per distribution (median 31, up to 1,620)
     | isotope_errors (list): per composition, how many isotope steps the precursor m/z is off for it (the m/z the instrument picked minus the composition's,
     |                        in 13C spacings); default:None (all 0)
     | fragmentation_method (string): 'CID'/'HCD'/'ETD'/'ECD'/'EThcD'/'ETciD', e.g., the activation column of load_spectra_filepath; default:None (all peptide ion types)
@@ -3543,7 +3580,7 @@ def rank_glycopeptide_sites(peptide, glycans, fragment_masses, intensities = Non
     electron transfer, b/y with collisional activation) that carry every glycan whose site they cover, and optionally by the cleavage rule of the protease\n
     | Arguments:
     | :-
-    | peptide (string): amino acid sequence, in CandyCrunch's one-letter code (c, j, k, m for modified residues)
+    | peptide (string): amino acid sequence, in CandyCrunch's one-letter code (c, j, k, m, n, q for modified residues)
     | glycans (list): the glycans to place, one per occupied site, as compositions (dicts or strings, 'H1N1A1') or IUPAC-condensed structures
     | fragment_masses (list or dict): observed m/z values, or a peak dictionary of m/z : intensity such as the peak_d of load_spectra_filepath
     | intensities (list): intensities of the m/z values if fragment_masses is a list; default:None (all equal)
