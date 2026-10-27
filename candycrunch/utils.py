@@ -1,14 +1,15 @@
-"""Readers for mzML, mzXML, mgf, and Thermo .raw spectra files, on the standard library and numpy"""
+"""Readers for mzML, mzXML, mzData, mgf, Thermo .raw, Agilent MassHunter .d and SCIEX .wiff spectra files, on the standard library and numpy"""
 import base64
 import heapq
 import itertools
+import os
 import re
 import struct
 import zlib
 import xml.etree.ElementTree as ET
 import numpy as np
 # Thermo .raw trailer extra fields: numpy types of the generic data types (0 is a gap, 2-4 are booleans; 12 and 13, strings of the declared length
-# in ASCII or UTF-16, are not read)
+# in ASCII or UTF-16, are only read for HCD Energy)
 RAW_FIELD_TYPES = {0: 'V0', 1: 'i1', 2: 'u1', 3: 'u1', 4: 'u1', 5: 'u1', 6: '<i2', 7: '<u2', 8: '<i4', 9: '<u4', 10: '<f4', 11: '<f8'}
 # The trailer extra fields read per scan (Thermo writes 0 for a monoisotopic m/z or charge state it did not determine)
 RAW_TRAILER_FIELDS = ('Monoisotopic M/Z:', 'Charge State:', 'MS2 Isolation Width:', 'MSn Isolation Width:', 'Master Scan Number:', 'HCD Energy:')
@@ -339,6 +340,68 @@ def read_mzxml(filepath, centroid_levels = ()):
         yield heapq.heappop(queue)[2]
 
 
+# mzData terms by their PSI accession; a term a writer gives by name alone is read by its name in lower case
+MZDATA_TERMS = {'PSI:1000037': 'polarity', 'PSI:1000038': 'timeinminutes', 'PSI:1000039': 'timeinseconds', 'PSI:1000040': 'masstochargeratio',
+                'PSI:1000041': 'chargestate', 'PSI:1000042': 'intensity', 'PSI:1000044': 'method', 'PSI:1000045': 'collisionenergy'}
+
+
+def read_mzdata(filepath, centroid_levels = ()):
+    """iterates over the spectra of an mzData file (PSI's XML format before mzML, which Agilent MassHunter's MzDataExport writes, e.g., as run.mzdata.xml)\n
+   | Arguments:
+   | :-
+   | filepath (string): absolute filepath to the mzData file
+   | centroid_levels (tuple): MS levels whose profile spectra (spectrumType continuous) are centroided (ion-trap scans at valleys, as Bruker and Agilent
+   |                          ion-trap scans in read_mzml, others by a 3-point Gaussian fit at each local maximum); default:()\n
+   | Returns:
+   | :-
+   | Yields a dict per spectrum: id (the spectrum's id, a string), ms_level (int or None), rt (minutes; None if absent), polarity ('+', '-' or None), peaks
+   | ((n, 2) array of m/z and intensity), precursor (mz, and if given charge and intensity i, of the first precursor, with ref, the id of the spectrum it
+   | was selected in; None if there is none), activation (its method term, e.g., 'CID'; None if absent), collision_energy (float or None), and instrument
+   | (the names and values of the file's analyzer terms in lower-case letters only, e.g., 'analyzertypequadrupoletimeofflight')
+   """
+
+    def terms(node):
+        return {MZDATA_TERMS.get(p.get('accession')) or (p.get('name') or '').lower(): p.get('value') for p in (node.iter() if node is not None else ())
+                if p.tag.rsplit('}', 1)[-1] in ('cvParam', 'userParam')}
+
+    instrument = ''
+    for _, el in ET.iterparse(filepath):
+        tag = el.tag.rsplit('}', 1)[-1]
+        if tag == 'analyzer':
+            # The file's one instrument names its analyzers in words (QuadrupoleTimeOfFlight, IonTrap, ...), before the spectra
+            instrument += re.sub('[^a-z]', '', ''.join((p.get('name') or '') + (p.get('value') or '') for p in el.iter()).lower())
+        if tag != 'spectrum':
+            continue
+        ns = el.tag[:-len(tag)]
+        settings = el.find(f'{ns}spectrumDesc/{ns}spectrumSettings')
+        scan = settings.find(f'{ns}spectrumInstrument') if settings is not None else None
+        params = terms(scan)
+        precursor_el = el.find(f'{ns}spectrumDesc/{ns}precursorList/{ns}precursor')
+        selected = terms(precursor_el)
+        arrays = []
+        for kind in ('mzArrayBinary', 'intenArrayBinary'):
+            # Base64 of 32- or 64-bit floats in either byte order; mzData has no compression
+            data = el.find(f'{ns}{kind}/{ns}data')
+            text = data.text if data is not None else None
+            arrays.append(np.frombuffer(base64.b64decode(text), ('>' if data.get('endian') == 'big' else '<') + ('f4' if data.get('precision') == '32' else 'f8'))
+                          if text and text.strip() else np.zeros(0))
+        peaks = np.stack(arrays, axis = -1)
+        ms_level = int(scan.get('msLevel')) if scan is not None and scan.get('msLevel') else None
+        acquisition = settings.find(f'{ns}acqSpecification') if settings is not None else None
+        if ms_level in centroid_levels and len(peaks) and acquisition is not None and acquisition.get('spectrumType') == 'continuous':
+            peaks = (centroid_ion_trap(peaks[:, 0], peaks[:, 1], min_gap = 0.3, bin_shift = False) if 'trap' in instrument and 'orbitrap' not in instrument else
+                     centroid_gaussian(peaks[:, 0], peaks[:, 1]))
+        rt = float(params['timeinminutes']) if params.get('timeinminutes') else float(params['timeinseconds']) / 60 if params.get('timeinseconds') else None
+        precursor = {key: conv(selected[term]) for key, term, conv in (('mz', 'masstochargeratio', float), ('charge', 'chargestate', lambda x: int(float(x))),
+                                                                        ('i', 'intensity', float)) if selected.get(term)} if selected.get('masstochargeratio') else None
+        if precursor:
+            precursor['ref'] = precursor_el.get('spectrumRef')
+        yield {'id': el.get('id'), 'ms_level': ms_level, 'rt': rt, 'polarity': {'p': '+', '+': '+', 'n': '-', '-': '-'}.get((params.get('polarity') or ' ')[0].lower()),
+               'peaks': peaks, 'precursor': precursor, 'activation': selected.get('method'),
+               'collision_energy': float(selected['collisionenergy']) if selected.get('collisionenergy') else None, 'instrument': instrument}
+        el.clear()
+
+
 def read_mgf(filepath):
     """iterates over the spectra of an .mgf file\n
    | Arguments:
@@ -367,7 +430,7 @@ def read_mgf(filepath):
                         params['charge'] = pepmass[2]
                 if isinstance(params.get('charge'), str):
                     # e.g. 2+, 3+ and 4+
-                    params['charge'] = [int(c[-1] + c[:-1]) if c[-1:] in ('+', '-') else int(c) for c in re.split(r',\s*|\s*and\s*', params['charge'])]
+                    params['charge'] = [int(c[-1] + c[:-1]) if c[-1:] in ('+', '-') else int(c) for c in re.split(r',\s*|\s*and\s*', params['charge'].strip()) if c]
                 if 'rtinseconds' in params:
                     # A retention time, or ranges and lists of them (e.g., 600.5-612.5): the middle of their span
                     rts = [float(v) for v in re.findall(r'\d*\.?\d+(?:[eE][-+]?\d+)?', params['rtinseconds'])]
@@ -393,8 +456,8 @@ def read_raw_scan_table(filepath):
    | :-
    | Returns the scan table as a list per column, one entry per scan: scan, ms_level, polarity, scan_mode, analyzer, filter_string (isolation m/z,
    | activation and energy of each stage, e.g., 1022.4700@etd50.00), precursor_mz, charge, isolation_width, master_scan, retention_time, scan_range
-   | ((lowest, highest) m/z of its scan windows; an ion-trap MS2's lower limit is its low-mass cutoff), and packet (the file offset of the scan's data
-   | packet, for read_raw_packet)
+   | ((lowest, highest) m/z of its scan windows; an ion-trap MS2's lower limit is its low-mass cutoff), packet (the file offset of the scan's data
+   | packet, for read_raw_packet), and RealEnergy (the trailer's HCD Energy of MSn scans: a float, or text such as 30.00,42.00,72.00 for stepped energies)
    """
     with open(filepath, 'rb') as f:
         head = f.read(1356)
@@ -566,6 +629,230 @@ def read_raw_packet(f, address, drop_flagged = False):
         ints.append(np.frombuffer(prof, '<f4', n, pos + 8 + 4 * fudge))
         pos += 8 + 4 * fudge + 4 * n
     return np.concatenate(mzs), np.concatenate(ints), True
+
+
+# Agilent MassHunter scan index (AcqData/MSScan.bin): one 284-byte record per scan with the fields of the folder's MSScan.xsd in its order (ScanID,
+# ScanMethodID, TimeSegmentID, ScanTime in min, MSLevel, ScanType, TIC, base peak m/z and value, CalibrationID, CycleNumber, IonMode, IonPolarity (0 positive,
+# 1 negative), Fragmentor, CollisionEnergy, MzOfInterest, AbundanceLimit, SamplingPeriod, Threshold, ChargeState, then ChromScaleFactor as 4 bytes, not the
+# schema's 8, MassCalOffset, ...), ending in a profile and a centroid SpectrumParamValues block (format ID 1 and 2: offset into MSProfile.bin / MSPeak.bin,
+# byte and point count, x and y range, noise); of them the fields read here
+MASSHUNTER_SCAN = np.dtype({'names': ['scan', 'rt', 'level', 'polarity', 'energy', 'mz', 'charge', 'calibration', 'format', 'offset', 'n'],
+                            'formats': ['<i4', '<f8', '<i4', '<i4', '<f8', '<f8', '<i4', '<i8', '<i4', '<i8', '<i4'],
+                            'offsets': [0, 12, 20, 64, 76, 84, 116, 124, 220, 224, 236], 'itemsize': 284})
+
+
+def read_masshunter_scans(folder):
+    """reads the scan index of an Agilent MassHunter .d folder (AcqData/MSScan.bin of the 6200 series TOF / 6500 series Q-TOF acquisition software)\n
+   | Arguments:
+   | :-
+   | folder (string): absolute path to the .d folder\n
+   | Returns:
+   | :-
+   | Returns a structured array (MASSHUNTER_SCAN) with one row per scan: scan, rt (min), level, polarity, energy (collision energy), mz (an MS/MS scan's
+   | precursor, MassHunter's isolation target), charge (0 if not determined), calibration (the offset of the scan's record in MSMassCal.bin), format (2 where
+   | the scan has a centroided spectrum), offset and n (its place and point count in MSPeak.bin)
+   """
+    name = os.path.basename(os.path.normpath(folder))
+    with open(os.path.join(folder, 'AcqData', 'MSScan.bin'), 'rb') as f:
+        index = f.read()
+    # MSTS.xml gives the number of scans of each time segment, the header's int32 at byte 88 the offset of the first record
+    with open(os.path.join(folder, 'AcqData', 'MSTS.xml'), 'rb') as f:
+        n = sum(int(x) for x in re.findall(rb'<NumOfScans>(\d+)</NumOfScans>', f.read()))
+    start = struct.unpack_from('<i', index, 88)[0]
+    if not n or len(index) - start != n * MASSHUNTER_SCAN.itemsize:
+        raise ValueError(f"{name} has an MSScan.bin layout CandyCrunch does not know; convert it to mzML with msconvert (with peak picking) first.")
+    return np.frombuffer(index, dtype = MASSHUNTER_SCAN, count = n, offset = start)
+
+
+def read_masshunter(folder):
+    """iterates over the scans of an Agilent MassHunter .d folder, from the centroided spectra MassHunter stores next to its profile spectra\n
+   | Arguments:
+   | :-
+   | folder (string): absolute path to the .d folder\n
+   | Returns:
+   | :-
+   | Yields a dict per scan: scan, ms_level, rt (min), peaks ((n, 2) array of m/z and abundance), precursor (mz and charge, None for survey scans; the
+   | charge None where MassHunter determined none), polarity ('+'/'-') and collision_energy
+   """
+    name = os.path.basename(os.path.normpath(folder))
+    scans = read_masshunter_scans(folder)
+    if not os.path.exists(os.path.join(folder, 'AcqData', 'MSPeak.bin')) or not (scans['format'] == 2).all():
+        raise ValueError(f"{name} holds profile spectra only (no AcqData/MSPeak.bin); convert it to mzML with msconvert (with peak picking) first.")
+    with open(os.path.join(folder, 'AcqData', 'MSPeak.bin'), 'rb') as f:
+        peaks = f.read()
+    with open(os.path.join(folder, 'AcqData', 'MSMassCal.bin'), 'rb') as f:
+        calibration = f.read()
+    # MSPeak.bin holds each scan's centroids as their float64 flight times, then their float32 abundances; MSMassCal.bin each scan's calibration (a count,
+    # then the 'Traditional' step's A and t0 and the 'Polynomial' step's flight time range and coefficients): m/z = (A (t - t0))^2 with the A of the scan's
+    # reference-mass correction. The polynomial step (powers of t chosen by DefaultMassCal.xml's ValueUseFlags) moves m/z by less than 0.1 ppm on 6520 Q-TOF
+    # runs and is not applied
+    for s in scans:
+        times = np.frombuffer(peaks, '<f8', s['n'], s['offset'])
+        a, t0 = struct.unpack_from('<2d', calibration, s['calibration'] + 4)
+        yield dict(scan = int(s['scan']), ms_level = int(s['level']), rt = float(s['rt']),
+                   peaks = np.column_stack([(a * (times - t0)) ** 2, np.frombuffer(peaks, '<f4', s['n'], s['offset'] + 8 * s['n'])]),
+                   precursor = dict(mz = float(s['mz']), charge = int(s['charge']) or None) if s['level'] > 1 and s['mz'] > 0 else None,
+                   polarity = '-' if s['polarity'] == 1 else '+', collision_energy = float(s['energy']))
+
+
+def read_compound_file(filepath):
+    """reads the streams of an OLE compound file (Microsoft's structured storage, the container of SCIEX .wiff files)\n
+   | Arguments:
+   | :-
+   | filepath (string): absolute path to the file\n
+   | Returns:
+   | :-
+   | Returns a dict of stream paths ('Storage/Substorage/Stream') to their bytes
+   """
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    if data[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        raise ValueError(f"{os.path.basename(filepath)} is no OLE compound file (a .wiff is one)")
+    sector, mini = 1 << struct.unpack_from('<H', data, 30)[0], 1 << struct.unpack_from('<H', data, 32)[0]
+    n_fat, first_dir, cutoff, first_minifat, n_minifat, difat_sector, n_difat = struct.unpack_from('<2I4x5I', data, 44)
+    # The sectors of the allocation table: 109 listed in the header, the rest in a chain of DIFAT sectors whose last entry points to the next one
+    difat = list(struct.unpack_from('<109I', data, 76))
+    for _ in range(n_difat):
+        entries = struct.unpack_from(f'<{sector // 4}I', data, (difat_sector + 1) * sector)
+        difat, difat_sector = difat + list(entries[:-1]), entries[-1]
+    fat = np.concatenate([np.frombuffer(data, '<u4', sector // 4, (s + 1) * sector) for s in difat[:n_fat]])
+
+    def chain(start, table):
+        # Sector numbers of a stream up to the end-of-chain mark (values from 0xFFFFFFFA up are marks); a damaged file's cycle stops at the table's length
+        out = []
+        while start < 0xFFFFFFFA and len(out) <= len(table):
+            out.append(start)
+            start = int(table[start])
+        return out
+
+    read = lambda start: b''.join(data[(s + 1) * sector:(s + 2) * sector] for s in chain(start, fat))
+    directory = read(first_dir)
+    # Directory entries of 128 bytes: UTF-16 name and its byte length, type (1 storage, 2 stream, 5 root), left and right sibling and child in a red-black
+    # tree, first sector and size (of which version 3 files, with 512-byte sectors, only use the lower 4 bytes)
+    entries = [(directory[k:k + struct.unpack_from('<H', directory, k + 64)[0]].decode('utf-16-le').rstrip('\x00'), directory[k + 66],
+                *struct.unpack_from('<3i', directory, k + 68), *struct.unpack_from('<IQ', directory, k + 116)) for k in range(0, len(directory) - 127, 128)]
+    ministream = read(entries[0][5])[:entries[0][6]]
+    minifat = np.frombuffer(read(first_minifat), '<u4') if n_minifat else np.zeros(0, '<u4')
+    streams, stack = {}, [(entries[0][4], '')]
+    while stack:
+        i, prefix = stack.pop()
+        if not 0 <= i < len(entries):
+            continue
+        name, kind, left, right, child, start, size = entries[i]
+        size &= 0xFFFFFFFF if sector == 512 else 0xFFFFFFFFFFFFFFFF
+        stack += [(left, prefix), (right, prefix)] + ([(child, prefix + name + '/')] if kind == 1 else [])
+        if kind == 2:
+            # Streams below the cutoff (4096 bytes) live in the 64-byte sectors of the root's mini stream
+            streams[prefix + name] = (b''.join(ministream[s * mini:(s + 1) * mini] for s in chain(start, minifat)) if size < cutoff else read(start))[:size]
+    return streams
+
+
+# SCIEX .wiff scan index (SampleSubtree/Sample1/Idx, after 32 bytes of header): one 54-byte record per scan, cycle by cycle and within a cycle experiment by
+# experiment, with the offset and size of its spectrum in the .wiff.scan (0 bytes for a dependent scan without precursor), its time in ms, TIC, base peak
+# intensity and base peak TOF bin
+WIFF_SCAN = np.dtype({'names': ['offset', 'size', 'rt', 'tic', 'base_peak', 'base_peak_bin'], 'formats': ['<u4', '<u4', '<f8', '<f8', '<f8', '<f8'],
+                      'offsets': [0, 4, 8, 18, 26, 42], 'itemsize': 54})
+
+
+def read_wiff(filepath):
+    """iterates over the scans of a SCIEX .wiff file (Analyst, information-dependent acquisition on a TripleTOF or QSTAR), from the .wiff.scan beside it\n
+   | Arguments:
+   | :-
+   | filepath (string): absolute path to the .wiff file\n
+   | Returns:
+   | :-
+   | Yields a dict per scan: scan (its row in the scan index), cycle and experiment (1-based, as SCIEX and pwiz number them), ms_level, rt (min), peaks
+   | ((n, 2) array of centroid m/z and intensity), precursor (mz and i of the survey peak IDA chose, None for survey scans) and scan_low (the lower end
+   | of the experiment's mass range); dependent scans without a precursor are skipped
+   """
+    name = os.path.basename(filepath)
+    if not os.path.exists(filepath + '.scan'):
+        raise ValueError(f"{name} has no {name}.scan beside it; SCIEX keeps the spectra of a .wiff file in its .wiff.scan, so both have to be copied.")
+    streams = read_compound_file(filepath)
+    samples = {m.group(1) for k in streams if (m := re.match(r'SampleSubtree/(Sample\d+)/', k))}
+    periods = {m.group(1) for k in streams if (m := re.match(r'MethodSubtree/Method1/DeviceMethod\d+/(Period\d+)/', k))}
+    if samples != {'Sample1'} or periods != {'Period0'}:
+        raise ValueError(f"{name} holds {len(samples)} samples acquired in {len(periods)} periods; CandyCrunch reads .wiff files of one sample and one period.")
+    sample = {k.split('/', 2)[2]: v for k, v in streams.items() if k.startswith('SampleSubtree/Sample1/')}
+    headers = {int(m.group(1)): v for k, v in streams.items() if (m := re.match(r'MethodSubtree/Method1/DeviceMethod\d+/Period0/Experiment(\d+)/ExperimentHeaderEx$', k))}
+    if 'TDCInfo' not in sample or 'TOFCalibrationData' not in sample or 'Idx' not in sample:
+        raise ValueError(f"{name} holds no TOF spectra (a triple quadrupole or QTRAP run); CandyCrunch reads the .wiff files of SCIEX TOF instruments.")
+    n_exp = len(headers)
+    # Information-dependent acquisition: per cycle the survey scan (experiment 0) and a 32-byte slot per dependent experiment with the m/z and intensity of
+    # the survey peak it fragmented (float64 at bytes 0 and 16; zero where IDA found no candidate). No charge state is stored
+    dde = sample.get('DDERealTimeData', b'')
+    if n_exp < 2 or sorted(headers) != list(range(n_exp)) or len(dde) < 32 or (len(dde) - 32) % (32 * (n_exp - 1)) or (len(sample['Idx']) - 32) % WIFF_SCAN.itemsize:
+        raise ValueError(f"{name} has no information-dependent MS/MS scans CandyCrunch can read (TOF MS only, SWATH or an unknown layout); CandyCrunch needs "
+                         f"data-dependent MS2 spectra.")
+    slots = np.frombuffer(dde, '<f8', offset = 32).reshape(-1, n_exp - 1, 4)
+    scans = np.frombuffer(sample['Idx'], WIFF_SCAN, offset = 32)
+    # The flight time of a TOF bin in ns (25.1 ps on a TripleTOF 5600), and per experiment the number of bins summed into one stored point (4 for TOF MS,
+    # 4 or 8 for product ion scans) and its mass range (float64 at 66)
+    bin_ns = struct.unpack_from('<d', sample['TDCInfo'], 32)[0]
+    summed = [struct.unpack_from('<I', headers[e], 56)[0] for e in range(n_exp)]
+    scan_low = [struct.unpack_from('<d', headers[e], 66)[0] for e in range(n_exp)]
+    # TOF calibration m/z = (A (t - t0))^2, t in ns: a default (A, t0) at byte 32, then a count and, where the instrument recalibrated each scan (TripleTOF
+    # survey and product ion scans each have their own), one (A, t0, int32) per scan of the index
+    calibration = sample['TOFCalibrationData']
+    default = struct.unpack_from('<2d', calibration, 32)
+    n_calibrations = struct.unpack_from('<I', calibration, 52)[0] if len(calibration) >= 56 else 0
+    per_scan = np.frombuffer(calibration, np.dtype({'names': ['a', 't0'], 'formats': ['<f8', '<f8'], 'itemsize': 20}), len(scans), 56) if n_calibrations == len(scans) else None
+    with open(filepath + '.scan', 'rb') as f:
+        data = np.frombuffer(f.read(), np.uint8)
+    # A spectrum in the .wiff.scan (after 44 bytes of header): FF FF FF FF, the TOF bin its points count from (uint32), a zero byte, then its profile as a
+    # byte code: below 7C an intensity, 7C/7D/7E an intensity in the next 1/2/4 bytes, 80-FB a gap of 0-123 empty points, FC/FD/FE a gap in the next 1/2/4
+    # bytes, FF the end (FF padding to 4 bytes follows)
+    has = np.flatnonzero(scans['size'] > 0)
+    starts = scans['offset'][has].astype(np.int64) + 44
+    ends = starts + scans['size'][has]
+    if len(has) and (ends[-1] > len(data) or (np.diff(starts) <= 0).any() or not (data[starts[:, None] + np.arange(4)] == 0xFF).all()):
+        raise ValueError(f"{name}.scan does not hold the spectra its scan index points to (an incomplete copy?).")
+    first_bin = (data[starts[:, None] + np.arange(4, 8)].astype(np.int64) << np.arange(0, 32, 8)).sum(1)
+    # Operand bytes take any value, so the tokens are walked from each spectrum's start, all spectra at once, one token per step
+    length = np.ones(256, np.int64)
+    length[[0x7C, 0xFC]], length[[0x7D, 0xFD]], length[[0x7E, 0xFE]] = 2, 3, 5
+    token, at, stop = np.zeros(len(data), bool), starts + 9, ends
+    while len(at):
+        going = at < stop
+        going[going] = data[at[going]] != 0xFF
+        at, stop = at[going], stop[going]
+        token[at] = True
+        at = at + length[data[at]]
+    # Decoded in chunks of ~4 MB of spectra, as the ~70 million tokens of a 90 MB .wiff.scan take gigabytes as arrays
+    chunks = np.flatnonzero(np.diff((starts - starts[0]) >> 22, prepend = -1, append = -1)) if len(has) else []
+    for k0, k1 in zip(chunks[:-1], chunks[1:]):
+        pos = np.flatnonzero(token[starts[k0]:ends[k1 - 1]]) + starts[k0]
+        code = data[pos]
+        if (code == 0x7F).any():
+            raise ValueError(f"{name}.scan holds spectra in a code CandyCrunch does not know.")
+        first = np.searchsorted(pos, np.append(starts[k0:k1], ends[k1 - 1]))
+        gap, low = code >= 0x80, (code & 0x7F).astype(np.int64)
+        value = np.where(gap, low, code).astype(np.int64)
+        wide = np.flatnonzero((low >= 0x7C) & (low <= 0x7E))
+        value[wide] = 0
+        for j in range(4):
+            # Little-endian operands: 1, 2 or 4 bytes for 7C/FC, 7D/FD, 7E/FE
+            take = wide[(low[wide] - 0x7B).clip(max = 3) + (low[wide] == 0x7E) > j]
+            value[take] |= data[np.minimum(pos[take] + 1 + j, len(data) - 1)].astype(np.int64) << 8 * j
+        # A point is one step, a gap that many steps; the k-th point of a spectrum lies k + 1 steps of summed bins after its first bin (the scan index's base
+        # peak bin is exactly that)
+        steps = np.concatenate([[0], np.cumsum(np.where(gap, value, 1))])
+        before = steps[:-1] - np.repeat(steps[first[:-1]], np.diff(first).astype(np.intp))
+        point_steps, point_ints, bounds = before[~gap], value[~gap], np.concatenate([[0], np.cumsum(~gap)])[first]
+        for k in range(k0, k1):
+            row = int(has[k])
+            cycle, experiment = divmod(row, n_exp)
+            precursor = None
+            if experiment:
+                if cycle >= len(slots) or not slots[cycle, experiment - 1, 0] > 0:
+                    continue
+                precursor = dict(mz = float(slots[cycle, experiment - 1, 0]), i = float(slots[cycle, experiment - 1, 2]))
+            a, t0 = (per_scan['a'][row], per_scan['t0'][row]) if per_scan is not None else default
+            t = (first_bin[k] + summed[experiment] * (point_steps[bounds[k - k0]:bounds[k - k0 + 1]] + 1)) * bin_ns
+            # The profile is centroided as TOF data (points evenly spaced in sqrt(m/z)); survey scans keep their TIMS_MS1_PEAKS most intense centroids
+            peaks = centroid_tof((a * (t - t0)) ** 2, point_ints[bounds[k - k0]:bounds[k - k0 + 1]], max_peaks = None if experiment else TIMS_MS1_PEAKS)
+            yield dict(scan = row, cycle = cycle + 1, experiment = experiment + 1, ms_level = 2 if experiment else 1, rt = float(scans['rt'][row]) / 60000,
+                       peaks = peaks, precursor = precursor, scan_low = scan_low[experiment])
 
 
 def mz_order(mzs, rts, charges, compositions):
