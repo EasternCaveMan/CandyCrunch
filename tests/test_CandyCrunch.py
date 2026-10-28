@@ -638,6 +638,25 @@ def test_label_inputs_open_rows():
     assert labelled['spec_id'].tolist() == [0] and len(unlabelled) == 2
     assert [r['status'] for r in labelled.attrs['map_rows']] == ['labelled', 'no_structure', 'open_row_nearer', 'no_structure']
 
+
+def test_label_inputs_own_rt():
+    # Mapping RTs read in the run itself (rt_own, from a map's RT_<run> column) are never dropped: each composition's strongest input sits 3-20 min from
+    # its row (another peak of it), which scatters the anchors past the drop rule, yet the weak inputs 0.2 min from the rows are the mapped peaks
+    import training.pipeline_labels as pl
+    glycans = ['Gal(b1-4)GlcNAc', 'Gal(b1-4)Glc', 'GlcNAc(b1-4)GlcNAc', 'Fuc(a1-2)Gal(b1-4)Glc', 'Gal(b1-4)Gal(b1-4)Glc', 'Neu5Ac(a2-3)Gal(b1-4)Glc']
+    comps = [{'Hex': 1, 'HexNAc': 1}, {'Hex': 2}, {'HexNAc': 2}, {'Hex': 2, 'dHex': 1}, {'Hex': 3}, {'Hex': 2, 'Neu5Ac': 1}]
+    masses, rts, off = [100.0 * (k + 1) for k in range(6)], [10.0 * (k + 1) for k in range(6)], [3.0, -5.0, 8.0, -12.0, 15.0, 20.0]
+    inputs = pd.DataFrame({'spec_id': range(12), 'RT': [t + 0.2 for t in rts] + [t + o for t, o in zip(rts, off)], 'intensity': [1e4] * 6 + [1e6] * 6,
+                           'peak_d': [{50.0: 1.0}] * 12, 'rt_range': [(0.0, 0.0)] * 12, 'num_spectra': 3, 'composition': comps * 2, 'charge': 1,
+                           'annotation_score': 12.0, 'model_input': [np.zeros((3, 1), np.float32)] * 12, 'RT2': 0.3, 'glycan_type': 1,
+                           'compositional_vector': [np.zeros(12)] * 12}, index = pd.Index(masses * 2, name = 'm/z'))
+    inputs.attrs.update(mode = 'negative', trap = 'other', lc = 'PGC', modification = 'reduced', mass_tag = None, sample_prep = 'underivatized')
+    mapping = pd.DataFrame({'Mass': masses, 'RT': rts, 'glycan': glycans})
+    labelled, _ = pl.label_inputs(inputs, mapping)
+    assert labelled.attrs['rt_alignment'] == 'dropped' and sorted(labelled['spec_id']) == list(range(6, 12))
+    labelled, _ = pl.label_inputs(inputs, mapping.assign(rt_own = True))
+    assert labelled.attrs['rt_alignment'] == 'none' and sorted(labelled['spec_id']) == list(range(6)) and (labelled['rt_error'].abs() < 0.3).all()
+
 def test_member_spectra_repool(monkeypatch):
     # The member spectra run_inputs keeps of a pooled input re-pool to the input the model got: their summed binned intensities, normalized, and the mean
     # of their m/z remainders over every member (one without a peak in the binned range counts too)
@@ -743,19 +762,20 @@ def test_mixed_charge_carrier_candidates():
 
 def test_ms1_peak_regrouping():
     # Unreduced anomers 1 min apart (1:3) fragmented on their flanks only, and a broad peak (sigma 1 min) whose MS2 every 1.2 min differ: with accurate survey
-    # scans each anomer is a cluster at its MS1 apex, and the broad peak one cluster at its apex
-    rts = np.arange(0, 20, 0.01)
-    peaks = [(900.3, 10.0, 0.1, 1e5), (900.3, 11.0, 0.1, 3e5), (1100.4, 15.0, 1.0, 2e5)]
+    # scans each anomer is a cluster at its MS1 apex, and the broad peak one cluster at its apex. Far from the anomers, a small peak of their m/z fragmented
+    # once is a cluster of its own, and a weak one (below 5% of the anomers) fragmented three times is left out instead of joining them
+    rts = np.arange(0, 60, 0.01)
+    peaks = [(900.3, 10.0, 0.1, 1e5), (900.3, 11.0, 0.1, 3e5), (1100.4, 15.0, 1.0, 2e5), (900.3, 30.0, 0.1, 2e4), (900.3, 50.0, 0.1, 5e3)]
     trace = lambda mz, t: sum(h * np.exp(-0.5 * ((t - apex) / w) ** 2) for m, apex, w, h in peaks if m == mz) + 1
     ms1 = (rts, np.repeat([[900.3, 1100.4]], len(rts), axis = 0).ravel().astype(np.float32),
            np.array([[trace(900.3, t), trace(1100.4, t)] for t in rts]).ravel().astype(np.float32), np.arange(len(rts) + 1, dtype = np.int64) * 2)
-    spectra = [(900.3, t) for t in (9.95, 10.1, 10.9, 11.05)] + [(1100.4, t) for t in (12.6, 13.8, 15.0, 16.2, 17.4)]
+    spectra = [(900.3, t) for t in (9.95, 10.1, 10.9, 11.05, 30.0, 49.95, 50.0, 50.05)] + [(1100.4, t) for t in (12.6, 13.8, 15.0, 16.2, 17.4)]
     df = pd.DataFrame({'m/z': [m for m, _ in spectra], 'RT': [t for _, t in spectra], 'intensity': [trace(m, t) for m, t in spectra],
                        'peak_d': [{204.087: 100.0, 366.14: 50.0, 1000.0 + 37 * k: 80.0} for k in range(len(spectra))]})
     out = condense_dataframe(df.copy(), mz_ppm = 20, ms1 = ms1).sort_values('RT')
-    assert np.allclose(out['RT'], [10.0, 11.0, 15.0], atol = 0.02) and out['num_spectra'].tolist() == [2, 2, 5]
-    # Without survey scans the anomers stay one cluster and the broad peak five
-    assert len(condense_dataframe(df.copy(), mz_ppm = 20)) == 6
+    assert np.allclose(out['RT'], [10.0, 11.0, 15.0, 30.0], atol = 0.02) and out['num_spectra'].tolist() == [2, 2, 5, 1]
+    # Without survey scans the anomers stay one cluster, the broad peak five, and the small peaks one each
+    assert len(condense_dataframe(df.copy(), mz_ppm = 20)) == 8
 
 
 def test_condense_isotope_apex():
