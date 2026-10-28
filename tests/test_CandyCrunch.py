@@ -579,7 +579,8 @@ def test_label_run_mapping_rules(monkeypatch):
     labelled, unlabelled = pl.label_run('run.cc', mapping, 'N')
     assert np.isclose(labelled.attrs['rt_shift'], 1.3) and np.array_equal(labelled['model_input'].iloc[0], np.array([[300], [1], [0]], dtype = np.float32))
     assert labelled['spec_id'].tolist() == [0, 1, 2, 3, 4, 5, 6] and len(unlabelled) == 2
-    assert all(len(c) == 2 for c in labelled['glycan_candidates'].iloc[5:]) and labelled['glycan_match_status'].iloc[5] == 'candidates'
+    # The sialylated composition's two kept inputs, 1 min apart on PGC, split its two RT-less rows by elution order: a2-6 first
+    assert labelled['glycan_candidates'].iloc[5:].tolist() == [[sia[1]], [sia[0]]] and labelled['glycan_match_status'].iloc[5] == 'unique'
     # Where each label came from, and every mapping row labelled
     assert labelled.attrs['rt_alignment'] == 'median' and labelled.attrs['rt_anchors'] == 5
     assert labelled['label_source'].tolist() == ['rt_median'] * 5 + ['no_rt'] * 2 and np.allclose(labelled['rt_error'].iloc[:5], 0, atol = 1e-6)
@@ -595,6 +596,47 @@ def test_label_run_mapping_rules(monkeypatch):
     assert [r['status'] for r in labelled.attrs['map_rows']] == ['labelled'] * 7 + ['no_input_at_mass', 'other_composition', 'outside_rt']
     assert labelled.attrs['rt_alignment'] == 'none' and labelled['spec_id'].tolist() == [0, 1, 2, 3, 4, 5, 6]
 
+
+def test_label_inputs_accurate_ms1():
+    # With accurate survey scans an input takes a mapping row only within ppm_tolerance of its Mass or of its first two 13C peaks at the input's charge, a Mass
+    # with fewer decimals within half its last one: 720.3207 (another ion, 655 ppm off N3H3 [M+2Na]2+ 719.8493) is only labelled at 0.5 m/z, the 13C pick
+    # of N4H5S2 [M+3Na]3+ is, and so is an input 29 ppm off a Mass given as 1031.5
+    import training.pipeline_labels as pl
+    comps = [{'Hex': 5, 'HexNAc': 2}, {'Hex': 3, 'HexNAc': 3}, {'Hex': 5, 'HexNAc': 4, 'Neu5Ac': 2}, {'Hex': 4, 'HexNAc': 4, 'dHex': 1}]
+    glycans = ['Man(a1-3)[Man(a1-3)[Man(a1-6)]Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc', 'GlcNAc(b1-2)Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc',
+               'Neu5Ac(a2-6)Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Neu5Ac(a2-6)Gal(b1-4)GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc',
+               'Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc']
+    mzs, masses, charges = [801.3864, 720.3207, 946.1202 + 1.003355 / 3 + 3e-4, 1031.53], [801.3859, 719.8493, 946.1202, 1031.5], [2, 2, 3, 2]
+    inputs = pd.DataFrame({'spec_id': range(4), 'RT': [10.0, 11.0, 12.0, 13.0], 'intensity': 1e5, 'peak_d': [{500.0: 1.0}] * 4, 'rt_range': [(r, r) for r in range(10, 14)],
+                           'num_spectra': 3, 'composition': comps, 'charge': charges, 'annotation_score': 12.0, 'model_input': [np.zeros((3, 1), np.float32)] * 4,
+                           'RT2': 0.3, 'glycan_type': 1, 'compositional_vector': [np.zeros(12)] * 4}, index = pd.Index(mzs, name = 'm/z'))
+    inputs.attrs.update(mode = 'positive', trap = 'other', lc = 'C18', modification = None, mass_tag = None, sample_prep = 'permethylated', ms1_trap = 'tof', accurate_ms1 = True)
+    mapping = pd.DataFrame({'Mass': masses, 'RT': [10.0, 11.0, 12.0, 13.0], 'glycan': glycans})
+    labelled, unlabelled = pl.label_inputs(inputs, mapping)
+    assert sorted(labelled['spec_id']) == [0, 2, 3] and [r['status'] for r in labelled.attrs['map_rows']] == ['labelled', 'no_input_at_mass', 'labelled', 'labelled']
+    assert labelled['mz_error'].tolist() == pytest.approx([0.0005, 1.003355 / 3 + 3e-4, 0.03])
+    # Without accurate survey scans every input within 0.5 m/z of a Mass takes its row
+    inputs.attrs['accurate_ms1'] = False
+    labelled, _ = pl.label_inputs(inputs, mapping)
+    assert sorted(labelled['spec_id']) == [0, 1, 2, 3]
+
+
+def test_label_inputs_open_rows():
+    # A mapping row without structure but with Mass and RT (an isomer the mapping leaves at composition level) keeps the inputs nearer it than any
+    # structured row of their mass: the input 0.7 min from the structured row and 0.1 min from the open row stays unlabelled, and a structured row whose
+    # only input sits nearer an open row says so
+    import training.pipeline_labels as pl
+    comps = [{'Hex': 1, 'HexNAc': 2}, {'Hex': 1, 'HexNAc': 2}, {'Hex': 2, 'HexNAc': 2}]
+    glycans = ['Gal(b1-3)[GlcNAc(b1-6)]GalNAc', 'Gal(b1-3)[Gal(b1-4)GlcNAc(b1-6)]GalNAc']
+    mzs = [587.2305, 587.2305, 749.2833]
+    inputs = pd.DataFrame({'spec_id': range(3), 'RT': [10.0, 10.7, 12.6], 'intensity': 1e5, 'peak_d': [{500.0: 1.0}] * 3, 'rt_range': [(r, r) for r in (10.0, 10.7, 12.6)],
+                           'num_spectra': 3, 'composition': comps, 'charge': [1, 1, 1], 'annotation_score': 12.0, 'model_input': [np.zeros((3, 1), np.float32)] * 3,
+                           'RT2': 0.3, 'glycan_type': 1, 'compositional_vector': [np.zeros(12)] * 3}, index = pd.Index(mzs, name = 'm/z'))
+    inputs.attrs.update(mode = 'negative', trap = 'other', lc = 'PGC', modification = 'reduced', mass_tag = None, sample_prep = 'underivatized')
+    mapping = pd.DataFrame({'Mass': [587.2305, 587.2305, 749.2833, 749.2833], 'RT': [10.0, 10.8, 12.0, 12.5], 'glycan': [glycans[0], np.nan, glycans[1], np.nan]})
+    labelled, unlabelled = pl.label_inputs(inputs, mapping)
+    assert labelled['spec_id'].tolist() == [0] and len(unlabelled) == 2
+    assert [r['status'] for r in labelled.attrs['map_rows']] == ['labelled', 'no_structure', 'open_row_nearer', 'no_structure']
 
 def test_member_spectra_repool(monkeypatch):
     # The member spectra run_inputs keeps of a pooled input re-pool to the input the model got: their summed binned intensities, normalized, and the mean
@@ -659,6 +701,44 @@ def test_run_inputs_activation_split(monkeypatch):
     monkeypatch.setattr(pl, 'load_spectra_filepath', lambda *args, **kwargs: loaded.assign(activation = 'CID'))
     inputs = pl.run_inputs('run.cc', 'N')
     assert calls == [['CID'] * 3] and 'activation' not in inputs.columns and inputs.attrs['activation'] == 'CID'
+
+
+def test_charge_carrier_candidates():
+    # A sodiated permethylated run (free reducing end, adducts Na+) with accurate survey scans (ms1_ppm): every charge is carried by Na+, so Man5 [M+2Na]2+ 801.3864 is no
+    # Hex1HexNAc1Neu5Ac3 [M+Na+H]2+ (8 ppm off) and FM3 [M+2Na]2+ 684.3261 no Hex6HexNAc2dHex1P1 [M+Na+2H]3+ (0.33 Da off), the matches tried first before;
+    # and a match within ms1_ppm replaces an in-class one further off: Hex5HexNAc2Neu5Ac1 [M+Na+H]2+ 970.9818 is no Hex5HexNAc3P1 [M+2Na]2+ (43 ppm off)
+    comp_map, df_use, topo_map = create_struct_maps(df_glycan, ['N'], filter_out = {'HexA'}, phylo_level = 'Class', phylo_filter = 'Mammalia')
+    peaks = {300.0: 1.0, 1500.0: 0.5}
+    candidates = lambda ms1_ppm: assign_candidate_structures(pd.DataFrame({'m/z': [801.3864, 684.3261, 970.9818], 'peak_d': [peaks] * 3}), df_use, comp_map, topo_map,
+                                                             0.5, 'positive', 0, modification = None, sample_prep = 'permethylated', max_charge = 4, ms1_ppm = ms1_ppm,
+                                                             adducts = ['Na+'])
+    out = candidates(20)
+    found = {(s, stringify_dict(c), z) for s, c, z in zip(out['spec_id'], out['composition'], out['charge'])}
+    assert (0, 'Hex5HexNAc2', 2) in found and (1, 'Hex3HexNAc2dHex1', 2) in found and (2, 'Hex5HexNAc2Neu5Ac1', 2) in found
+    assert not {f for f in found if f[1] in ('Hex1HexNAc1Neu5Ac3', 'Hex6HexNAc2dHex1P1', 'Hex5HexNAc3P1')}
+    # Without accurate survey scans the first match within 0.5 Da stays
+    out = candidates(None)
+    assert 'Hex5HexNAc3P1' in {stringify_dict(c) for s, c in zip(out['spec_id'], out['composition']) if s == 2}
+
+
+def test_mixed_charge_carrier_candidates():
+    # A procainamide run that fragments [M+2H+K]3+ and [M+H+NH4]2+ beside [M+3H]3+ (adducts K+ and NH4+) with accurate survey scans: a precursor keeps every
+    # reading within ms1_ppm for the annotation scores, so protonated Hex5HexNAc4dHex1Neu5Ac2 is no longer only Hex4HexNAc4Neu5Ac3 [M+2H+NH4]3+, and
+    # Hex5HexNAc4dHex3 [M+H+NH4]2+ no longer only Hex4HexNAc4Neu5Ac1dHex2 [M+2H]2+; the K+ ions keep their reading
+    comp_map, df_use, topo_map = create_struct_maps(df_glycan, ['N'], filter_out = {'HexA'}, phylo_level = 'Class', phylo_filter = 'Mammalia')
+    mass = lambda c: composition_to_mass(c, modification = 'procainamide')
+    sialylated, fucosylated = {'Hex': 5, 'HexNAc': 4, 'dHex': 1, 'Neu5Ac': 2}, {'Hex': 5, 'HexNAc': 4, 'dHex': 3}
+    ions = [(sialylated, (mass(sialylated) + 3 * PROTON_MASS) / 3, 3), (sialylated, (mass(sialylated) + 2 * PROTON_MASS + mass_dict['K+']) / 3, 3),
+            (fucosylated, (mass(fucosylated) + PROTON_MASS + mass_dict['NH4+']) / 2, 2)]
+    candidates = lambda ms1_ppm: assign_candidate_structures(pd.DataFrame({'m/z': [mz * (1 + 10e-6) for _, mz, _ in ions], 'peak_d': [{300.0: 1.0, 1500.0: 0.5}] * 3}),
+                                                             df_use, comp_map, topo_map, 0.5, 'positive', 0, modification = 'procainamide', max_charge = 3,
+                                                             ms1_ppm = ms1_ppm, adducts = ['K+', 'NH4+'])
+    out = candidates(20)
+    found = {(s, stringify_dict(c), z) for s, c, z in zip(out['spec_id'], out['composition'], out['charge'])}
+    assert all((k, stringify_dict(c), z) in found for k, (c, _, z) in enumerate(ions))
+    # Without accurate survey scans the first reading stays
+    out = candidates(None)
+    assert (0, stringify_dict(sialylated), 3) not in {(s, stringify_dict(c), z) for s, c, z in zip(out['spec_id'], out['composition'], out['charge'])}
 
 
 def test_ms1_peak_regrouping():
@@ -760,6 +840,21 @@ def test_mzxml_without_ms2_or_rt(tmp_path):
         process_mzXML_stack(path)
 
 
+def test_exactive_mzxml(tmp_path):
+    # msconvert writes a Q Exactive's mzXML without filter lines and names only its quadrupole as analyzer; the model names the orbitrap, so the survey
+    # scans count as accurate MS1 (read as an unknown analyzer, candidates were matched at 0.5 Da, where [M+H]+ readings took the [M+NH4]+ ions)
+    data = base64.b64encode(np.array([[500.0, 10.0], [797.3034, 2e6]]).astype('>f8').tobytes()).decode()
+    path = tmp_path / 'qe.mzXML'
+    path.write_text('<?xml version="1.0"?><mzXML xmlns="http://sashimi.sourceforge.net/schema_revision/mzXML_3.2"><msRun><msInstrument msInstrumentID="1">'
+                    '<msManufacturer category="msManufacturer" value="Thermo Scientific"/><msModel category="msModel" value="Q Exactive Plus"/>'
+                    '<msMassAnalyzer category="msMassAnalyzer" value="quadrupole"/></msInstrument>' + ''.join(
+                        f'<scan num="{num}" msLevel="{level}" centroided="1" polarity="+" retentionTime="PT{rt}S" msInstrumentID="1">{precursor}<peaks '
+                        f'precision="64" byteOrder="network" compressionType="none" contentType="m/z-int">{data}</peaks></scan>' for num, level, rt, precursor in
+                        [(1, 1, 600, ''), (2, 2, 601, '<precursorMz precursorIntensity="2e6" activationMethod="HCD">797.3034</precursorMz>')]) + '</msRun></mzXML>')
+    df = process_mzXML_stack(str(path), intensity = True, extract_ms1 = True)
+    assert df.attrs['detected_trap'] == df.attrs['detected_ms1_trap'] == 'orbitrap' and df['analyzer'].tolist() == ['orbitrap']
+
+
 def test_bruker_ion_trap_mzml(tmp_path):
     # The scans of test_bruker_mzxml as msconvert writes a Bruker ion trap .d to mzML: profiles, the HCT series model with the amaZon named in a userParam,
     # and the isolation window centre as selected ion m/z, also with a charge state; mzML and mzXML of one run give the same spectra and precursors
@@ -838,26 +933,155 @@ def test_bruker_yep(tmp_path, model):
     assert df['analyzer'].tolist() == [df.attrs['detected_trap']] * 2 and df['polarity'].tolist() == ['-'] * 2 and df['isolation_width'].isna().all()
 
 
+def test_bruker_baf(tmp_path):
+    # A Bruker Q-TOF .d folder (otofControl): analysis.baf blocks (length, type with the A0 BF signature, header length) with the parameter definitions
+    # (3001: entries with their number and short name at byte 20), the method's values (2001: a set of (number, 8-byte value) records), and per spectrum a
+    # header (2002: number, RT in ms; sub-blocks with its values, precursor list and TOF calibration), a profile (1001, not read) and a line spectrum (1002:
+    # float64 positions on the digitizer's time axis, float32 intensities). The spectra's C1 is the method's times 1 + e (temperature compensation)
+    delay, timebase, c0, c1, c2, c4, e = 17312.0, 0.2, 312.48, 155567.06, 9.18e-05, -0.00143, -1.2e-06
+    names = {'Mode_IonPolarity': 0, 'Mode_ScanBegin': 1213, 'Collision_Energy_Act': 1480, 'MSMS_IsolationMass_Act': 1521, 'MSMS_PreCursorChargeState': 1538,
+             'Quadrupole_IsolationResolution_Act': 1449, 'Calibration_Tof2CalC1': 1149, 'TOF_DeviceTempGradient1': 1284}
+
+    def block(kind, header, body = b''):
+        return struct.pack('<3I', 12 + len(header) + len(body), 0xbfa00000 | kind, 12 + len(header)) + header + body
+
+    def records(values):
+        return b''.join(struct.pack('<H', k) + (struct.pack('<q', v) if isinstance(v, int) else struct.pack('<d', v)) for k, v in values.items())
+
+    def line_spectrum(number, peaks, gradient):
+        # Positions from the method's C1 and m/z times 1 + e or, where the instrument compensates with its own temperature gradient, the spectrum's C1
+        cal, f = (c1 * (1 + e), 1) if gradient else (c1, 1 + e)
+        positions = np.array([(c0 + np.sqrt(1e12 / cal * (m * f + c4)) + c2 * m * f - delay) / timebase for m, _ in peaks], dtype = '<f8')
+        n = len(peaks)
+        return block(0x1002, struct.pack('<4I', number, number, 3, n) + bytes(24), struct.pack('<4I', n, 40, 40 + 8 * n, 40 + 12 * n) + bytes(24) +
+                     positions.tobytes() + np.array([i for _, i in peaks], dtype = '<f4').tobytes() + np.ones(n, dtype = '<f4').tobytes())
+
+    definitions = b''.join(struct.pack('<2HBBH6H', 20 + len(name) + 1, number, 5, 1, 0, 20, 0, 0, 0, 0, 0) + name.encode() + b'\x00' for name, number in names.items())
+    survey = [(675.36, 2e6), (965.844, 9e5), (965.844 + 1.003355 / 2, 6e5), (965.844 + 1.003355, 3e5), (966.47, 4e3)]
+    fragments = [(290.09, 1e4), (675.3, 1e4), (800.3, 3e4), (965.85, 5e4), (966.35, 4e4)]
+
+    def run(gradient):
+        # The method's values, with TOF_DeviceTempGradient1 (ppm/C) where the instrument compensates C1 itself
+        method = {0: 1, 1213: 50.0, 1149: c1, **({1284: gradient} if gradient else {})}
+        data = block(0x3001, b'', definitions) + block(0x2001, bytes(8), block(0x000d, struct.pack('<2I', len(method), 0x200), records(method)))
+        for number, rt, precursor, charge, peaks in [(1, 150000, None, 0, survey), (2, 150600, 965.844, 2, fragments), (3, 151200, 675.3605, 1, fragments)]:
+            values = {1480: 25.0, 1449: 4.0} if precursor else {1480: 7.0}
+            values.update({1521: precursor, 1538: charge} if precursor else {})
+            subs = (block(0x0001, struct.pack('<I', len(values)), records(values)) +
+                    block(0x0005, struct.pack('<I', 1 if precursor else 0), struct.pack('<f', precursor) if precursor else b'') +
+                    block(0x0006, struct.pack('<I', 10), struct.pack('<7d3I2d', delay, timebase, c0, c1 * (1 + e), c2, 0.0, c4, 3, 68, 2, 26.1, 25.6) + bytes(24)))
+            data += (block(0x2002, struct.pack('<5I', 1, number, 3, rt, 0) + struct.pack('<If', 0x200, -1.0), subs) + block(0x1001, bytes(32)) +
+                     line_spectrum(number, peaks, gradient))
+        return data
+
+    folder = tmp_path / 'run.d'
+    folder.mkdir()
+    data = run(0)
+    (folder / 'analysis.baf').write_bytes(data)
+    df = load_spectra_filepath(str(folder), extract_ms1 = True)
+    # Both precursors move onto their monoisotopic survey centroids; Bruker's charge 2 is kept, its charge 1 counts as undetermined
+    assert np.allclose(df['m/z'], [965.844, 675.36], atol = 1e-4)
+    assert df['precursor_charge'].tolist()[0] == 2 and np.isnan(df['precursor_charge'].tolist()[1])
+    # The line positions give back the m/z through the TOF calibration and the temperature factor; the doubly charged precursor's envelope is no fragment
+    assert sorted(df['peak_d'][0]) == pytest.approx([290.09, 675.3, 800.3], abs = 1e-6) and len(df['peak_d'][1]) == 5
+    assert np.allclose(df['RT'], [2.51, 2.52]) and df['scan'].tolist() == [2, 3] and df['collision_energy'].tolist() == [25.0, 25.0]
+    assert df['isolation_width'].tolist() == [4.0, 4.0] and df['scan_low'].tolist() == [50.0, 50.0]
+    assert df.attrs['detected_trap'] == 'other' and df.attrs['detected_ms1_trap'] == 'tof' and df.attrs['detected_mode'] == 'negative'
+    assert df['analyzer'].tolist() == ['tof'] * 2 and df['polarity'].tolist() == ['-'] * 2 and df['activation'].tolist() == ['HCD'] * 2
+    assert len(df.attrs['ms1'][0]) == 1 and df.attrs['ms1'][1][0] == pytest.approx(675.36, abs = 1e-4)
+    # An instrument compensating C1 with its own temperature gradient (a compact) used the spectrum's C1 as it is
+    (folder / 'analysis.baf').write_bytes(run(45.0))
+    df = load_spectra_filepath(str(folder))
+    assert np.allclose(df['m/z'], [965.844, 675.36], atol = 1e-4) and sorted(df['peak_d'][0]) == pytest.approx([290.09, 675.3, 800.3], abs = 1e-6)
+    # A run stored as profile spectra only is refused with a hint
+    (folder / 'analysis.baf').write_bytes(data.replace(struct.pack('<I', 0xbfa01002), struct.pack('<I', 0xbfa01003)))
+    with pytest.raises(ValueError, match = 'profile spectra only'):
+        load_spectra_filepath(str(folder))
+
+
+def test_waters_raw(tmp_path):
+    # A Waters MassLynx .raw folder (Fast DDA): _FUNCTNS.INF (a 416-byte record per function: scan type, ionization mode, centroid and lock mass bits; mass
+    # range at 160), per function an .IDX (30-byte or older 22-byte records: points, bit 30 for calibrated m/z, TIC, RT, offset), an .STS (parameter
+    # definitions, then a record per scan) and a .DAT of 12-byte centroids or 8-byte continuum points (intensity and m/z as mantissa and exponent); the
+    # continuum MS/MS function is stored uncalibrated and takes the header's calibration, a polynomial in sqrt(m/z) (here sqrt(m/z) = c0 + c1 sqrt(stored))
+    cal = [4e-3, 0.9998, 0.0, 0.0, 0.0, 0.0]
+    folder = tmp_path / 'run.raw'
+    folder.mkdir()
+
+    def pack(value, bits, shift):
+        e = int(np.floor(np.log2(value))) + 1 if value else 0
+        return round(value * 2.0 ** (bits - e)) | e << shift if value else 0
+
+    def function(k, head, scans, width, size, sts):
+        data, index = b'', b''
+        for rt, peaks in scans:
+            info = len(peaks) | (1 << 30 if width == 12 else 0)
+            index += struct.pack('<2I2f6sQ', 0, info, 0.0, rt, b'', len(data)) if size == 30 else struct.pack('<2I2f6s', len(data), info, 0.0, rt, b'')
+            data += b''.join(struct.pack('<2I', pack(i, 21, 22), pack(m, 27, 27)) + bytes(width - 8) for m, i in peaks)
+        defs = b''.join(struct.pack('<3H', number, 3, at) + name.ljust(26, b'\x00') + struct.pack('<H', 4) + bytes(14)
+                        for number, at, name in [(62, 0, b'Collision Energy'), (77, 4, b'Set Mass')])
+        stats = struct.pack('<4H', 32 + len(defs), 1, 8, 2) + bytes(24) + defs + b''.join(struct.pack('<2f', ce, mass) for ce, mass in sts)
+        for suffix, content in (('IDX', index), ('DAT', data), ('STS', stats)):
+            (folder / f'_FUNC{k:03d}.{suffix}').write_bytes(content)
+        return struct.pack('<H', head) + bytes(158) + struct.pack('<f', 50.0) + bytes(124) + struct.pack('<f', 2000.0) + bytes(124)
+
+    # Survey scan (function 1, ES-: ionization mode 9, centroided): a 3+ glycan at 965.844 and a 1+ one at 675.36
+    survey = [(675.36, 2e6), (965.844, 9e5), (965.844 + 1.003355 / 3, 1e6), (965.844 + 2 * 1.003355 / 3, 6e5), (1200.5, 3e4)]
+    # MS/MS (function 2, continuum): each fragment a peak of points evenly spaced in sqrt(m/z), as on the TOF grid, flanked by zeros
+    fragments = [290.09, 512.2, 800.3]
+    profile = [(((np.sqrt(f) + 2.2e-4 * k - cal[0]) / cal[1]) ** 2, h) for f in fragments for k, h in zip(range(-3, 4), [0, 20, 70, 100, 70, 20, 0])]
+    # The DDA set masses sit above the survey centroids: on the 13C peak of the 3+ ion, and 0.06 above the 1+ one; function 3 is the lock mass reference
+    (folder / '_FUNCTNS.INF').write_bytes(function(1, 18 | 9 << 5 | 0x400, [(10.0, survey)], 12, 30, [(4.0, 0.0)]) +
+                                          function(2, 16 | 9 << 5, [(10.01, profile), (10.02, profile)], 8, 22, [(25.0, 965.844 + 1.003355 / 3 + 0.03), (20.0, 675.42)]) +
+                                          function(3, 18 | 9 << 5 | 0x400 | 0x8000, [(10.015, [(554.2615, 5e4)])], 12, 30, [(4.0, 0.0)]))
+    (folder / '_HEADER.TXT').write_text('\n'.join(f'$$ Cal Function {k}: ' + ','.join(map(str, cal)) + ',T1' for k in (1, 2, 3)))
+    assert [s['scan'] for s in candycrunch.utils.read_waters(str(folder), peaks = False)] == ['function=1 process=0 scan=1', 'function=2 process=0 scan=1',
+                                                                                             'function=2 process=0 scan=2']
+    df = load_spectra_filepath(str(folder), extract_ms1 = True)
+    # The 3+ precursor walks down its isotopes from the 13C peak, the 1+ one is found 0.06 below its set mass; MassLynx stores no charge states
+    assert np.allclose(df['m/z'], [965.844, 675.36], atol = 1e-4) and df['precursor_charge'].isna().all()
+    # Continuum points are calibrated and centroided (calibrated centroids are not calibrated again); the lock mass function is no survey scan
+    assert sorted(df['peak_d'][0]) == pytest.approx(fragments, abs = 1e-3) and list(df['peak_d'][0].values()) == pytest.approx([280] * 3)
+    assert len(df.attrs['ms1'][0]) == 1 and not np.any(np.abs(df.attrs['ms1'][1] - 554.2615) < 0.01) and df.attrs['ms1'][1][0] == pytest.approx(675.36, abs = 1e-4)
+    assert df['scan'].tolist() == ['function=2 process=0 scan=1', 'function=2 process=0 scan=2'] and np.allclose(df['RT'], [10.01, 10.02])
+    assert df['collision_energy'].tolist() == [25.0, 20.0] and df['scan_low'].tolist() == [50.0, 50.0] and df['polarity'].tolist() == ['-'] * 2
+    assert df.attrs['detected_mode'] == 'negative' and df.attrs['detected_trap'] == 'other' and df.attrs['detected_ms1_trap'] == 'tof'
+    # Ion mobility (HDMS) runs keep their spectra in .cdt files, which are not read
+    (folder / '_func002.cdt').write_bytes(b'')
+    with pytest.raises(ValueError, match = 'ion mobility'):
+        load_spectra_filepath(str(folder))
+
+
 def test_agilent_masshunter(tmp_path):
     # An Agilent MassHunter .d folder: AcqData/MSScan.bin (header with the offset of the first record at byte 88, one 284-byte record per scan),
     # MSTS.xml (number of scans), MSMassCal.bin (per scan: a count, A, t0, polynomial step) and MSPeak.bin (per scan: float64 flight times, then
-    # float32 abundances); m/z = (A (t - t0))^2. MS2 records give the isolation target and MassHunter's charge state
+    # float32 abundances); m/z = (A (t - t0))^2 minus the polynomial step (here c t, ValueUseFlags 2 in DefaultMassCal.xml). MS2 records give the isolation
+    # target and MassHunter's charge state
     from candycrunch.utils import MASSHUNTER_SCAN
-    a, t0 = 0.000572794, 1024.818
+    a, t0, c = 0.000572794, 1024.818, -2e-8
     survey = [(675.36, 2e6), (965.844, 9e5), (965.844 + 1.003355 / 2, 6e5), (965.844 + 1.003355, 3e5), (966.47, 4e3)]
     fragments = [(290.09, 1e4), (675.3, 1e4), (800.3, 3e4), (965.85, 5e4), (966.35, 4e4)]
     scans = [(1, 2.5, 1, survey, 0.0, 0), (2, 2.51, 2, fragments, 965.846, 2), (3, 2.52, 2, fragments, 675.3605, 1)]
     records, peaks, calibration = np.zeros(len(scans), dtype = MASSHUNTER_SCAN), bytes(68), bytes(72)
     for k, (scan, rt, level, spectrum, mz, charge) in enumerate(scans):
-        records[k] = (scan, rt, level, 0, 10.0 * (level - 1), mz, charge, len(calibration), 2, len(peaks), len(spectrum))
-        calibration += struct.pack('<i10d', 10, a, t0, 19996.0, 92106.0, *[0.0] * 6)
-        peaks += np.array([np.sqrt(m) / a + t0 for m, _ in spectrum], dtype = '<f8').tobytes() + np.array([i for _, i in spectrum], dtype = '<f4').tobytes()
+        records[k] = (scan, rt, level, 0, 10.0 * (level - 1), mz, charge, len(calibration), 2, len(peaks), len(spectrum), 1)
+        calibration += struct.pack('<i5d', 5, a, t0, 19996.0, 92106.0, c)
+        times = np.array([np.sqrt(m) / a + t0 for m, _ in spectrum])
+        for _ in range(3):
+            times = np.sqrt(np.array([m for m, _ in spectrum]) + c * times) / a + t0
+        peaks += times.astype('<f8').tobytes() + np.array([i for _, i in spectrum], dtype = '<f4').tobytes()
     folder = tmp_path / 'run.d'
     (folder / 'AcqData').mkdir(parents = True)
     (folder / 'AcqData' / 'MSScan.bin').write_bytes(bytes(88) + struct.pack('<i', 228) + bytes(136) + records.tobytes())
     (folder / 'AcqData' / 'MSTS.xml').write_text(f'<TimeSegments><TimeSegment><NumOfScans>{len(scans)}</NumOfScans></TimeSegment></TimeSegments>')
     (folder / 'AcqData' / 'MSMassCal.bin').write_bytes(calibration)
+    (folder / 'AcqData' / 'DefaultMassCal.xml').write_text('<DefaultCalibration DefaultCalibrationID="1"><Step Number="2"><CalibrationFormula>Polynomial'
+                                                           '</CalibrationFormula><ValueUseFlags>2</ValueUseFlags></Step></DefaultCalibration>')
     (folder / 'AcqData' / 'MSPeak.bin').write_bytes(peaks)
+    # The third scan as from a time segment stored as centroids only: its centroid block comes first, then an empty profile block
+    index = bytearray(records.tobytes())
+    index[2 * 284 + 156:2 * 284 + 220], index[2 * 284 + 220:2 * 284 + 284] = index[2 * 284 + 220:2 * 284 + 284], struct.pack('<i', 1) + bytes(60)
+    (folder / 'AcqData' / 'MSScan.bin').write_bytes(bytes(88) + struct.pack('<i', 228) + bytes(136) + bytes(index))
     df = load_spectra_filepath(str(folder), extract_ms1 = True)
     # Both precursors move onto their monoisotopic survey centroids; MassHunter's charge 2 is kept, its charge 1 counts as undetermined
     assert np.allclose(df['m/z'], [965.844, 675.36], atol = 1e-4)
@@ -868,6 +1092,14 @@ def test_agilent_masshunter(tmp_path):
     assert df.attrs['detected_trap'] == 'other' and df.attrs['detected_ms1_trap'] == 'tof' and df.attrs['detected_mode'] == 'positive'
     assert df['analyzer'].tolist() == ['tof'] * 2 and df['polarity'].tolist() == ['+'] * 2 and df['activation'].tolist() == ['HCD'] * 2
     assert len(df.attrs['ms1'][0]) == 1 and df.attrs['ms1'][1][0] == pytest.approx(675.36, abs = 1e-4)
+    # A scan stored as a profile only (no centroid block) is skipped; a run whose survey scans are all profiles is refused
+    index[2 * 284 + 156:2 * 284 + 160] = struct.pack('<i', 1)
+    (folder / 'AcqData' / 'MSScan.bin').write_bytes(bytes(88) + struct.pack('<i', 228) + bytes(136) + bytes(index))
+    assert load_spectra_filepath(str(folder))['scan'].tolist() == [2]
+    index[220:224] = struct.pack('<i', 1)
+    (folder / 'AcqData' / 'MSScan.bin').write_bytes(bytes(88) + struct.pack('<i', 228) + bytes(136) + bytes(index))
+    with pytest.raises(ValueError, match = 'profile spectra only'):
+        load_spectra_filepath(str(folder))
     # A run stored as profile spectra only is refused with a hint
     (folder / 'AcqData' / 'MSPeak.bin').unlink()
     with pytest.raises(ValueError, match = 'profile spectra only'):
@@ -984,6 +1216,19 @@ def test_sciex_wiff(tmp_path):
         assert df['analyzer'].tolist() == ['tof'] * 2 and df['activation'].tolist() == ['HCD'] * 2
         rts, mzs, ints, offsets = df.attrs['ms1']
         assert len(rts) == 2 and np.allclose(mzs[:offsets[1]], centres[0], atol = 1e-4) and ints[:offsets[1]].tolist() == [74200, 50469, 33400, 8100]
+    # A run stopped within a cycle: the index ends with a survey scan and one dependent scan, the IDA slots with that scan's slot
+    index = np.concatenate([index, np.zeros(2, WIFF_SCAN)]).astype(WIFF_SCAN)
+    for k, (rt, first, summed, peaks) in enumerate([(2200.0, 1389200, 4, envelope), (2350.0, 400200, 8, fragments)]):
+        block, mzs = spectrum(first, summed, peaks)
+        centres.append(mzs)
+        index[len(rows) + k] = (len(scan_file) - 44, len(block), rt, 0, 0, 0)
+        scan_file += block
+    streams['SampleSubtree/Sample1/Idx'] = bytes(32) + index.tobytes()
+    streams['SampleSubtree/Sample1/DDERealTimeData'] = bytes(32) + slots.tobytes() + struct.pack('<4d', 965.846, 0, 31869, 0)
+    path.write_bytes(compound_file(streams))
+    (tmp_path / 'run.wiff.scan').write_bytes(bytes(scan_file))
+    df = load_spectra_filepath(str(path))
+    assert df['scan'].tolist() == [f'sample=1 period=1 cycle={c} experiment=2' for c in (1, 2, 3)] and df['m/z'].tolist()[2] == pytest.approx(centres[6][1], abs = 1e-4)
     # The spectra live in the .wiff.scan, which has to come with the .wiff
     (tmp_path / 'run.wiff.scan').unlink()
     with pytest.raises(ValueError, match = 'wiff.scan beside it'):
