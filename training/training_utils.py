@@ -30,7 +30,6 @@ device = "cpu"
 if torch.cuda.is_available():
     device = "cuda:0"
 
-
 def calculate_class_distribution(dataloader, num_classes):
     """Calculate class distribution in a dataloader"""
     targets = getattr(dataloader.dataset, "targets", None)
@@ -304,10 +303,10 @@ def calculate_metrics_sklearn_from_classes(
     }
 
 
-def train_model(model,dataloaders,criterion,optimizer,scheduler,glycans,num_epochs=None,
-                patience=None,log_to_wandb=True,num_classes=None,model_type=None,setting_name=None,
-                classifier_moe_aux_loss_weight=0.0,checkpoint_metadata=None,
-                glycan_compositions=None,save_dir="./models",wandb_prefix=None,
+def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_epochs=None,
+                patience=None, log_to_wandb=True, num_classes=None, model_type=None, setting_name=None,
+                classifier_moe_aux_loss_weight=0.0, checkpoint_metadata=None,
+                glycan_compositions=None, save_dir="./models",wandb_prefix=None,
                 contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,):
     """
     Train a CNN or CNN2 with SAM and optional CNN2 classifier MoE load balancing.
