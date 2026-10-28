@@ -10,13 +10,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
-
+from glycowork.motif.processing import canonicalize_composition
 from glycowork.motif.graph import glycan_to_nxGraph
 from glycowork.motif.tokenization import glycan_to_composition
 
-cc_training_dir = Path("cc_training")
+train_dataset="full20261028"
+pretrain_dataset="Prefull20261028"
+cc_training_dir = Path("/home/daniel/vahid/CandyCrunch-vahid2/data_processing/Final_Results_cc")
 exclude_projects = set()               # GlycoPost_IDs left out of training and pretraining
-output_dir = Path("prepared_datasets")
+output_dir = Path(f"prepared_datasets_{train_dataset}")
 test_size = 0.15
 random_state = 42
 
@@ -42,6 +44,15 @@ FEATURE_COLUMNS = [
 PRETRAIN_COLUMNS = ["model_input"] + FEATURE_COLUMNS[2:]
 
 
+def iupac_to_composition_string(glycan: str) -> str:
+    comp_dict = glycan_to_composition(glycan)
+    if not comp_dict:
+        raise ValueError(f"Could not derive a valid composition from: {glycan}")
+
+    # Turn {'Hex': 5, 'HexNAc': 4, 'dHex': 1, 'Neu5Ac': 2}
+    # into a format canonicalize_composition understands
+    expanded = ''.join(f'{k}{v}' for k, v in comp_dict.items())
+    return canonicalize_composition(expanded, as_string=True)
 
 def _readable(glycan):
     # Structures glycowork cannot turn into a composition and a graph cannot be trained on (training_script.py drops them)
@@ -77,9 +88,8 @@ def downcast_numeric(df):
 def tupleify(df, columns):
     return list(df[list(columns)].itertuples(index=False, name=None))
 
-
 print("Loading labelled inputs")
-train = pd.read_pickle(cc_training_dir / "train.pkl")
+train = pd.read_pickle(cc_training_dir / f"{train_dataset}.pkl")
 train = train[~train["GlycoPost_ID"].isin(exclude_projects)]
 structures = set(train["glycan"]).union(*train["glycan_candidates"])
 readable = {g for g in structures if _readable(g)}
@@ -99,8 +109,8 @@ for sparse in train["model_input"]:
     binned.append(b)
     remainders.append(r)
 combined = _encode_settings(train.assign(binned_intensities=binned, mz_remainder=remainders)).reset_index(drop=True)
-glycans = sorted(set().union(*combined["glycan_candidates"]))
-
+glycans = pd.DataFrame({"glycan": sorted(set().union(*combined["glycan_candidates"]))})
+glycans["glycan_comp"] = glycans["glycan"].apply(iupac_to_composition_string)
 print("Splitting train/test by run")
 splitter = GroupShuffleSplit(test_size=test_size, n_splits=1, random_state=random_state)
 train_idx, test_idx = next(splitter.split(combined, groups=combined["GlycoPost_ID"] + "/" + combined["filename"]))
@@ -112,8 +122,8 @@ test_df = downcast_numeric(test_df)
 
 print("Writing intermediate dataframes")
 output_dir.mkdir(parents=True, exist_ok=True)
-train_df.to_pickle(output_dir / "train_second.pkl")
-test_df.to_pickle(output_dir / "test_second.pkl")
+train_df.to_pickle(output_dir / "train_second_GShS.pkl")
+test_df.to_pickle(output_dir / "test_second_GShS.pkl")
 
 print("Serialising tuples for CandyCrunch")
 # The member spectra of each input ride along as a tenth element where the conversion kept them (ResampledDataset re-pools them, SimpleDataset reads the first nine)
@@ -123,31 +133,31 @@ X_test = tupleify(test_df, columns)
 y_train = train_df["glycan"].tolist()
 y_test = test_df["glycan"].tolist()
 
-with open(output_dir / "X_train.pkl", "wb") as fh:
+with open(output_dir / "X_train_GShS.pkl", "wb") as fh:
     pickle.dump(X_train, fh)
-with open(output_dir / "X_test.pkl", "wb") as fh:
+with open(output_dir / "X_test_GShS.pkl", "wb") as fh:
     pickle.dump(X_test, fh)
-with open(output_dir / "y_train.pkl", "wb") as fh:
+with open(output_dir / "y_train_GShS.pkl", "wb") as fh:
     pickle.dump(y_train, fh)
-with open(output_dir / "y_test.pkl", "wb") as fh:
+with open(output_dir / "y_test_GShS.pkl", "wb") as fh:
     pickle.dump(y_test, fh)
 with open(output_dir / "glycans.pkl", "wb") as fh:
     pickle.dump(glycans, fh)
-with open(output_dir / "cand_mask_train.pkl", "wb") as fh:
-    pickle.dump(candidate_mask(train_df, glycans), fh)
-with open(output_dir / "cand_mask_test.pkl", "wb") as fh:
-    pickle.dump(candidate_mask(test_df, glycans), fh)
+with open(output_dir / "cand_mask_train_GShS.pkl", "wb") as fh:
+    pickle.dump(candidate_mask(train_df, glycans["glycan"]), fh)
+with open(output_dir / "cand_mask_test_GShS.pkl", "wb") as fh:
+    pickle.dump(candidate_mask(test_df, glycans["glycan"]), fh)
 
-print("Serializing pretraining inputs")
-# One input per candidate composition of each unlabeled spectrum, as at inference; the spectrum stays sparse, as dense arrays of every unlabeled input
-# exceed memory (densify as for the labeled inputs above)
-(output_dir / "pretrain").mkdir(exist_ok=True)
-for path in sorted((cc_training_dir / "pretrain").glob("*.pkl")):
-    if path.stem in exclude_projects:
-        continue
-    pretrain = pd.read_pickle(path).explode(["compositional_vectors", "glycan_types"])
-    pretrain = _encode_settings(pretrain.rename(columns={"compositional_vectors": "compositional_vector", "glycan_types": "glycan_type"}))
-    with open(output_dir / "pretrain" / f"X_{path.stem}.pkl", "wb") as fh:
-        pickle.dump(tupleify(pretrain, PRETRAIN_COLUMNS), fh)
+# print("Serializing pretraining inputs")
+# # One input per candidate composition of each unlabeled spectrum, as at inference; the spectrum stays sparse, as dense arrays of every unlabeled input
+# # exceed memory (densify as for the labeled inputs above)
+# (output_dir / "pretrain").mkdir(exist_ok=True)
+# for path in sorted((cc_training_dir / "pretrain").glob("*.pkl")):
+#     if path.stem in exclude_projects:
+#         continue
+#     pretrain = pd.read_pickle(path).explode(["compositional_vectors", "glycan_types"])
+#     pretrain = _encode_settings(pretrain.rename(columns={"compositional_vectors": "compositional_vector", "glycan_types": "glycan_type"}))
+#     with open(output_dir / "pretrain" / f"X_{path.stem}.pkl", "wb") as fh:
+#         pickle.dump(tupleify(pretrain, PRETRAIN_COLUMNS), fh)
 
 print(f"Saved processed datasets to {output_dir.resolve()}")

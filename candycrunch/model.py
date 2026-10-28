@@ -7,7 +7,7 @@ from candycrunch.inference import transform_mz, transform_rt
 
 class SimpleDataset(torch.utils.data.Dataset):
 
-    def __init__(self, x, y, transform_mz=None, transform_rt=None):
+    def __init__(self, x, y, transform_mz = None, transform_rt = None):
         self.x = x
         self.y = y
         self.transform_mz = transform_mz
@@ -31,18 +31,9 @@ class SimpleDataset(torch.utils.data.Dataset):
         modification = self.x[index][7]
         trap = self.x[index][8]
         out = self.y[index]
-        return (
-            torch.FloatTensor(mz),
-            torch.FloatTensor(mz_r),
-            torch.FloatTensor(prec),
-            torch.LongTensor([glycan_type]),
-            torch.FloatTensor([RT]),
-            torch.LongTensor([mode]),
-            torch.LongTensor([lc]),
-            torch.LongTensor([modification]),
-            torch.LongTensor([trap]),
-            torch.LongTensor([out]),
-        )
+        return torch.FloatTensor(mz), torch.FloatTensor(mz_r), torch.FloatTensor(prec), torch.LongTensor(
+            [glycan_type]), torch.FloatTensor([RT]), torch.LongTensor([mode]), torch.LongTensor([lc]), torch.LongTensor(
+            [modification]), torch.LongTensor([trap]), torch.LongTensor([out])
 
 class ResUnit(nn.Module):
     """Daniel new Change"""

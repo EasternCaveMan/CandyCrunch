@@ -24,7 +24,7 @@ from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, SimpleDataset, t
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
 from sklearn.metrics import pairwise_distances
-from training_utils import load_dataset_inputs, seed_worker, train_model
+from training_utils import ResampledDataset, load_dataset_inputs, seed_worker, train_model
 
 warnings.filterwarnings("ignore",category=RuntimeWarning,module="sklearn.utils.extmath")
 
@@ -166,12 +166,12 @@ def main(args):
     print("Preparing dataloaders")
     X_train = load_dataset_inputs(train_source, targets=y_train, composition_vectors=composition_vectors)
     X_test = load_dataset_inputs(val_source, targets=y_test, composition_vectors=composition_vectors)
-    trainset = SimpleDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
+    trainset = ResampledDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
     valset = SimpleDataset(X_test, y_test)
 
     pretrain_trainset = None
     if args.sup_pretraining:
-        pretrain_trainset = SimpleDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
+        pretrain_trainset = ResampledDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
     elif args.unsup_pretraining:
         unsup_pretrain_dir = resolve_prepared_dataset_dir(args.unsup_pretraining_dataset)
         unsup_pretrain_source = unsup_pretrain_dir / args.unsup_pretraining_cache
@@ -181,8 +181,8 @@ def main(args):
             unsup_pretrain_source,
             default_composition=np.zeros(len(comp_vector_order), dtype=np.float32),
         )
-        pretrain_trainset = SimpleDataset(X_pretrain, np.zeros(len(X_pretrain), dtype=np.int64),
-                                         transform_mz=transform_mz, transform_rt=transform_rt)
+        pretrain_trainset = ResampledDataset(X_pretrain, np.zeros(len(X_pretrain), dtype=np.int64),
+                                            transform_mz=transform_mz, transform_rt=transform_rt)
 
 
     # ============================================================
