@@ -30,6 +30,7 @@ device = "cpu"
 if torch.cuda.is_available():
     device = "cuda:0"
 
+
 def calculate_class_distribution(dataloader, num_classes):
     """Calculate class distribution in a dataloader"""
     targets = getattr(dataloader.dataset, "targets", None)
