@@ -1,116 +1,8 @@
-
 from torch import flatten
 import torch.nn.functional as F
 import torch.nn as nn
-import json
-import random
-from pathlib import Path
-import numpy as np
 import torch
 from candycrunch.inference import transform_mz, transform_rt
-
-class MemmapSpectrumDataset(torch.utils.data.Dataset):
-    """Read spectra from a training cache or in-memory inference arrays."""
-
-    def __init__(self,cache_dir,targets,composition_vectors,model_type,transform_mz=None,transform_rt=None,
-                 *, arrays=None, repeats=1, default_composition=None):
-        if model_type not in {"CNN", "CNN2"}:
-            raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN' or 'CNN2'.")
-        if (cache_dir is None) == (arrays is None):
-            raise ValueError("Provide either cache_dir or in-memory arrays.")
-        if not isinstance(repeats, (int, np.integer)) or repeats < 1:
-            raise ValueError("repeats must be a positive integer.")
-        self.cache_dir = str(cache_dir) if cache_dir is not None else None
-        self._arrays = None
-        self.manifest = None
-        if arrays is None:
-            with (Path(cache_dir) / "manifest.json").open() as file:
-                self.manifest = json.load(file)
-            sample_count = self.manifest["samples"]
-        else:
-            array_names = ["metadata", "sample_compositions"]
-            array_names.extend(["binned_intensities", "mz_remainder"])
-            sample_count = len(arrays["metadata"])
-            self._arrays = {name: arrays[name] for name in array_names}
-            if any(len(values) != sample_count for values in self._arrays.values()):
-                raise ValueError("Inference arrays must have the same number of samples.")
-        self.targets = np.zeros(sample_count, dtype=np.int64) if targets is None else np.asarray(targets, dtype=np.int64)
-        self.composition_vectors = None if composition_vectors is None else np.asarray(composition_vectors, dtype=np.float32)
-        self.default_composition = None if default_composition is None else np.asarray(default_composition, dtype=np.float32)
-        self.model_type = model_type
-        self.transform_mz = transform_mz
-        self.transform_rt = transform_rt
-        self.repeats = repeats
-        if sample_count != len(self.targets):
-            raise ValueError(f"Feature/target length mismatch: {sample_count} != {len(self.targets)}")
-
-    @classmethod
-    def for_inference(cls, arrays, model_type, repeats=1, transform_mz=None, transform_rt=None):
-        """Use in-memory arrays and per-sample compositions without creating a cache."""
-        return cls(None, None, None, model_type, arrays=arrays, repeats=repeats,
-                   transform_mz=transform_mz, transform_rt=transform_rt)
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        if self.cache_dir is not None:
-            state["_arrays"] = None
-        return state
-
-    def __len__(self):
-        return len(self.targets) * self.repeats
-
-    def _open_arrays(self):
-        if self._arrays is not None:
-            return self._arrays
-        names = ["bin_offsets", "bin_index", "bin_intensity", "bin_remainder"]
-        if (Path(self.cache_dir) / "sample_compositions.npy").exists():
-            names.append("sample_compositions")
-        self._arrays = {name: np.load(Path(self.cache_dir) / f"{name}.npy", mmap_mode="r") for name in ["metadata", *names]}
-        return self._arrays
-
-    def __getitem__(self, index):
-        index = index // self.repeats
-        arrays = self._open_arrays()
-        metadata = arrays["metadata"][index]
-        target = int(self.targets[index])
-        if self.composition_vectors is None:
-            if "sample_compositions" in arrays:
-                composition = arrays["sample_compositions"][index]
-            elif self.default_composition is not None:
-                composition = self.default_composition
-            else:
-                raise ValueError("Unlabeled spectrum stores need sample_compositions.npy or default_composition.")
-        else:
-            composition = self.composition_vectors[target]
-        precursor = torch.tensor(composition, dtype=torch.float32)
-        retention_time = float(metadata[1])
-        if self.transform_rt is not None:
-            retention_time = self.transform_rt(retention_time)
-        if self.manifest is None:
-            mz = np.asarray(arrays["binned_intensities"][index])
-            mz_remainder = arrays["mz_remainder"][index]
-        else:
-            # Training stores keep only occupied bins (float16 intensities, m/z remainders as uint16 fractions of a bin), densified here
-            start, end = arrays["bin_offsets"][index], arrays["bin_offsets"][index + 1]
-            occupied = arrays["bin_index"][start:end]
-            mz = np.zeros(self.manifest["num_bins"], dtype=np.float32)
-            mz[occupied] = arrays["bin_intensity"][start:end]
-            mz_remainder = np.zeros(self.manifest["num_bins"], dtype=np.float32)
-            mz_remainder[occupied] = arrays["bin_remainder"][start:end] * self.manifest["remainder_scale"]
-        if self.transform_mz is not None:
-            mz = self.transform_mz(np.copy(mz))
-
-        shared = (precursor,
-                  torch.tensor([int(metadata[0])], dtype=torch.long),
-                  torch.tensor([retention_time], dtype=torch.float32),
-                  torch.tensor([int(metadata[2])], dtype=torch.long),
-                  torch.tensor([int(metadata[3])], dtype=torch.long),
-                  torch.tensor([int(metadata[4])], dtype=torch.long),
-                  torch.tensor([int(metadata[5])], dtype=torch.long),
-                  torch.tensor([target], dtype=torch.long))
-        return (torch.tensor(mz, dtype=torch.float32),
-                torch.empty(0, dtype=torch.float32),
-                torch.tensor(mz_remainder, dtype = torch.float32), *shared)
 
 
 class SimpleDataset(torch.utils.data.Dataset):
@@ -126,25 +18,21 @@ class SimpleDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         mz = self.x[index][0]
-        mz_r = self.x[index][2]
-        prec = self.x[index][3]
-        glycan_type = self.x[index][4]
-        RT = self.x[index][5]
-        mode = self.x[index][6]
-        lc = self.x[index][7]
-        modification = self.x[index][8]
-        trap = self.x[index][9]
-        out = self.y[index]
-
         if self.transform_mz:
             mz = self.transform_mz(mz)
-
+        mz_r = self.x[index][1]
+        prec = self.x[index][2]
+        glycan_type = self.x[index][3]
+        RT = self.x[index][4]
         if self.transform_rt:
             RT = self.transform_rt(RT)
-
+        mode = self.x[index][5]
+        lc = self.x[index][6]
+        modification = self.x[index][7]
+        trap = self.x[index][8]
+        out = self.y[index]
         return (
             torch.FloatTensor(mz),
-            torch.empty(0, dtype=torch.float32),
             torch.FloatTensor(mz_r),
             torch.FloatTensor(prec),
             torch.LongTensor([glycan_type]),

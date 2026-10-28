@@ -20,11 +20,11 @@ from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
 import pandas as pd
 import wandb
-from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, MemmapSpectrumDataset, transform_mz, transform_rt
+from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, SimpleDataset, transform_mz, transform_rt
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
 from sklearn.metrics import pairwise_distances
-from training_utils import seed_worker, train_model
+from training_utils import load_dataset_inputs, seed_worker, train_model
 
 warnings.filterwarnings("ignore",category=RuntimeWarning,module="sklearn.utils.extmath")
 
@@ -105,13 +105,12 @@ def main(args):
     # Load data
     # ============================================================
     dataset_dir = resolve_prepared_dataset_dir(args.dataset)
-    train_cache = dataset_dir / f"train_{args.split}"
-    val_cache = dataset_dir / f"test_{args.split}"
-
-    # with open(dataset_dir / f"X_train_{args.split}.pkl", "rb") as file:
-    #     X_train = pickle.load(file)
-    # with open(dataset_dir / f"X_test_{args.split}.pkl", "rb") as file:
-    #     X_test = pickle.load(file)
+    train_source = dataset_dir / f"X_train_{args.split}.pkl"
+    val_source = dataset_dir / f"X_test_{args.split}.pkl"
+    if not train_source.is_file():
+        train_source = dataset_dir / f"train_{args.split}"
+    if not val_source.is_file():
+        val_source = dataset_dir / f"test_{args.split}"
     with open(dataset_dir / f"y_train_{args.split}.pkl","rb",) as file:
         y_train = pickle.load(file)
     with open(dataset_dir / f"y_test_{args.split}.pkl","rb",) as file:
@@ -165,38 +164,25 @@ def main(args):
     # Datasets
     # ============================================================
     print("Preparing dataloaders")
-    trainset = MemmapSpectrumDataset(train_cache,
-                                     y_train,
-                                     composition_vectors,
-                                     args.model,
-                                     transform_mz=transform_mz,
-                                     transform_rt=transform_rt)
+    X_train = load_dataset_inputs(train_source, targets=y_train, composition_vectors=composition_vectors)
+    X_test = load_dataset_inputs(val_source, targets=y_test, composition_vectors=composition_vectors)
+    trainset = SimpleDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
+    valset = SimpleDataset(X_test, y_test)
 
     pretrain_trainset = None
     if args.sup_pretraining:
-        pretrain_trainset = MemmapSpectrumDataset(train_cache,
-                                                  y_train,
-                                                  composition_vectors,
-                                                  args.model,
-                                                  transform_mz=transform_mz,
-                                                  transform_rt=transform_rt)
+        pretrain_trainset = SimpleDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
     elif args.unsup_pretraining:
         unsup_pretrain_dir = resolve_prepared_dataset_dir(args.unsup_pretraining_dataset)
-        unsup_pretrain_cache = unsup_pretrain_dir / args.unsup_pretraining_cache
-        if not unsup_pretrain_cache.exists():
-            raise FileNotFoundError(f"Could not find unsupervised pretraining cache: {unsup_pretrain_cache}")
-        pretrain_trainset = MemmapSpectrumDataset(unsup_pretrain_cache,
-                                                  None,
-                                                  None,
-                                                  args.model,
-                                                  transform_mz=transform_mz,
-                                                  transform_rt=transform_rt,
-                                                  default_composition=np.zeros(len(comp_vector_order), dtype=np.float32))
-
-    valset = MemmapSpectrumDataset(val_cache,
-                                   y_test,
-                                   composition_vectors,
-                                   args.model)
+        unsup_pretrain_source = unsup_pretrain_dir / args.unsup_pretraining_cache
+        if not unsup_pretrain_source.exists():
+            raise FileNotFoundError(f"Could not find unsupervised pretraining inputs: {unsup_pretrain_source}")
+        X_pretrain = load_dataset_inputs(
+            unsup_pretrain_source,
+            default_composition=np.zeros(len(comp_vector_order), dtype=np.float32),
+        )
+        pretrain_trainset = SimpleDataset(X_pretrain, np.zeros(len(X_pretrain), dtype=np.int64),
+                                         transform_mz=transform_mz, transform_rt=transform_rt)
 
 
     # ============================================================
@@ -243,7 +229,7 @@ def main(args):
         )
         pretrainloader = make_loader(pretrain_trainset, False, args.num_workers, train_generator, pretrain_batch_sampler)
     elif args.unsup_pretraining:
-        pretrain_sample_count = len(pretrain_trainset.targets)
+        pretrain_sample_count = len(pretrain_trainset)
         pretrain_batch_sampler = UnlabeledContrastiveBatchSampler(
             pretrain_sample_count,
             examples_per_batch=args.unsup_pretraining_examples_per_batch,
@@ -507,7 +493,7 @@ if __name__ == "__main__":
     parser.add_argument("--unsup-pretraining-dataset","--unsup_pretraining_dataset",dest="unsup_pretraining_dataset",
         type=str,default="PreOP20261003",help="Prepared dataset name/path for unsupervised pretraining; defaults to PreOP20261003.")
     parser.add_argument("--unsup-pretraining-cache","--unsup_pretraining_cache",dest="unsup_pretraining_cache",
-        type=str,default="pretrain_data",help="Cache directory inside the unsupervised pretraining dataset (default: pretrain_data).")
+        type=str,default="pretrain_data",help="Input pickle or spectrum-store directory inside the unsupervised pretraining dataset (default: pretrain_data).")
     parser.add_argument("--combine-loss",type=str_to_bool,nargs="?",const=True,default=False,
         help=("If True, fine-tune with --loss_function plus "
               "--contrastive-loss-weight * SupConLoss. Mutually exclusive with pretraining."))

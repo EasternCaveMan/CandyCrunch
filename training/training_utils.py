@@ -1,5 +1,6 @@
 import copy
 import json
+import pickle
 import numpy as np
 import time
 import torch
@@ -16,8 +17,67 @@ from sklearn.metrics import f1_score, matthews_corrcoef
 from sklearn.exceptions import UndefinedMetricWarning
 import random
 from glycowork.ml.model_training import EarlyStopping, disable_running_stats, enable_running_stats
+
 warnings.filterwarnings("ignore", category = UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category = UserWarning, module = "sklearn")
+
+
+def load_dataset_inputs(source, targets=None, composition_vectors=None, default_composition=None, num_bins=2048):
+    """Load nine-field SimpleDataset inputs into memory from a pickle or sparse store.
+
+    Labeled inputs receive composition vectors in the training vocabulary's
+    order. Unlabeled inputs use their stored vectors or default_composition.
+    Existing sparse stores are densified here without memory mapping.
+    """
+    source = Path(source)
+    if source.is_file():
+        with source.open("rb") as file:
+            inputs = pickle.load(file)
+    else:
+        with (source / "manifest.json").open() as file:
+            manifest = json.load(file)
+        names = ["metadata", "bin_offsets", "bin_index", "bin_intensity", "bin_remainder"]
+        arrays = {name: np.load(source / f"{name}.npy") for name in names}
+        composition_path = source / "sample_compositions.npy"
+        sample_compositions = np.load(composition_path) if composition_path.exists() else None
+        inputs = []
+        for index, metadata in enumerate(arrays["metadata"]):
+            start, end = arrays["bin_offsets"][index:index + 2]
+            occupied = arrays["bin_index"][start:end]
+            mz = np.zeros(manifest["num_bins"], dtype=np.float32)
+            mz_r = np.zeros_like(mz)
+            mz[occupied] = arrays["bin_intensity"][start:end]
+            mz_r[occupied] = arrays["bin_remainder"][start:end] * manifest["remainder_scale"]
+            composition = None if sample_compositions is None else sample_compositions[index]
+            inputs.append((mz, mz_r, composition, int(metadata[0]), float(metadata[1]),
+                           *(int(value) for value in metadata[2:])))
+
+    if targets is not None and len(inputs) != len(targets):
+        raise ValueError(f"Feature/target length mismatch: {len(inputs)} != {len(targets)}")
+    if composition_vectors is not None:
+        if targets is None:
+            raise ValueError("targets are required with class composition_vectors.")
+        composition_vectors = np.asarray(composition_vectors, dtype=np.float32)
+    result = []
+    for index, sample in enumerate(inputs):
+        # build_training_pickles.py keeps unlabeled spectra sparse in eight-field tuples.
+        if len(sample) == 8:
+            sparse = sample[0]
+            occupied = np.asarray(sparse[0], dtype=np.intp)
+            mz = np.zeros(num_bins, dtype=np.float32)
+            mz_r = np.zeros_like(mz)
+            mz[occupied], mz_r[occupied] = sparse[1], sparse[2]
+            sample = (mz, mz_r, *sample[1:])
+        if len(sample) < 9:
+            raise ValueError(f"Expected nine input fields for sample {index}, got {len(sample)}.")
+        composition = (composition_vectors[int(targets[index])] if composition_vectors is not None
+                       else sample[2])
+        if composition is None or np.ndim(composition) == 0:
+            composition = default_composition
+        if composition is None:
+            raise ValueError("Inputs need composition vectors or default_composition.")
+        result.append((sample[0], sample[1], composition, *sample[3:9]))
+    return result
 
 
 def seed_worker(worker_id):
@@ -32,7 +92,7 @@ if torch.cuda.is_available():
 
 def calculate_class_distribution(dataloader, num_classes):
     """Calculate class distribution in a dataloader"""
-    targets = getattr(dataloader.dataset, "targets", None)
+    targets = getattr(dataloader.dataset, "y", None)
     if targets is not None:
         targets = np.asarray(targets, dtype=np.int64)
         valid_targets = targets[(targets >= 0) & (targets < num_classes)]
@@ -45,7 +105,7 @@ def calculate_class_distribution(dataloader, num_classes):
     total_samples = 0
 
     for data in dataloader:
-        y = data[-1].squeeze()
+        y = data[-1].reshape(-1)
         for label in y.cpu().numpy():
             if label < num_classes:
                 class_counts[int(label)] += 1
@@ -242,7 +302,7 @@ def _classifier_routing_wandb_payload(
 def prepare_batch(data, model_type):
 
     if model_type in {"CNN", "CNN2"}:
-        mz_list,_,mz_remainder,precursor,glycan_type,rt,mode_in,lc,modification,trap,y= data
+        mz_list,mz_remainder,precursor,glycan_type,rt,mode_in,lc,modification,trap,y= data
         mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
         inputs = [mz_features,precursor,glycan_type,rt,mode_in,lc,modification,trap]
         inputs = [x.to(device) for x in inputs]
