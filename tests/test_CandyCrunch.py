@@ -4,6 +4,7 @@ import base64
 import pathlib
 import sqlite3
 import struct
+import zipfile
 import zlib
 import hashlib
 import inspect
@@ -1493,7 +1494,13 @@ def test_thermo_raw(tmp_path):
     table = candycrunch.utils.read_raw_scan_table(str(path))
     assert table['ms_level'] == [1, 2, 2] and table['filter_string'] == ['', '1000.0000@cid35.00', '1000.5000@hcd30.00']
     assert table['precursor_mz'] == [None, 1000.0, 1000.02] and table['charge'] == [None, None, 2] and table['master_scan'] == [None, 1, 1]
-    assert table['scan_range'] == [(150.0, 2000.0)] * 3
+    assert table['scan_range'] == [(150.0, 2000.0)] * 3 and table['isolation_width'] == [None, 2.0, 2.0]
+    # A zero-filled copy, one cut before its run header and one cut before its scan index
+    raw = path.read_bytes()
+    for i, broken in enumerate([bytes(len(raw)), raw[:run_header], raw[:index]]):
+        (tmp_path / f'broken{i}.raw').write_bytes(broken)
+        with pytest.raises(ValueError, match = 'damaged or incomplete'):
+            candycrunch.utils.read_raw_scan_table(str(tmp_path / f'broken{i}.raw'))
     df = process_raw_stack(str(path), intensity = True, extract_ms1 = True)
     _, ms1_mzs, ms1_ints, _ = df.attrs['ms1']
     assert np.allclose(ms1_mzs, [1000.0]) and np.allclose(ms1_ints, [220])
@@ -1503,6 +1510,16 @@ def test_thermo_raw(tmp_path):
     assert np.allclose(list(df['peak_d'][0]), [600.2, 400.1]) and list(df['peak_d'][0].values()) == [100, 50]
     assert df['analyzer'].tolist() == ['linear'] * 2 and df['polarity'].tolist() == ['-'] * 2 and df['collision_energy'].tolist() == [35.0, 30.0]
     assert df['scan_low'].tolist() == [150.0] * 2 and df['header_shift'].tolist() == [0.0, 0.0]
+    # The same run uploaded as a zip archive reads the same; a zip of several runs names them
+    with zipfile.ZipFile(tmp_path / 'run.raw.zip', 'w') as archive:
+        archive.write(path, 'run.raw')
+    zipped = load_spectra_filepath(str(tmp_path / 'run.raw.zip'), extract_ms1 = True)
+    assert zipped.drop(columns = 'peak_d').equals(df.drop(columns = 'peak_d')) and zipped['peak_d'].tolist() == df['peak_d'].tolist()
+    with zipfile.ZipFile(tmp_path / 'runs.zip', 'w') as archive:
+        archive.write(path, 'a.raw')
+        archive.write(path, 'b.raw')
+    with pytest.raises(ValueError, match = 'holds 2 runs'):
+        load_spectra_filepath(str(tmp_path / 'runs.zip'))
 
 
 def test_qtof_mzml(tmp_path):
