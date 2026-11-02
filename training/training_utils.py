@@ -24,11 +24,64 @@ warnings.filterwarnings("ignore", category = UserWarning, module = "sklearn")
 
 
 class ResampledDataset(SimpleDataset):
-    # Each pooled input re-pooled from a random subset of its member spectra (k uniform in 1..n) every time it is drawn, as condense_dataframe pools a cluster:
-    # summed binned intensities, normalized, and the mean m/z remainder; an input without members (x[9], from build_training_pickles) stays as pooled. On
-    # 47.5k labels (2026-10-22) this served the pipeline better than training on the pooled inputs (harness DEV 0.743 vs 0.677 over two seeds) and kept their accuracy
+    """Use the stored pooled spectrum or its member spectra for training.
+
+    ``avg`` preserves the original random-subset pooling behavior. ``explode``
+    presents every stored member spectrum as a separate item with its parent's
+    label and metadata. Rows without members keep their stored pooled spectrum.
+    """
+
+    def __init__(self, x, y, transform_mz=None, transform_rt=None, resample_mode="avg"):
+        if resample_mode not in {"avg", "explode"}:
+            raise ValueError("resample_mode must be 'avg' or 'explode'.")
+        super().__init__(x, y, transform_mz=transform_mz, transform_rt=transform_rt)
+        self.resample_mode = resample_mode
+        self._source_y = np.asarray(y)
+        # Keep SimpleDataset's usual field conversion and transforms for each
+        # parent row, even when self.y is expanded for explode mode.
+        self._base_dataset = SimpleDataset(x, y, transform_mz=transform_mz, transform_rt=transform_rt)
+        self._exploded_indices = None
+
+        if resample_mode == "explode":
+            self._exploded_indices = []
+            expanded_targets = []
+            for row_index, sample in enumerate(self.x):
+                members = sample[9] if len(sample) > 9 else None
+                if members:
+                    for member_index in range(len(members)):
+                        self._exploded_indices.append((row_index, member_index))
+                        expanded_targets.append(self._source_y[row_index])
+                else:
+                    self._exploded_indices.append((row_index, None))
+                    expanded_targets.append(self._source_y[row_index])
+            self.y = np.asarray(expanded_targets, dtype=self._source_y.dtype)
+
+    def __len__(self):
+        if self.resample_mode == "explode":
+            return len(self._exploded_indices)
+        return super().__len__()
+
     def __getitem__(self, index):
-        out = super().__getitem__(index)
+        if self.resample_mode == "explode":
+            row_index, member_index = self._exploded_indices[index]
+            out = self._base_dataset[row_index]
+            if member_index is None:
+                return out
+
+            member = self.x[row_index][9][member_index]
+            mz = np.zeros(len(self.x[row_index][0]), dtype=np.float32)
+            mz_r = np.zeros_like(mz)
+            bins = member[0].astype(np.intp)
+            mz[bins] = member[1]
+            mz_r[bins] = member[2]
+            if mz.sum() <= 0:
+                return out
+            mz = mz / mz.sum()
+            if self.transform_mz:
+                mz = self.transform_mz(mz)
+            return (torch.FloatTensor(mz), torch.FloatTensor(mz_r)) + out[2:]
+
+        out = self._base_dataset[index]
         members = self.x[index][9] if len(self.x[index]) > 9 else None
         if members is None or len(members) < 2:
             return out

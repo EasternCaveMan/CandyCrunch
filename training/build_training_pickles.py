@@ -14,8 +14,8 @@ from glycowork.motif.processing import canonicalize_composition
 from glycowork.motif.graph import glycan_to_nxGraph
 from glycowork.motif.tokenization import glycan_to_composition
 
-train_dataset="full20261028"
-pretrain_dataset="Prefull20261028"
+train_dataset="full20261029"
+pretrain_dataset="Prefull20261029"
 cc_training_dir = Path("/home/daniel/vahid/CandyCrunch-vahid2/data_processing/Final_Results_cc")
 exclude_projects = set()               # GlycoPost_IDs left out of training and pretraining
 output_dir = Path(f"prepared_datasets_{train_dataset}")

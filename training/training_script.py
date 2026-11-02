@@ -166,12 +166,18 @@ def main(args):
     print("Preparing dataloaders")
     X_train = load_dataset_inputs(train_source, targets=y_train, composition_vectors=composition_vectors)
     X_test = load_dataset_inputs(val_source, targets=y_test, composition_vectors=composition_vectors)
-    trainset = ResampledDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
+    trainset = ResampledDataset(
+        X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt,
+        resample_mode=args.resample_dataset,
+    )
     valset = SimpleDataset(X_test, y_test)
 
     pretrain_trainset = None
     if args.sup_pretraining:
-        pretrain_trainset = ResampledDataset(X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt)
+        pretrain_trainset = ResampledDataset(
+            X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt,
+            resample_mode=args.resample_dataset,
+        )
     elif args.unsup_pretraining:
         unsup_pretrain_dir = resolve_prepared_dataset_dir(args.unsup_pretraining_dataset)
         unsup_pretrain_source = unsup_pretrain_dir / args.unsup_pretraining_cache
@@ -182,7 +188,8 @@ def main(args):
             default_composition=np.zeros(len(comp_vector_order), dtype=np.float32),
         )
         pretrain_trainset = ResampledDataset(X_pretrain, np.zeros(len(X_pretrain), dtype=np.int64),
-                                            transform_mz=transform_mz, transform_rt=transform_rt)
+                                            transform_mz=transform_mz, transform_rt=transform_rt,
+                                            resample_mode=args.resample_dataset)
 
 
     # ============================================================
@@ -221,7 +228,7 @@ def main(args):
     pretrain_valloader = None
     if args.sup_pretraining:
         pretrain_batch_sampler = ClassAwareContrastiveBatchSampler(
-            y_train,
+            pretrain_trainset.y,
             classes_per_batch=args.supcon_classes_per_batch,
             examples_per_class=args.supcon_examples_per_class,
             views_per_example=args.supcon_views_per_example,
@@ -334,7 +341,8 @@ def main(args):
             classifier_tag += (f"H{args.classifier_expert_hidden_dim}")
     else:
         classifier_tag = "ShCl"
-    setting_name = (f"{args.model}_{classifier_tag}_{args.split}{loss_tag}{pretraining_tag}{combine_loss_tag}_{args.dataset}")
+    resample_tag = "_Explode" if args.resample_dataset == "explode" else ""
+    setting_name = (f"{args.model}_{classifier_tag}_{args.split}{loss_tag}{pretraining_tag}{combine_loss_tag}{resample_tag}_{args.dataset}")
     pretrain_setting_name = setting_name if pretraining_enabled else None
     # ============================================================
     # Checkpoint metadata
@@ -399,7 +407,7 @@ def main(args):
         raise ValueError(f"Unknown fine-tuning loss_function={args.loss_function!r}.")
 
     wandb.init(
-        project="CandyCrunch_4",
+        project="CandyCrunch_5",
         entity=("vahid-atabaigielmi-university-of-gothenburg"),name=setting_name,save_code=True)
     # Runs with several seeds share one setting_name, so each seed gets its own folder instead of overwriting the previous seed's checkpoint and metrics
     model_dir = Path("./models") if len(args.random_seeds) == 1 else Path("./models") / f"seed{args.current_seed}"
@@ -473,6 +481,9 @@ if __name__ == "__main__":
     parser.add_argument("--dataset",type=str,required=True)
     parser.add_argument("--split", type=str,required=True)
     parser.add_argument("--model",type=str,required=True,choices=["CNN","CNN2"])
+    parser.add_argument("--resample-dataset", "--resample_dataset", dest="resample_dataset",
+        choices=["avg", "explode"], default="avg",
+        help="Training spectra mode: avg randomly re-pools member spectra (default); explode uses each member as a separate item.")
     # ============================================================
     # Training
     # ============================================================
