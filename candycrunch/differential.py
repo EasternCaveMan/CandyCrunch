@@ -37,23 +37,24 @@ def abundance_table(features, runs, motifs = False):
     return table.loc[order].rename_axis('glycan').reset_index(), counts.loc[order]
 
 
-def compare_groups(features, groups, pairs = None, motifs = False, transform = None, impute = True, min_samples = 0.1):
+def compare_groups(features, groups, pairs = None, motifs = False, transform = None, impute = True, min_samples = 0.1, covariates = None):
     """differential abundance between groups of runs of one batch: glycowork's get_differential_expression for two groups (moderated Welch's t-test,
     or paired, on log-ratio transformed abundances, with Benjamini-Hochberg correction at a sample-size adjusted alpha) and get_glycanova for three or
-    more (moderated one-way ANOVA with Tukey's post-hoc test); glycowork tests a glycan or motif not found in any run of a group on its detection
-    (Fisher's exact test) instead\n
+    more (moderated one-way ANOVA with Tukey's post-hoc test), or with covariates a linear model of group plus covariates (ANCOVA for three or more
+    groups); glycowork tests a glycan or motif not found in any run of a group on its detection (Fisher's exact test) instead\n
    | Arguments:
    | :-
    | features (dataframe): feature table of wrap_inference_batch (see abundance_table)
-   | groups (dict): group of each run, {run: group}; runs without a group (None or '') are left out; the first group named is the reference, so Log2FC is the second group over the first
+   | groups (dict): group of each run, {run: group}; runs without a group (None or '') or without glycan signal are left out; the first group named is the reference, so Log2FC is the second group over the first
    | pairs (dict): two groups only: the subject of each run, {run: subject}, for a paired test of runs of the same subject; default:None
    | motifs (bool): compare motifs (glycowork's known and exhaustive feature sets, counted on the features with a structure) instead of glycans; default:False
    | transform (string): 'CLR' or 'ALR'; default:None (glycowork chooses)
    | impute (bool): replace zeros by glycowork's biosynthetic imputation; default:True
-   | min_samples (float): share of runs a glycan has to be found in to be tested; default:0.1\n
+   | min_samples (float): share of runs a glycan has to be found in to be tested; default:0.1
+   | covariates (dict): a nuisance variable of each run, {run: value}, or several as {name: {run: value}} (such as secretor status, sex, age or batch; values that are all numbers are a slope, anything else a factor); the groups are compared within them; every compared run needs a value; not with pairs; default:None\n
    | Returns:
    | :-
-   | Returns a dictionary: groups (in order), members ({group: runs}), paired, motifs, table (glycowork's results, plus 'Mean in <group>' columns of measured abundance, 'Found in' (runs per group) and, for glycans, the number of features in each row), posthoc ({glycan: Tukey's table}, three or more groups), values (measured abundance in % per row and run, before imputation), input (the abundance table of the runs compared), test, alpha, transform, and log (what glycowork printed)
+   | Returns a dictionary: groups (in order), members ({group: runs}), left_out (runs without glycan signal, and their pairs), paired, covariates ({name: {run: value}}), motifs, table (glycowork's results, plus 'Mean in <group>' columns of measured abundance, 'Found in' (runs per group) and, for glycans, the number of features in each row), posthoc ({glycan: Tukey's table}, three or more groups), values (measured abundance in % per row and run, before imputation), input (the abundance table of the runs compared), test, alpha, transform, and log (what glycowork printed)
    """
     from glycowork.motif.analysis import get_differential_expression, get_glycanova
     from glycowork.motif.annotate import quantify_motifs
@@ -66,10 +67,18 @@ def compare_groups(features, groups, pairs = None, motifs = False, transform = N
     members = {g: [r for r, x in groups.items() if x == g] for g in names}
     if len(names) < 2:
         raise ValueError('Give the runs at least two groups to compare')
+    # a run without glycan signal (nothing found, or only excluded features) has no composition to compare, as its shares would be 0/0: it is left
+    # out, and with pairs its partner too
+    signal = abundance_table(features, [r for g in names for r in members[g]], motifs = motifs)[0]
+    empty = [r for g in names for r in members[g] if not (signal[r] > 0).any()]
+    lost = {(pairs or {}).get(r) for r in empty} - {None, ''}
+    empty += [r for g in names for r in members[g] if r not in empty and (pairs or {}).get(r) in lost]
+    members = {g: [r for r in members[g] if r not in empty] for g in names}
     small = [g for g in names if len(members[g]) < 2]
     if small:
-        raise ValueError(f'Every group needs at least two runs, to estimate its variance: {", ".join(small)} has one')
-    pairs = {r: p for r, p in (pairs or {}).items() if p and groups.get(r)}
+        counts = ', '.join(g + (' has one' if members[g] else ' has none') for g in small)
+        raise ValueError(f'Every group needs at least two runs with glycan signal, to estimate its variance: {counts}')
+    pairs = {r: p for r, p in (pairs or {}).items() if p and groups.get(r) and r not in empty}
     if pairs and len(names) > 2:
         raise ValueError('Pairs only work for two groups (a paired t-test); clear them to compare three or more groups')
     if pairs:
@@ -78,16 +87,32 @@ def compare_groups(features, groups, pairs = None, motifs = False, transform = N
             raise ValueError('For a paired comparison, every run needs a pair, and every pair one run in each group')
         members[names[1]] = [b[p] for p in a]
     runs = [r for g in names for r in members[g]]
+    named = covariates if covariates and all(isinstance(v, dict) for v in covariates.values()) else {'covariate': covariates or {}}
+    covariates = {name: {r: v for r, v in values.items() if r in runs and v not in (None, '')} for name, values in named.items()}
+    covariates = {name: values for name, values in covariates.items() if values}
+    if covariates and pairs:
+        raise ValueError('Pairs and covariates do not go together: a paired test already compares each subject with itself; clear one of them')
+    if covariates and not hasattr(stats, '_covariate_fit'):
+        raise ImportError('Comparing groups with covariates needs the current glycowork (from its dev branch)')
+    for name, values in covariates.items():
+        missing = [r for r in runs if r not in values]
+        if missing:
+            raise ValueError(f'Give every compared run a value for {name}, or none: {", ".join(missing[:5])}{" ..." if len(missing) > 5 else ""} have none')
+    # a covariate typed into a table arrives as text; one whose values are all numbers (an age) is a slope, anything else (a status, a batch) a factor
+    cov = pd.DataFrame({name: (lambda v: v if v.notna().all() else pd.Series(values))(pd.to_numeric(pd.Series(values), errors = 'coerce'))
+                        for name, values in covariates.items()}).loc[runs] if covariates else None
     table, counts = abundance_table(features, runs, motifs = motifs)
     log = io.StringIO()
+    if empty:
+        print(f'Left out, without glycan signal{" (or paired with such a run)" if lost else ""}: {", ".join(empty)}', file = log)
     with contextlib.redirect_stdout(log):
         if len(names) == 2:
             results = get_differential_expression(table, group1 = members[names[0]], group2 = members[names[1]], motifs = motifs, paired = bool(pairs),
-                                                  impute = impute, min_samples = min_samples, transform = transform, random_state = 0)
+                                                  impute = impute, min_samples = min_samples, transform = transform, random_state = 0, covariates = cov)
             posthoc = {}
         else:
             results, posthoc = get_glycanova(table, groups = [groups[r] for r in runs], motifs = motifs, impute = impute, min_samples = min_samples,
-                                             transform = transform, random_state = 0)
+                                             transform = transform, random_state = 0, covariates = cov)
         values = table.set_index('glycan')
         values = values / values.sum() * 100
         if motifs:
@@ -103,7 +128,7 @@ def compare_groups(features, groups, pairs = None, motifs = False, transform = N
     table_out['Found in'] = [', '.join(f'{g} {present.iloc[i][members[g]].sum()}/{len(members[g])}' for g in names) for i in range(len(table_out))]
     if not motifs:
         table_out['Features'] = counts.reindex(table_out['Glycan']).values
-    return {'groups': names, 'members': members, 'paired': bool(pairs), 'motifs': motifs, 'table': table_out,
+    return {'groups': names, 'members': members, 'left_out': empty, 'paired': bool(pairs), 'covariates': covariates, 'motifs': motifs, 'table': table_out,
             'posthoc': {k: pd.DataFrame(v).reset_index(drop = True) for k, v in posthoc.items()}, 'values': values.reindex(table_out['Glycan']),
             'input': table, 'test': attrs.get('test', ''), 'alpha': float(attrs.get('alpha', 0.05)), 'transform': attrs.get('transform', transform or ''),
             'log': log.getvalue()}
