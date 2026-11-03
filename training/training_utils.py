@@ -375,9 +375,24 @@ def _classifier_routing_wandb_payload(
 
     return payload
 
+def collate_tokenized_spectra(samples, tokenizer):
+    """Tokenize after each dataset item has been resampled and augmented."""
+    batch = torch.utils.data.default_collate(samples)
+    features = torch.stack(batch[:2], dim=1)
+    tokens = tokenizer.encode_spectra(features, metadata=tokenizer.metadata_from_batch(batch))
+    return (tokens, *batch[2:])
+
+
 def prepare_batch(data, model_type):
 
-    if model_type in {"CNN", "CNN2"}:
+    if model_type == "Transformer" and isinstance(data[0], dict):
+        tokens, precursor, glycan_type, rt, mode_in, lc, modification, trap, y = data
+        tokens = {key: value.to(device) for key, value in tokens.items()}
+        inputs = [tokens, *[value.to(device) for value in
+                           (precursor, glycan_type, rt, mode_in, lc, modification, trap)]]
+        return inputs, y.reshape(-1).to(device)
+
+    if model_type in {"CNN", "CNN2", "Transformer"}:
         mz_list,mz_remainder,precursor,glycan_type,rt,mode_in,lc,modification,trap,y= data
         mz_features = torch.stack([mz_list, mz_remainder], dim=1).to(device)
         inputs = [mz_features,precursor,glycan_type,rt,mode_in,lc,modification,trap]
@@ -385,7 +400,7 @@ def prepare_batch(data, model_type):
         y = y.reshape(-1).to(device)
 
     else:
-        raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN' or 'CNN2'.")
+        raise ValueError(f"Unknown model_type={model_type!r}. Expected 'CNN', 'CNN2', or 'Transformer'.")
     return inputs, y
 
 
@@ -440,13 +455,34 @@ def calculate_metrics_sklearn_from_classes(
 
 
 
+def forward_training_batch(model, inputs, needs_embeddings=False, return_routing=False):
+    """Normalize CNN, CNN2 and Transformer outputs, including gathered MoE losses."""
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    has_aux = callable(getattr(base_model, "get_classifier_aux_loss", None))
+    has_transformer_aux = callable(getattr(base_model, "get_transformer_aux_loss", None))
+    kwargs = {"rep": needs_embeddings}
+    if has_aux:
+        kwargs["return_aux_losses"] = True
+    if return_routing:
+        kwargs.update(return_routing=True, return_selected_logits=False)
+    output = model(*inputs, **kwargs)
+    values = list(output) if isinstance(output, tuple) else [output]
+    pred = values.pop(0)
+    embeddings = values.pop(0) if needs_embeddings else None
+    routing = values.pop(0) if return_routing else None
+    transformer_aux = values.pop(0) if has_transformer_aux else None
+    classifier_aux = values.pop(0) if has_aux else None
+    return pred, embeddings, routing, transformer_aux, classifier_aux
+
+
 def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_epochs=None,
                 patience=None, log_to_wandb=True, num_classes=None, model_type=True, setting_name=None,
                 classifier_moe_aux_loss_weight=0.0, checkpoint_metadata=None,
                 glycan_compositions=None, save_dir="./models",wandb_prefix=None,
-                contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,):
+                contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,
+                transformer_moe_aux_loss_weight=0.0):
     """
-    Train a CNN or CNN2 with SAM and optional CNN2 classifier MoE load balancing.
+    Train a CNN, CNN2 or Transformer with SAM and optional MoE load balancing.
 
     When contrastive_criterion is provided, fine-tuning optimizes the selected
     classification loss plus contrastive_loss_weight times supervised
@@ -471,7 +507,7 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     # Metrics
     # ============================================================
 
-    metric_names = ["loss","classification_loss","classifier_moe_aux_loss","accuracy","mcc","f1_macro","f1_weighted","top5_accuracy","top10_accuracy"]
+    metric_names = ["loss","classification_loss","classifier_moe_aux_loss","transformer_moe_aux_loss","accuracy","mcc","f1_macro","f1_weighted","top5_accuracy","top10_accuracy"]
     if contrastive_enabled:
         metric_names.append("contrastive_loss")
     metrics_dict = {"train": {name: [] for name in metric_names},"val": {name: [] for name in metric_names},"time_seconds": [],}
@@ -500,6 +536,11 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     uses_embedding_loss = getattr(criterion, "uses_embeddings", False)
     supports_aux_losses = callable(getattr(base_model, "get_classifier_aux_loss", None))
     classifier_moe_enabled = supports_aux_losses and getattr(base_model, "classifier_moe", False)
+    transformer_moe_enabled = (
+        callable(getattr(base_model, "get_transformer_aux_loss", None))
+        and getattr(base_model, "use_transformer_ff", False)
+        and getattr(base_model, "encoder_type", None) == "moe"
+    )
     classifier_routing_enabled = log_to_wandb and classifier_moe_enabled
     classifier_num_experts = (base_model.classifier_out.num_experts if classifier_routing_enabled else 0)
     classifier_routing_device = (next(base_model.parameters()).device if classifier_routing_enabled else None)
@@ -577,6 +618,7 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             running_loss = []
             running_classification_loss = []
             running_classifier_aux = []
+            running_transformer_aux = []
             running_contrastive_loss = []
             running_acc = []
             running_mcc = []
@@ -603,23 +645,13 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                     # FIRST FORWARD PASS
                     # =================================================
                     enable_running_stats(model)
+                    pred, embeddings, classifier_routing, transformer_aux_raw, classifier_aux_raw = forward_training_batch(
+                        model, inputs, needs_embeddings=needs_embeddings, return_routing=classifier_routing_enabled)
                     if classifier_routing_enabled:
-                        if needs_embeddings:
-                            pred,embeddings,classifier_routing,classifier_aux_raw = model(*inputs,rep=True,return_routing=True,return_aux_losses=True,return_selected_logits=False)
-                        else:
-                            pred,classifier_routing,classifier_aux_raw = model(*inputs,return_routing=True,return_aux_losses=True,return_selected_logits=False)
-                        _accumulate_classifier_routing(routing_class_sample_counts,routing_expert_selection_counts,routing_expert_responsibility_sums,y,classifier_routing)
-                        del classifier_routing
-                    elif supports_aux_losses:
-                        if needs_embeddings:
-                            pred,embeddings,classifier_aux_raw= model(*inputs,rep=True,return_aux_losses=True)
-                        else:
-                            pred,classifier_aux_raw= model(*inputs,return_aux_losses=True)
-                    else:
-                        if needs_embeddings:
-                            pred,embeddings = model(*inputs,rep=True)
-                        else:
-                            pred = model(*inputs)
+                        _accumulate_classifier_routing(
+                            routing_class_sample_counts, routing_expert_selection_counts,
+                            routing_expert_responsibility_sums, y, classifier_routing)
+                    del classifier_routing
                     classification_loss = criterion(embeddings if uses_embedding_loss else pred,y)
                     contrastive_loss = reduce_aux_loss(
                         contrastive_criterion(embeddings, y) if contrastive_enabled and phase == "train" else None,
@@ -632,7 +664,8 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                     # -------------------------------------------------
                     # Full training objective
                     # -------------------------------------------------
-                    total_loss = classification_loss
+                    transformer_aux = reduce_aux_loss(transformer_aux_raw if transformer_moe_enabled else None, classification_loss)
+                    total_loss = classification_loss + transformer_moe_aux_loss_weight * transformer_aux
                     if classifier_moe_enabled:
                         total_loss = total_loss + classifier_moe_aux_loss_weight * classifier_aux
                     if contrastive_enabled and phase == "train":
@@ -651,16 +684,8 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                         # SAM SECOND FORWARD PASS
                         # =================================================
                         disable_running_stats(model)
-                        if supports_aux_losses:
-                            if uses_embedding_loss or contrastive_enabled:
-                                pred_second,embeddings_second,classifier_aux_second_raw= model(*inputs,rep=True,return_aux_losses=True)
-                            else:
-                                pred_second,classifier_aux_second_raw= model(*inputs,return_aux_losses=True)
-                        else:
-                            if uses_embedding_loss or contrastive_enabled:
-                                pred_second,embeddings_second = model(*inputs,rep=True)
-                            else:
-                                pred_second = model(*inputs)
+                        pred_second, embeddings_second, _, transformer_aux_second_raw, classifier_aux_second_raw = forward_training_batch(
+                            model, inputs, needs_embeddings=uses_embedding_loss or contrastive_enabled)
                         classification_loss_second = (criterion(embeddings_second if uses_embedding_loss else pred_second,y))
                         contrastive_loss_second = reduce_aux_loss(
                             contrastive_criterion(embeddings_second, y) if contrastive_enabled else None,
@@ -677,7 +702,9 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                         # ---------------------------------------------
                         # Second SAM objective
                         # ---------------------------------------------
-                        loss_second = classification_loss_second
+                        transformer_aux_second = reduce_aux_loss(
+                            transformer_aux_second_raw if transformer_moe_enabled else None, classification_loss_second)
+                        loss_second = classification_loss_second + transformer_moe_aux_loss_weight * transformer_aux_second
                         if classifier_moe_enabled:
                             loss_second = loss_second + classifier_moe_aux_loss_weight * classifier_aux_second
                         if contrastive_enabled:
@@ -701,15 +728,17 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                 running_loss.append(loss.detach().item())
                 running_classification_loss.append(classification_loss.detach().item())
                 running_classifier_aux.append(classifier_aux.detach().item())
+                running_transformer_aux.append(transformer_aux.detach().item())
                 if contrastive_enabled:
                     running_contrastive_loss.append(contrastive_loss.detach().item())
                 # ====================================================
                 # Batch metrics
                 # ====================================================
-                hits = cand_mask[y].gather(1, pred.detach().topk(10, dim=1).indices).cumsum(dim=1) > 0
+                k = min(10, pred.shape[1])
+                hits = cand_mask[y].gather(1, pred.detach().topk(k, dim=1).indices).cumsum(dim=1) > 0
                 running_acc.append(hits[:, 0].float().mean().item())
-                running_topk.append(hits[:, 4].float().mean().item())
-                running_topk10.append(hits[:, 9].float().mean().item())
+                running_topk.append(hits[:, min(4, k - 1)].float().mean().item())
+                running_topk10.append(hits[:, -1].float().mean().item())
                 sklearn_metrics = calculate_metrics_sklearn_from_classes(pred_classes, y, num_classes, batch_size_small=True)
                 running_mcc.append(sklearn_metrics["mcc"])
                 running_f1_macro.append(sklearn_metrics["f1_macro"])
@@ -720,6 +749,7 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             epoch_loss = np.mean(running_loss)
             epoch_classification_loss = (np.mean(running_classification_loss))
             epoch_classifier_aux = (np.mean(running_classifier_aux) if running_classifier_aux else 0.0)
+            epoch_transformer_aux = np.mean(running_transformer_aux) if running_transformer_aux else 0.0
             epoch_contrastive_loss = (np.mean(running_contrastive_loss) if running_contrastive_loss else 0.0)
             epoch_acc = float(np.mean(running_acc))
             epoch_topk = float(np.mean(running_topk))
@@ -748,6 +778,8 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             message = ("{} " "Loss: {:.4f} " "Cls: {:.4f} " "C-MoE: {:.4f} " "Acc: {:.4f} " "MCC: {:.4f} " "F1-macro: {:.4f} " "F1-weighted: {:.4f} "
                 "Top-5: {:.4f} " "Top-10: {:.4f}").format(phase, epoch_loss, epoch_classification_loss, epoch_classifier_aux, epoch_acc, epoch_mcc_final,
                 epoch_f1_macro_final, epoch_f1_weighted_final, epoch_topk, epoch_topk10)
+            if transformer_moe_enabled:
+                message += f" T-MoE: {epoch_transformer_aux:.4f}"
             if contrastive_enabled:
                 message += f" SupCon: {epoch_contrastive_loss:.4f}"
             logging.info(message)
@@ -758,6 +790,7 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             if log_to_wandb:
                 wandb_payload = {f"{phase}/loss": epoch_loss, f"{phase}/classification_loss": epoch_classification_loss,
                     f"{phase}/classifier_moe_aux_loss": epoch_classifier_aux,
+                    f"{phase}/transformer_moe_aux_loss": epoch_transformer_aux,
                     f"{phase}/accuracy": epoch_acc, f"{phase}/mcc": epoch_mcc_final, f"{phase}/f1_score_macro": epoch_f1_macro_final,
                     f"{phase}/f1_score_weighted": epoch_f1_weighted_final, f"{phase}/top5_accuracy": epoch_topk, f"{phase}/top10_accuracy": epoch_topk10, "epoch": epoch,}
                 if contrastive_enabled:
@@ -772,6 +805,7 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             metrics_dict[phase]["loss"].append(float(epoch_loss))
             metrics_dict[phase]["classification_loss"].append(float(epoch_classification_loss))
             metrics_dict[phase]["classifier_moe_aux_loss"].append(float(epoch_classifier_aux))
+            metrics_dict[phase]["transformer_moe_aux_loss"].append(float(epoch_transformer_aux))
             if contrastive_enabled:
                 metrics_dict[phase]["contrastive_loss"].append(float(epoch_contrastive_loss))
             metrics_dict[phase]["accuracy"].append(float(epoch_acc.item() if hasattr(epoch_acc, "item") else epoch_acc))
@@ -812,6 +846,17 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     time_elapsed = (time.time() - since)
     print("Training complete in " "{:.0f}m {:.0f}s".format(time_elapsed // 60, time_elapsed % 60))
     print("Best val loss: {:4f}, " "best Accuracy score: {:.4f}".format(best_loss, best_acc))
+    # Persist the trained model before optional reporting/plotting can fail.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = output_dir / f"CandyCrunch_{setting_name}.pt"
+    checkpoint = dict(checkpoint_metadata or {})
+    checkpoint["state_dict"] = best_model_wts
+    checkpoint["best_val_loss"] = float(best_loss)
+    checkpoint["best_val_accuracy"] = float(best_acc)
+    checkpoint["classifier_moe_aux_loss_weight"] = float(classifier_moe_aux_loss_weight)
+    checkpoint["transformer_moe_aux_loss_weight"] = float(transformer_moe_aux_loss_weight)
+    torch.save(checkpoint, best_model_path)
+    print(f"Saved trained checkpoint: {best_model_path.resolve()}")
     # ================================================================
     # Save metrics
     # ================================================================
@@ -845,14 +890,6 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     # ================================================================
     # Save best model
     # ================================================================
-    best_model_path = output_dir / f"CandyCrunch_{setting_name}.pt"
-    checkpoint = dict(checkpoint_metadata or {})
-    checkpoint["state_dict"] = best_model_wts
-    checkpoint["best_val_loss"] = float(best_loss)
-    checkpoint["best_val_accuracy"] = (float(best_acc.item()) if hasattr(best_acc, "item") else float(best_acc))
-    # Save auxiliary-loss weights explicitly too.
-    checkpoint["classifier_moe_aux_loss_weight"] = float(classifier_moe_aux_loss_weight)
-    torch.save(checkpoint, best_model_path)
     # ================================================================
     # Final WandB logging
     # ================================================================

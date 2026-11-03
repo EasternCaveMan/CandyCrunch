@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 from candycrunch.model import CandyCrunch_CNN, CandyCrunch_CNN2
+from candycrunch.transformer import CandyCrunch_Transformer
 
 def load_checkpoint(model_path, device=None, temperature=1.15):
     """Return keyword arguments for prediction.wrap_inference or wrap_inference_batch.
@@ -21,6 +22,7 @@ def load_checkpoint(model_path, device=None, temperature=1.15):
     model_classes = {
         "CandyCrunch_CNN": CandyCrunch_CNN,
         "CandyCrunch_CNN2": CandyCrunch_CNN2,
+        "CandyCrunch_Transformer": CandyCrunch_Transformer,
     }
     model_class = checkpoint["model_class"]
     if model_class not in model_classes:

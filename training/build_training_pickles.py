@@ -13,7 +13,7 @@ from sklearn.model_selection import GroupShuffleSplit
 
 from glycowork.motif.graph import compare_glycans, glycan_to_nxGraph
 from glycowork.motif.tokenization import glycan_to_composition
-
+from glycowork.motif.processing import canonicalize_composition
 train_dataset="full20261029"
 pretrain_dataset="Prefull20261029"
 cc_training_dir = Path("/home/daniel/vahid/CandyCrunch-vahid2/data_processing/Final_Results_cc")
