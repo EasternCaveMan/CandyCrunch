@@ -2,6 +2,7 @@ import copy
 import json
 import pickle
 import numpy as np
+import pandas as pd
 import time
 import torch
 import wandb
@@ -21,6 +22,49 @@ from candycrunch.model import SimpleDataset
 
 warnings.filterwarnings("ignore", category = UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category = UserWarning, module = "sklearn")
+
+
+class RawPretrainingInputs:
+    """Keep CC spectra sparse, expanding only the requested row.
+
+    Unlabelled composition candidates do not have the training vocabulary's
+    vector order. Use the supplied unknown-composition vector instead.
+    """
+
+    def __init__(self, frame, default_composition, num_bins):
+        required = {"model_input", "RT2", "mode", "lc_type", "modification", "trap"}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(f"Raw pretraining inputs are missing columns: {sorted(missing)}")
+        if default_composition is None:
+            raise ValueError("Raw pretraining inputs require default_composition.")
+        columns = sorted(required | ({"glycan_types"} if "glycan_types" in frame else set()))
+        self.frame = frame[columns].reset_index(drop=True)
+        self.default_composition = np.asarray(default_composition, dtype=np.float32)
+        self.num_bins = num_bins
+
+    def __len__(self):
+        return len(self.frame)
+
+    def __getitem__(self, index):
+        if index >= len(self):
+            raise IndexError(index)
+        row = self.frame.iloc[index]
+        sparse = row["model_input"]
+        occupied = np.asarray(sparse[0], dtype=np.intp)
+        mz = np.zeros(self.num_bins, dtype=np.float32)
+        mz_r = np.zeros_like(mz)
+        mz[occupied], mz_r[occupied] = sparse[1], sparse[2]
+        types = row.get("glycan_types", [])
+        types = np.asarray(types).reshape(-1)
+        glycan_type = int(types[0]) if len(types) and np.all(types == types[0]) else 3
+        mode = {"positive": 0, "negative": 1}.get(row["mode"], row["mode"])
+        if mode not in (0, 1):
+            raise ValueError(f"Unknown ion mode at pretraining row {index}: {mode!r}")
+        return (mz, mz_r, self.default_composition, glycan_type, float(row["RT2"]),
+                int(mode), {"PGC": 0, "C18": 1}.get(row["lc_type"], 2),
+                {"reduced": 0, "permethylated": 1}.get(row["modification"], 2),
+                {"linear": 0, "orbitrap": 1, "amazon": 2}.get(row["trap"], 3))
 
 
 class ResampledDataset(SimpleDataset):
@@ -99,16 +143,21 @@ class ResampledDataset(SimpleDataset):
 
 
 def load_dataset_inputs(source, targets=None, composition_vectors=None, default_composition=None, num_bins=2048):
-    """Load SimpleDataset inputs and optional member spectra from a pickle or sparse store.
+    """Load prepared inputs, a raw CC pretraining DataFrame, or a sparse store.
 
     Labeled inputs receive composition vectors in the training vocabulary's
     order. Unlabeled inputs use their stored vectors or default_composition.
-    Existing sparse stores are densified here without memory mapping.
+    Raw CC DataFrames stay sparse until an item is requested and use the
+    supplied default composition. Existing prepared stores are densified here.
     """
     source = Path(source)
     if source.is_file():
         with source.open("rb") as file:
             inputs = pickle.load(file)
+        if isinstance(inputs, pd.DataFrame):
+            if targets is not None:
+                raise ValueError("Raw DataFrame inputs are supported for unlabelled pretraining only.")
+            return RawPretrainingInputs(inputs, default_composition, num_bins)
     else:
         with (source / "manifest.json").open() as file:
             manifest = json.load(file)
@@ -375,22 +424,7 @@ def _classifier_routing_wandb_payload(
 
     return payload
 
-def collate_tokenized_spectra(samples, tokenizer):
-    """Tokenize after each dataset item has been resampled and augmented."""
-    batch = torch.utils.data.default_collate(samples)
-    features = torch.stack(batch[:2], dim=1)
-    tokens = tokenizer.encode_spectra(features, metadata=tokenizer.metadata_from_batch(batch))
-    return (tokens, *batch[2:])
-
-
 def prepare_batch(data, model_type):
-
-    if model_type == "Transformer" and isinstance(data[0], dict):
-        tokens, precursor, glycan_type, rt, mode_in, lc, modification, trap, y = data
-        tokens = {key: value.to(device) for key, value in tokens.items()}
-        inputs = [tokens, *[value.to(device) for value in
-                           (precursor, glycan_type, rt, mode_in, lc, modification, trap)]]
-        return inputs, y.reshape(-1).to(device)
 
     if model_type in {"CNN", "CNN2", "Transformer"}:
         mz_list,mz_remainder,precursor,glycan_type,rt,mode_in,lc,modification,trap,y= data

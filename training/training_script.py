@@ -3,9 +3,7 @@ import warnings
 import argparse
 import random
 import hashlib
-import json
 import re
-from functools import partial
 from pathlib import Path
 import numpy as np
 import torch
@@ -26,14 +24,13 @@ import pandas as pd
 import wandb
 from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, SimpleDataset, transform_mz, transform_rt
 from candycrunch.transformer import CandyCrunch_Transformer
-from candycrunch.GlycoTransTokenizer import GlycoBertTokenizer
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
 from sklearn.metrics import pairwise_distances
 if __package__:
-    from .training_utils import ResampledDataset, collate_tokenized_spectra, load_dataset_inputs, seed_worker, train_model
+    from .training_utils import RawPretrainingInputs, ResampledDataset, load_dataset_inputs, seed_worker, train_model
 else:
-    from training_utils import ResampledDataset, collate_tokenized_spectra, load_dataset_inputs, seed_worker, train_model
+    from training_utils import RawPretrainingInputs, ResampledDataset, load_dataset_inputs, seed_worker, train_model
 
 warnings.filterwarnings("ignore",category=RuntimeWarning,module="sklearn.utils.extmath")
 
@@ -108,8 +105,6 @@ def main(args):
     pretraining_enabled = args.sup_pretraining or args.unsup_pretraining
     if args.sup_pretraining and args.unsup_pretraining:
         raise ValueError("Use either --sup-pretraining True or --unsup-pretraining True, not both.")
-    if pretraining_enabled and args.combine_loss:
-        raise ValueError("Use --sup-pretraining, --unsup-pretraining, or --combine-loss, not more than one.")
     if pretraining_enabled and args.pretraining_epochs < 1:
         raise ValueError("--pretraining-epochs must be at least 1 when pretraining is enabled.")
     if args.unsup_pretraining and args.unsup_pretraining_examples_per_batch < 1:
@@ -126,33 +121,7 @@ def main(args):
     # Load data
     # ============================================================
     dataset_dir = resolve_prepared_dataset_dir(args.dataset)
-    spectrum_tokenizer = None
-    vocabulary_tag = ""
-    if args.model == "Transformer":
-        vocabulary_path = (Path(args.vocabulary) if args.vocabulary else
-                           dataset_dir / f"tokenized_{args.split}_mz" / "vocabulary.json")
-        if not vocabulary_path.is_file():
-            raise FileNotFoundError(
-                f"Spectrum vocabulary not found: {vocabulary_path}. Generate it with "
-                f"python -m training.prepare_transformer_corpus --dataset {args.dataset} --split {args.split}, "
-                "or supply --vocabulary PATH."
-            )
-        spectrum_tokenizer = GlycoBertTokenizer.load_spectrum_vocabulary(
-            vocabulary_path, max_seq_length=args.max_seq_length)
-        if spectrum_tokenizer.word_format != "mz":
-            raise ValueError("Regenerate the vocabulary with --word-format mz; m/z:intensity words are no longer used for training.")
-        for name in ("min_mz", "max_mz", "mz_bin_size", "intensity_threshold"):
-            saved = getattr(spectrum_tokenizer, name)
-            requested = getattr(args, name)
-            if requested is not None and requested != saved:
-                raise ValueError(f"--{name.replace('_', '-')} disagrees with the saved vocabulary; regenerate the corpus with that setting.")
-            setattr(args, name, saved)
-        args.max_seq_length = spectrum_tokenizer.max_seq_length
-        args.vocabulary = str(vocabulary_path)
-        vocabulary_tag = hashlib.sha256(
-            json.dumps(spectrum_tokenizer.to_state(), sort_keys=True).encode()).hexdigest()[:10]
-        print(f"Loaded spectrum vocabulary: {vocabulary_path} ({spectrum_tokenizer.vocab_size} tokens)")
-    input_dim = spectrum_tokenizer.input_dim if spectrum_tokenizer is not None else 2048
+    input_dim = 2048
     train_source = dataset_dir / f"X_train_{args.split}.pkl"
     val_source = dataset_dir / f"X_test_{args.split}.pkl"
     if not train_source.is_file():
@@ -233,9 +202,11 @@ def main(args):
         )
     elif args.unsup_pretraining:
         unsup_pretrain_dir = resolve_prepared_dataset_dir(args.unsup_pretraining_dataset)
-        unsup_pretrain_source = unsup_pretrain_dir / args.unsup_pretraining_cache
+        unsup_pretrain_source = (unsup_pretrain_dir if unsup_pretrain_dir.is_file()
+                                else unsup_pretrain_dir / args.unsup_pretraining_cache)
         if not unsup_pretrain_source.exists():
             raise FileNotFoundError(f"Could not find unsupervised pretraining inputs: {unsup_pretrain_source}")
+        print(f"Loading unsupervised inputs from {unsup_pretrain_source}", flush=True)
         X_pretrain = load_dataset_inputs(
             unsup_pretrain_source,
             default_composition=np.zeros(len(comp_vector_order), dtype=np.float32),
@@ -256,11 +227,9 @@ def main(args):
             "pin_memory": pin_memory,
             "num_workers": num_workers,
         }
-        if spectrum_tokenizer is not None:
-            loader_kwargs["collate_fn"] = partial(collate_tokenized_spectra, tokenizer=spectrum_tokenizer)
         if batch_sampler is None:
             loader_kwargs.update(
-                batch_size=128,
+                batch_size=256,
                 shuffle=shuffle,
                 drop_last=shuffle,
                 generator=generator,
@@ -305,9 +274,19 @@ def main(args):
             views_per_example=args.unsup_pretraining_views_per_example,
             seed=args.current_seed + 1,
         )
-        pretrainloader = make_loader(pretrain_trainset, False, args.num_workers, train_generator, pretrain_batch_sampler)
-        pretrain_valloader = make_loader(pretrain_trainset, False, args.val_num_workers, val_generator, pretrain_val_batch_sampler)
-    trainloader = make_loader(trainset, True, args.num_workers, train_generator)
+        # Spawning workers would copy the entire raw DataFrame into each worker.
+        raw_inputs = isinstance(X_pretrain, RawPretrainingInputs)
+        pretrainloader = make_loader(pretrain_trainset, False, 0 if raw_inputs else args.num_workers, train_generator, pretrain_batch_sampler)
+        pretrain_valloader = make_loader(pretrain_trainset, False, 0 if raw_inputs else args.val_num_workers, val_generator, pretrain_val_batch_sampler)
+        if raw_inputs:
+            print(f"Raw pretraining pickle: {unsup_pretrain_source}; spectra expanded per item; workers=0")
+    # Repeated indices call the augmentation independently and guarantee a
+    # positive partner for every SupCon anchor, including singleton classes.
+    combined_batch_sampler = (UnlabeledContrastiveBatchSampler(
+        len(trainset), examples_per_batch=min(32, len(trainset)), views_per_example=2,
+        drop_last=False, seed=args.current_seed,
+    ) if args.combine_loss else None)
+    trainloader = make_loader(trainset, True, args.num_workers, train_generator, combined_batch_sampler)
     valloader = make_loader(valset, False, args.val_num_workers, val_generator)
     if args.sup_pretraining:
         pretrain_valloader = valloader
@@ -379,15 +358,23 @@ def main(args):
     else:
         pretraining_tag = ""
     combine_loss_tag = (f"_CombSupConW{args.contrastive_loss_weight:g}T{args.supcon_temperature:g}" if args.combine_loss else "")
-    model_kwargs = {"input_dim": input_dim,"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order)}
+    model_kwargs = {"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order)}
     model_class = CandyCrunch_CNN
+    if args.model == "CNN":
+        model_kwargs.update(input_dim=input_dim)
     if args.model == "CNN2":
         model_class = CandyCrunch_CNN2
         model_kwargs.update(
+            hidden_dim=args.hidden_dim,
             classifier_moe=args.classifier_moe,
             classifier_num_experts=args.classifier_num_experts,
             classifier_top_k=args.classifier_top_k,
             classifier_expert_hidden_dim=args.classifier_expert_hidden_dim,
+            norm_type=args.norm_type,
+            activation=args.activation,
+            encoder_activation=args.encoder_activation,
+            se=args.se,
+            se_reduction=args.se_reduction
         )
     elif args.model == "Transformer":
         model_class = CandyCrunch_Transformer
@@ -396,12 +383,10 @@ def main(args):
                         ff_dim = args.ff_dim,
                         peak_hidden_dim=resolve_transformer_peak_hidden_dim(args),
                         peak_encoder=args.peak_encoder,
-                        max_seq_length=args.max_seq_length,
+                        max_peaks = args.max_peaks,
                         min_mz=args.min_mz,
                         max_mz=args.max_mz,
-                        mz_bin_size=args.mz_bin_size,
                         intensity_threshold=args.intensity_threshold,
-                        tokenizer_state=spectrum_tokenizer.to_state(),
                         use_transformer_ff=args.use_transformer_ff,
                         encoder_type = args.encoder_type,
                         norm_type= args.norm_type,
@@ -421,26 +406,27 @@ def main(args):
     encoder_tag = ("NOFF" if not args.use_transformer_ff else (
         f"MoE{args.num_experts}K{args.moe_top_k}" if args.encoder_type == "moe" else "DENSE"))
     if args.classifier_moe:
-        classifier_tag = (f"{'MoE' if args.model == 'Transformer' else 'MoC'}{args.classifier_num_experts}K{args.classifier_top_k}")
+        classifier_tag = f"MoC'{args.classifier_num_experts}K{args.classifier_top_k}"
         if args.classifier_expert_hidden_dim is not None:
             classifier_tag += (f"H{args.classifier_expert_hidden_dim}")
     else:
         classifier_tag = "ShCl"
-    resample_tag = "_Explode" if args.resample_dataset == "explode" else ""
+
     dataset_tag = dataset_dir.name.removeprefix("prepared_datasets_")
     if args.model == "Transformer":
-        max_peak_tokens = args.max_seq_length - spectrum_tokenizer.metadata_prefix_length - 2
         setting_name = (f"{args.model}_{encoder_tag}_{classifier_tag}_{args.split}_H{args.nheads}L{args.nlayers}"
             f"PHD{resolve_transformer_peak_hidden_dim(args)}_{'FFD' + str(args.ff_dim) + '_' if args.ff_dim is not None else ''}"
-            f"MP{max_peak_tokens}_PE({args.peak_encoder})_N({args.norm_type})_ACT({args.activation})_FF({args.use_transformer_ff})_"
-            f"{loss_tag}{pretraining_tag}{combine_loss_tag}{resample_tag}_{dataset_tag}")
+            f"PE({args.peak_encoder})_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation}_FF({args.use_transformer_ff})"
+            f"{loss_tag}{pretraining_tag}{combine_loss_tag}_{args.resample_dataset}_{dataset_tag}")
+
+    elif args.model == "CNN2":
+        se_tag = f"ES{args.se}RS{args.se_reduction}" if args.se else str(args.se)
+        setting_name = (f"{args.model}2_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_{se_tag}"
+            f"{loss_tag}{pretraining_tag}{combine_loss_tag}_{args.resample_dataset}_{dataset_tag}")
     else:
         setting_name = (f"{args.model}_{classifier_tag}_{args.split}{loss_tag}"
-                        f"{pretraining_tag}{combine_loss_tag}{resample_tag}_{dataset_tag}")
-    setting_name = re.sub(r"[^A-Za-z0-9_.()-]", "_", setting_name)
-    if len(setting_name) > 200:
-        name_hash = hashlib.sha256(setting_name.encode()).hexdigest()[:10]
-        setting_name = setting_name[:189] + "_" + name_hash
+                        f"{pretraining_tag}{combine_loss_tag}_{args.resample_dataset}_{dataset_tag}")
+
     pretrain_setting_name = setting_name if pretraining_enabled else None
     # ============================================================
     # Checkpoint metadata
@@ -452,11 +438,7 @@ def main(args):
         "feature_columns": ["binned_intensities","mz_remainder","reducing_mass","glycan_type","RT","mode",
             "lc","modification","trap"],"training_args":vars(args).copy(),}
     if args.model == "Transformer":
-        checkpoint_metadata["vocabulary_hash"] = vocabulary_tag
-        checkpoint_metadata["spectrum_tokenization"] = (
-            "glycotrans_mz_numeric_peaks_v4" if spectrum_tokenizer.include_peak_values else
-            "glycotrans_metadata_mz_intensity_rank_v2" if spectrum_tokenizer.include_metadata
-            else "glycotrans_mz_intensity_rank_v1")
+        checkpoint_metadata["spectrum_encoding"] = "binned_intensity_ranked_peaks_v1"
     checkpoint_metadata["loss_function"] = args.loss_function
     checkpoint_metadata["combine_loss"] = bool(args.combine_loss)
     checkpoint_metadata["sup_pretraining"] = bool(args.sup_pretraining)
@@ -486,7 +468,7 @@ def main(args):
     def make_training_components(current_model, patience):
         # ReduceLROnPlateau only cuts the LR after lr_patience + 1 bad epochs, while EarlyStopping stops after patience bad epochs, so lr_patience must stay well below patience
         return training_setup(current_model,
-                              lr = 0.0001,
+                              lr = 0.005 if args.model == "Transformer" else 0.0001,
                               lr_patience = max(1, patience // 2 - 1),
                               factor=0.2,
                               weight_decay = 0.00002,
@@ -553,6 +535,10 @@ def main(args):
         checkpoint_metadata["pretraining_checkpoint"] = str(pretrain_model_path)
         checkpoint_metadata["pretraining_loss_function"] = pretrain_loss_name
         print(f"Loaded contrastive pretrained weights from {pretrain_model_path}")
+        # Release the large unlabelled DataFrame before fine-tuning.
+        pretrain_dataloaders = pretrainloader = pretrain_valloader = pretrain_trainset = None
+        if args.unsup_pretraining:
+            X_pretrain = None
 
     optimizer_ft, scheduler, _ = make_training_components(model, args.patience)
     criterion = make_finetuning_criterion()
@@ -582,13 +568,11 @@ def main(args):
 def build_parser():
     parser = argparse.ArgumentParser(description="CandyCrunch Model")
     # ============================================================
-    # Dataset
+    # Dataset and model type
     # ============================================================
     parser.add_argument("--dataset",type=str,required=True)
     parser.add_argument("--split", type=str,required=True)
     parser.add_argument("--model",type=str,required=True,choices=["CNN","CNN2","Transformer"])
-    parser.add_argument("--vocabulary", type=str, default=None,
-        help="Saved Transformer vocabulary. Default: DATASET/tokenized_SPLIT_mz/vocabulary.json.")
     parser.add_argument("--resample-dataset", "--resample_dataset", dest="resample_dataset",
         choices=["avg", "explode"], default="avg",
         help="Training spectra mode: avg randomly re-pools member spectra (default); explode uses each member as a separate item.")
@@ -610,12 +594,13 @@ def build_parser():
     parser.add_argument("--unsup-pretraining","--unsup_pretraining",dest="unsup_pretraining",type=str_to_bool,nargs="?",const=True,default=False,
         help="If True, run unsupervised contrastive pretraining on --unsup-pretraining-dataset first, then fine-tune with --loss_function (default: False).")
     parser.add_argument("--unsup-pretraining-dataset","--unsup_pretraining_dataset",dest="unsup_pretraining_dataset",
-        type=str,default="PreOP20261003",help="Prepared dataset name/path for unsupervised pretraining; defaults to PreOP20261003.")
+        type=str,default=str(Path(__file__).resolve().parents[1] / "data_processing" / "Final_Results_cc" / "Prefull20261031.pkl"),
+        help="Raw CC pretraining pickle, prepared dataset name, or prepared directory (default: data_processing/Final_Results_cc/Prefull20261031.pkl).")
     parser.add_argument("--unsup-pretraining-cache","--unsup_pretraining_cache",dest="unsup_pretraining_cache",
         type=str,default="pretrain_data",help="Input pickle or spectrum-store directory inside the unsupervised pretraining dataset (default: pretrain_data).")
-    parser.add_argument("--combine-loss",type=str_to_bool,nargs="?",const=True,default=False,
+    parser.add_argument("--combine-loss","--combine_loss",type=str_to_bool,nargs="?",const=True,default=False,
         help=("If True, fine-tune with --loss_function plus "
-              "--contrastive-loss-weight * SupConLoss. Mutually exclusive with pretraining."))
+              "--contrastive-loss-weight * SupConLoss using two augmented views per example. Can follow pretraining."))
     parser.add_argument("--contrastive-loss-weight","--contrastive_loss_weight",dest="contrastive_loss_weight",
         type=float,default=0.1,help="Weight for SupConLoss when --combine-loss is True (default: 0.1).")
     parser.add_argument("--pretraining-epochs",type=int,default=10,
@@ -632,7 +617,7 @@ def build_parser():
         help="Independent augmented views per original example for SupCon pretraining (default: 2).")
     parser.add_argument("--unsup-pretraining-examples-per-batch","--unsup_pretraining_examples_per_batch",
         dest="unsup_pretraining_examples_per_batch",type=int,default=128,
-        help="Original unlabeled spectra per unsupervised contrastive pretraining batch (default: 256).")
+        help="Original unlabeled spectra per unsupervised contrastive pretraining batch (default: 128).")
     parser.add_argument("--unsup-pretraining-views-per-example","--unsup_pretraining_views_per_example",
         dest="unsup_pretraining_views_per_example",type=int,default=2,
         help="Independent augmented views per unlabeled spectrum for unsupervised pretraining (default: 2).")
@@ -643,6 +628,15 @@ def build_parser():
     parser.add_argument("--persistent-workers",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--pin-memory",action=argparse.BooleanOptionalAction,default=None)
     parser.add_argument("--multiprocessing-context",choices=["spawn", "forkserver", "fork"],default="spawn")
+    # ============================================================
+    # CNN2
+    # ============================================================
+    parser.add_argument("--se","--se",type=str_to_bool,nargs="?",const=True,default=False,
+        help=("If True, use SE blocks."))
+    parser.add_argument("--se-reduction","--se-reduction",type=int,default=8,
+        help=("SE reduction factor."))
+    parser.add_argument("--hidden-dim","--hidden-dim",type=int,default=1024,
+        help=("Hidden dimension."))
     # ============================================================
     # Transformer
     # ============================================================
@@ -657,22 +651,17 @@ def build_parser():
     parser.add_argument( "--nlayers",type=int,default=2)
     parser.add_argument( "--ff_dim",type=int,default=256)
     parser.add_argument("--peak_hidden_dim",type=int,default=None,help=("Transformer model width. If omitted, it defaults to ff_dim//2 when ff_dim is given, otherwise nheads * 64."))
-    parser.add_argument("--max-seq-length", "--max_seq_length", type=int, default=None,
-        help="Spectrum sentence limit including CLS/SEP. Default: all input bins fit; 512 matches GlycoTrans's usual limit.")
-    parser.add_argument("--min-mz", type=float, default=None,
-        help="Optional check on the lower grid edge saved in the vocabulary.")
-    parser.add_argument("--max-mz", type=float, default=None,
-        help="Optional check on the upper grid edge saved in the vocabulary.")
-    parser.add_argument("--mz-bin-size", type=float, default=None,
-        help="Optional check on the m/z token bin size saved in the vocabulary.")
-    parser.add_argument("--intensity-threshold", type=float, default=None,
-        help="Optional check on the intensity threshold saved in the vocabulary.")
+    parser.add_argument("--max-peaks", "--max_peaks", "--max-seq-length", "--max_seq_length", dest = "max_peaks", type = int, default = None,
+        help = "Keep only the most intense peaks of each spectrum (without [CLS]). Default: all input bins fit; 512 matches GlycoTrans's usual limit.")
+    parser.add_argument("--min-mz", type = float, default = 39.714,
+        help = "First m/z edge of the input bin grid, linspace(min_mz, max_mz, 2048) (default: 39.714).")
+    parser.add_argument("--max-mz", type = float, default = 3000.0,
+        help = "Last m/z edge of the input bin grid (default: 3000).")
+    parser.add_argument("--intensity-threshold", type = float, default = 0.0,
+        help = "Minimum share of a spectrum's total intensity for a bin to count as a peak (default: 0 keeps every non-empty bin).")
     parser.add_argument("--use_transformer_ff",action=argparse.BooleanOptionalAction,default=True,help=(
             "Enable the Transformer feed-forward block. When disabled(--no-use_transformer_ff), the encoder uses attention only and ignores --encoder_type for the token FF path."))
     parser.add_argument("--encoder_type",type=str,default="dense",choices=["dense","moe"])
-    parser.add_argument("--norm_type",type=str,default="layer",choices=["layer","rms"])
-    parser.add_argument("--activation",type=str,default="leaky_relu", choices=["relu","gelu","leaky_relu","silu","elu"])
-    parser.add_argument( "--encoder_activation", default="gelu", choices=["relu", "gelu", "leaky_relu", "silu","elu"])
     # ============================================================
     # Token-level Transformer MoE
     # ============================================================
@@ -680,8 +669,11 @@ def build_parser():
     parser.add_argument("--moe_top_k", type=int,default=2, help=("Number of Transformer FFN experts selected per token."))
     parser.add_argument("--transformer_moe_aux_loss_weight", type=float,default=0.01,help=("Weight applied to the Transformer MoE load-balancing loss."))
     # ============================================================
-    # NEW: spectrum-level classifier MoE
+    # NEW: spectrum-level classifier MoE(CNN2 and Transformer)
     # ============================================================
+    parser.add_argument("--norm_type",type=str,default="layer",choices=["layer","rms"])
+    parser.add_argument("--activation",type=str,default="leaky_relu", choices=["relu","gelu","leaky_relu","silu","elu"])
+    parser.add_argument("--encoder_activation", default="leaky_relu", choices=["relu", "gelu", "leaky_relu", "silu", "elu"])
     parser.add_argument("--classifier_moe", action="store_true", help=("Replace the CNN2 or Transformer final classifier with a spectrum-level MoE classifier."))
     parser.add_argument("--classifier_num_experts",type=int,default=4,help=("Number of classifier experts."))
     parser.add_argument("--classifier_top_k",type=int,default=2,help=("Number of classifier experts selected for each spectrum."))

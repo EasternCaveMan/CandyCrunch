@@ -11,9 +11,6 @@ import torch
 import inspect
 # print(torch.__version__)
 # print(inspect.getsource(nn.TransformerEncoderLayer))
-from candycrunch.GlycoTransTokenizer import GlycoBertTokenizer
-
-
 
 # ============================================================
 # Normalization
@@ -495,44 +492,50 @@ class CandyTransformerEncoder(nn.Module):
 # ============================================================
 
 class CandyCrunch_Transformer(nn.Module):
-    def __init__(self, num_classes=None, input_precursor_dim=None, input_dim=2048,
-                 heads=4, layers=4, ff_dim=512, peak_hidden_dim=None, peak_dim=2,
-                 metadata_dim=24, dropout=0.2, use_transformer_ff=True,
-                 encoder_type="dense", norm_type="layer", activation="leaky_relu",
-                 encoder_activation="gelu", num_experts=4, moe_top_k=2, peak_encoder="linear",
-                 lambda_min=10 ** -2.5, lambda_max=10 ** 3.3,
-                 classifier_moe=False, classifier_num_experts=4, classifier_top_k=2,
-                 classifier_expert_hidden_dim=None, norm_first=True, encoder_final_norm=True,
-                 max_seq_length=None, min_mz=39.714, max_mz=3000.0,
-                 mz_bin_size=0.3, intensity_threshold=0.001, tokenizer_state=None):
+    def __init__(self,num_classes=None, input_precursor_dim=None, heads=None, layers=None, ff_dim=None, peak_dim=2,
+        metadata_dim=24, dropout=0.2, peak_encoder="linear", use_transformer_ff=True,
+        encoder_type="dense", norm_type="layer", activation="leaky_relu", encoder_activation="gelu",
+        peak_hidden_dim=None, lambda_min=10 ** -2.5, lambda_max=10 ** 3.3,
+         num_experts=4, moe_top_k=2, classifier_moe=True, classifier_num_experts=4,
+        classifier_top_k=2, classifier_expert_hidden_dim=None, norm_first=True,encoder_final_norm=True,
+        input_dim=2048, min_mz=39.714, max_mz=3000.0, max_peaks=None, intensity_threshold=0.0, patch_size=4):
         super().__init__()
-        if peak_hidden_dim is None:
-            peak_hidden_dim = ff_dim // 2 if ff_dim is not None else heads * 64
-        if peak_hidden_dim < 1 or peak_hidden_dim % heads:
-            raise ValueError("peak_hidden_dim must be positive and divisible by heads.")
-        self.peak_encoder = peak_encoder
+
+        if input_dim < 2 or max_mz <= min_mz:
+            raise ValueError("input_dim must be at least 2 and max_mz must exceed min_mz.")
+        if peak_dim != 2:
+            raise ValueError("Binned input uses peak_dim=2: m/z and intensity.")
+        if max_peaks is not None or intensity_threshold != 0.0:
+            raise ValueError("Fixed-bin input keeps every bin; use max_peaks=None and intensity_threshold=0.0.")
         self.input_dim = input_dim
-        self.use_transformer_ff = use_transformer_ff
+        self.min_mz = min_mz
+        self.max_mz = max_mz
+        # Same lower-edge grid used by CNN preprocessing; no learned positions needed.
+        self.register_buffer("bin_mz", torch.linspace(min_mz, max_mz, input_dim), persistent=False)
+
+        if heads is None or layers is None:
+            raise ValueError("heads and layers must be provided.")
+
+        if (use_transformer_ff and ff_dim is None):
+            raise ValueError("ff_dim must be provided use_transformer_ff=True.")
+
+        if peak_hidden_dim is None:
+            if ff_dim is not None:
+                peak_hidden_dim = ff_dim // 2
+            else:
+                peak_hidden_dim = heads * 64
+
+        if peak_hidden_dim % heads != 0:
+            raise ValueError(
+                f"peak_hidden_dim must be divisible by heads. Got peak_hidden_dim= {peak_hidden_dim}, heads={heads}."
+            )
+        self.peak_encoder = peak_encoder
+        self.use_transformer_ff = (use_transformer_ff)
         self.encoder_type = encoder_type
         self.norm_type = norm_type
         self.lambda_min = lambda_min
         self.lambda_max = lambda_max
-        self.classifier_moe = classifier_moe
-        self.tokenizer = GlycoBertTokenizer.for_spectra(input_dim=input_dim,
-                                                        max_seq_length=max_seq_length,
-                                                        min_mz=min_mz, max_mz=max_mz,
-                                                        mz_bin_size=mz_bin_size,
-                                                        intensity_threshold=intensity_threshold) if tokenizer_state is None else GlycoBertTokenizer.from_state(tokenizer_state)
-        if self.tokenizer.input_dim != input_dim:
-            raise ValueError("Saved vocabulary input_dim does not match the model input_dim.")
-        self.token_embedding = nn.Embedding(self.tokenizer.vocab_size,
-                                            peak_hidden_dim,
-                                            padding_idx=self.tokenizer.vocab[self.tokenizer.special_tokens["pad_token"]])
-        # GlycoTrans orders m/z tokens by intensity; these embeddings retain rank.
-        self.position_embedding = nn.Embedding(self.tokenizer.max_seq_length, peak_hidden_dim)
-        self.embedding_norm = make_norm(norm_type, peak_hidden_dim)
-        self.embedding_dropout = nn.Dropout(dropout)
-
+        self.classifier_moe = (classifier_moe)
         # ====================================================
         # Peak encoder
         # ====================================================
@@ -565,6 +568,20 @@ class CandyCrunch_Transformer(nn.Module):
 
         else:
             raise ValueError(f"Unknown peak_encode {peak_encoder!r}.Use 'linear' or 'fourier'.")
+        ##
+        # Token reduction: 2048 bin tokens -> 2048 / patch_size tokens
+        if input_dim % patch_size != 0:
+            raise ValueError(f"input_dim={input_dim} must be divisible by patch_size={patch_size}.")
+        self.patch_size = patch_size
+        if patch_size > 1:
+            # merges patch_size neighbouring bin embeddings into one token (no overlap)
+            self.token_reduce = nn.Conv1d(in_channels=peak_hidden_dim, out_channels=peak_hidden_dim,
+                                          kernel_size=patch_size, stride=patch_size)
+            self.token_reduce_norm = make_norm(norm_type, peak_hidden_dim)
+        else:
+            self.token_reduce = None
+        ##
+        self.cls_token = nn.Parameter(torch.zeros(1,1,peak_hidden_dim))
 
         encoder_layer = (CandyTransformerEncoderLayer(d_model=peak_hidden_dim,
                                                       nhead=heads,
@@ -626,6 +643,13 @@ class CandyCrunch_Transformer(nn.Module):
         angles = (2.0 * torch.pi * mz / wavelengths.view(1,1,half_dim))
         return torch.cat( [torch.sin(angles),torch.cos(angles)],dim=-1)
 
+    def encode_binned_spectrum(self, spectrum):
+        """Convert CNN [B, 2, bins] (intensity, remainder) to [B, bins, 2] (m/z, intensity)."""
+        if spectrum.ndim != 3 or spectrum.shape[1:] != (2, self.input_dim):
+            raise ValueError(f"Expected binned spectrum [batch, 2, {self.input_dim}].")
+        mz = self.bin_mz.to(dtype=spectrum.dtype) + spectrum[:, 1, :]
+        return torch.stack([mz, spectrum[:, 0, :]], dim=-1)
+
     def make_peak_embedding(self,peak_list):
         if self.peak_encoder == "linear":
             return self.peak_projection(peak_list)
@@ -643,14 +667,14 @@ class CandyCrunch_Transformer(nn.Module):
     def get_transformer_aux_loss(self):
         aux_loss = (self.transformer.get_aux_loss())
         if aux_loss is None:
-            return torch.tensor( 0.0,device=self.token_embedding.weight.device,dtype=self.token_embedding.weight.dtype)
+            return torch.tensor( 0.0,device=self.cls_token.device,dtype=self.cls_token.dtype)
         return aux_loss
     def get_classifier_aux_loss(self):
         if not self.classifier_moe:
-            return torch.tensor( 0.0,device=self.token_embedding.weight.device,dtype=self.token_embedding.weight.dtype)
+            return torch.tensor( 0.0,device=self.cls_token.device,dtype=self.cls_token.dtype)
         aux_loss = (self.classifier_out.get_aux_loss())
         if aux_loss is None:
-            return torch.tensor(0.0,device=self.token_embedding.weight.device,dtype=self.token_embedding.weight.dtype)
+            return torch.tensor(0.0,device=self.cls_token.device,dtype=self.cls_token.dtype)
         return aux_loss
 
     def get_aux_loss(self,transformer_weight=1.0,classifier_weight=1.0):
@@ -666,26 +690,21 @@ class CandyCrunch_Transformer(nn.Module):
         classifier_aux = (self.get_classifier_aux_loss())
         return transformer_weight * transformer_aux + classifier_weight * classifier_aux
 
-    def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap,
-                rep=False, return_routing=False, return_aux_losses=False, return_selected_logits=True,
-                return_transformer_routing=False):
-        """Classify the same binned inputs as the CNN models.
-
-        GlycoTrans m/z tokens and learned intensity-rank positions feed the
-        encoder; [CLS] is combined with the existing metadata features.
-        """
-        # Training batches are tokenized by the DataLoader after resampling.
-        # Raw binned tensors remain supported for inference and direct calls.
-        tokens = mz_features if isinstance(mz_features, dict) else self.tokenizer.encode_spectra(
-            mz_features, metadata={"glycan_type": glycan_type, "rt": rt, "mode": mode,
-                                   "lc": lc, "modification": modification, "trap": trap})
-        features = self.token_embedding(tokens["token_ids"]) + self.position_embedding(tokens["position_ids"])
-        if "peak_values" in tokens:
-            peak_embedding = self.make_peak_embedding(tokens["peak_values"].to(features.dtype))
-            features = features + peak_embedding.masked_fill(~tokens["peak_mask"].unsqueeze(-1), 0)
-        features = self.embedding_dropout(self.embedding_norm(features))
-        encoded = self.transformer(features, src_key_padding_mask=~tokens["attention_mask"])
-        spectrum_rep = encoded[:, 0, :]
+    def forward(self,mz_features,precursor,glycan_type,rt,mode,lc,modification,trap,
+        rep=False,return_routing=False,return_aux_losses=False,return_selected_logits=True):
+        """Use CNN binned inputs; optionally return classifier and transformer routes."""
+        peak_list = self.encode_binned_spectrum(mz_features)
+        peak_features = (self.make_peak_embedding(peak_list))
+        ##
+        if self.token_reduce is not None:
+            # Conv1d expects [B, channels, length]
+            peak_features = self.token_reduce(peak_features.transpose(1, 2))       # [B, D, 2048] -> [B, D, 512]
+            peak_features = self.token_reduce_norm(peak_features.transpose(1, 2))  # -> [B, 512, D]
+        cls_token = self.cls_token.expand(peak_features.size(0), -1, -1)
+        ##
+        peak_features = torch.cat([cls_token, peak_features], dim=1)
+        peak_features = self.transformer(peak_features)
+        spectrum_rep = peak_features[:, 0, :]
         glycan_type = (self.type_emb(glycan_type).squeeze(1))
         mode = (self.mode_emb(mode).squeeze(1))
         lc = (self.lc_emb(lc).squeeze(1))
@@ -695,7 +714,6 @@ class CandyCrunch_Transformer(nn.Module):
         rt = self.rt_block(rt)
         comb = torch.cat([spectrum_rep,precursor,glycan_type,rt,mode,lc,modification,trap],dim=1)
         comb_rep = (self.classifier_rep(comb))
-        routing = None
         if self.classifier_moe:
             if return_routing:
                 logits, routing = self.classifier_out(
@@ -713,7 +731,7 @@ class CandyCrunch_Transformer(nn.Module):
             transformer_aux = (self.get_transformer_aux_loss().reshape(1))
             classifier_aux = (self.get_classifier_aux_loss().reshape(1))
 
-        if return_routing and return_transformer_routing and self.use_transformer_ff and self.encoder_type == "moe":
+        if return_routing and self.use_transformer_ff and self.encoder_type == "moe":
             if routing is None:
                 routing = {}
             transformer_routing = []

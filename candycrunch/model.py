@@ -35,167 +35,28 @@ class SimpleDataset(torch.utils.data.Dataset):
             [glycan_type]), torch.FloatTensor([RT]), torch.LongTensor([mode]), torch.LongTensor([lc]), torch.LongTensor(
             [modification]), torch.LongTensor([trap]), torch.LongTensor([out])
 
-class ResUnit(nn.Module):
-    """Daniel new Change"""
-    def __init__(self, in_channels, size=3, dilation=1, causal=False, in_ln=True,
-                 se=False, se_reduction=8):
-        super(ResUnit, self).__init__()
-        self.size = size
-        self.dilation = dilation
-        self.causal = causal
-        self.in_ln = in_ln
-        # 1. InstanceNorm1d
-        self.se = se
-        if self.in_ln:
-            self.ln1 = nn.InstanceNorm1d(in_channels, affine=True)
-            self.ln1.weight.data.fill_(1.0)
-        # 2. Bottleneck 1×1 convolution, Reduces channels: C -> C/2
-        self.conv_in = nn.Conv1d(in_channels, in_channels // 2, 1)
-        # 3. InstanceNorm1d
-        self.ln2 = nn.InstanceNorm1d(in_channels // 2, affine=True)
-        self.ln2.weight.data.fill_(1.0)
-        # 4. Dilated Conv1D
-        # 5. Optional causal convolution, the padding part
-        padding = dilation * (size - 1) if causal else dilation * (size - 1) // 2
-        self.conv_dilated = nn.Conv1d( in_channels // 2, in_channels // 2, size, dilation=dilation, padding=padding)
-        # 6. InstanceNorm1d
-        self.ln3 = nn.InstanceNorm1d(in_channels // 2, affine=True)
-        self.ln3.weight.data.fill_(1.0)
-        # 7. Bottleneck 1×1 convolution, Restores channels: C/2 -> C
-        self.conv_out = nn.Conv1d(in_channels // 2, in_channels, 1)
-        if self.se:
-            se_hidden = max(in_channels // se_reduction, 1)
-            self.se_fc1 = nn.Conv1d(in_channels, se_hidden, 1)
-            self.se_fc2 = nn.Conv1d(se_hidden, in_channels, 1)
-    def forward(self, inp):
-        x = inp
-        if self.in_ln:
-            x = self.ln1(x)
-        x = nn.functional.leaky_relu(x)
-        x = nn.functional.leaky_relu(self.ln2(self.conv_in(x)))
-        x = self.conv_dilated(x)
-        if self.causal and self.size > 1:
-            x = x[:, :, :-self.dilation * (self.size - 1)]
-        x = nn.functional.leaky_relu(self.ln3(x))
-        x = self.conv_out(x)
-        if self.se:
-            s = x.mean(dim=2, keepdim=True) # (B, 64, L) -> (B, 64, 1)
-            s = nn.functional.leaky_relu(self.se_fc1(s)) # (B, 64, 1) -> (B, 8, 1)
-            s = torch.sigmoid(self.se_fc2(s)) # (B, 8, 1) -> (B, 64, 1)
-            x = x * s # (B, 64, L) -> (B, 64, L)
-        # 8. Residual connection
-        out = x + inp
-        return out
+
+# ============================================================
+# Normalization
+# ============================================================
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = (x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt())
+        return x * rms * self.weight
 
 
-class CandyCrunch_CNN2(nn.Module):
-    """Daniel new Change"""
-    def __init__( self, input_dim, num_classes=1, hidden_dim=512, input_precursor_dim=None, dropout=0.2,
-                  se=True, se_reduction=8, classifier_moe=False, classifier_num_experts=4,
-                  classifier_top_k=2, classifier_expert_hidden_dim=None):
-        super(CandyCrunch_CNN2, self).__init__()
+def make_norm(norm_type, dim):
+    if norm_type == "layer":
+        return nn.LayerNorm(dim)
 
-        self.input_dim = input_dim
-        self.classifier_moe = classifier_moe
-        self.type_emb = nn.Embedding(5, 24)
-        self.mode_emb = nn.Embedding(3, 24)
-        self.lc_emb = nn.Embedding(4, 24)
-        self.modification_emb = nn.Embedding(4, 24)
-        self.trap_emb = nn.Embedding(5, 24)
-        self.prec_block = nn.Sequential( nn.Linear(input_precursor_dim, 24), nn.LayerNorm(24), nn.LeakyReLU())
-        self.rt_block = nn.Sequential( nn.Linear(1, 24), nn.LayerNorm(24), nn.LeakyReLU())
-
-        self.res_block = nn.Sequential( nn.Conv1d(in_channels=2, out_channels=64, kernel_size=1),
-                                        nn.LeakyReLU(),
-                                        ResUnit(64, size=3, dilation=1, causal=False, se=se, se_reduction=se_reduction),
-                                        ResUnit(64, size=3, dilation=2, causal=False, se=se, se_reduction=se_reduction),
-                                        ResUnit(64, size=3, dilation=4, causal=False, se=se, se_reduction=se_reduction),
-                                        ResUnit(64, size=3, dilation=8, causal=False, se=se, se_reduction=se_reduction),
-                                        ResUnit(64, size=3, dilation=16, causal=False, se=se, se_reduction=se_reduction),
-                                        ResUnit(64, size=3, dilation=32, causal=False, se=se, se_reduction=se_reduction),
-                                        nn.AdaptiveMaxPool1d(102))
-        self.fc_dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(in_features=6528, out_features=1024)
-        self.comb_block1 = nn.Sequential(nn.Linear( 2 * hidden_dim + 24 + 24 + 24 + 24 + 24 + 24 + 24, 2 * 512,),
-                                         nn.LayerNorm(2 * 512),
-                                         nn.LeakyReLU(),
-                                         nn.Dropout(dropout))
-
-        self.comb_lin1 = nn.Linear(2 * 512, 2 * 256)
-        self.comb_block2 = nn.Sequential(nn.LayerNorm(2 * 256),
-                                         nn.LeakyReLU(),
-                                         nn.Dropout(dropout))
-
-        if classifier_moe:
-            self.classifier_out = MoEClassifier(input_dim=2 * 256,
-                                                num_classes=num_classes,
-                                                num_experts=classifier_num_experts,
-                                                top_k=classifier_top_k,
-                                                hidden_dim=classifier_expert_hidden_dim,
-                                                dropout=dropout,
-                                                activation="leaky_relu")
-        else:
-            self.comb_lin2 = nn.Linear(2 * 256, num_classes)
-
-    def get_classifier_aux_loss(self):
-        if not self.classifier_moe:
-            return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
-        aux_loss = self.classifier_out.get_aux_loss()
-        if aux_loss is None:
-            return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
-
-        return aux_loss
-
-    def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False,
-                return_routing=False, return_aux_losses=False, return_selected_logits=True):
-        glycan_type = self.type_emb(glycan_type).squeeze(1)
-        mode = self.mode_emb(mode).squeeze(1)
-        lc = self.lc_emb(lc).squeeze(1)
-        modification = self.modification_emb(modification).squeeze(1)
-        trap = self.trap_emb(trap).squeeze(1)
-        precursor = self.prec_block(precursor)
-        rt = self.rt_block(rt)
-        mz = self.res_block(mz_features)
-        mz = flatten(mz, start_dim=1)
-        mz = self.fc_dropout(mz)
-        mz = F.leaky_relu(self.fc1(mz))
-        comb = torch.cat([mz,precursor,glycan_type,rt,mode,lc,modification,trap],dim=1)
-        comb = self.comb_block1(comb)
-        comb_rep = self.comb_lin1(comb)
-        comb = self.comb_block2(comb_rep)
-
-        if self.classifier_moe:
-            if return_routing:
-                logits, routing = self.classifier_out(
-                    comb,
-                    return_routing=True,
-                    return_selected_logits=return_selected_logits,
-                )
-            else:
-                logits = self.classifier_out(comb)
-                routing = None
-        else:
-            logits = self.comb_lin2(comb)
-            routing = None
-
-        if return_aux_losses:
-            classifier_aux = (self.get_classifier_aux_loss().reshape(1))
-
-        if rep and return_routing and return_aux_losses:
-            return logits, comb_rep, routing, classifier_aux
-        if rep and return_routing:
-            return logits, comb_rep, routing
-        if rep and return_aux_losses:
-            return logits, comb_rep, classifier_aux
-        if rep:
-            return logits, comb_rep
-        if return_routing and return_aux_losses:
-            return logits, routing, classifier_aux
-        if return_routing:
-            return logits, routing
-        if return_aux_losses:
-            return logits, classifier_aux
-        return logits
+    if norm_type == "rms":
+        return RMSNorm(dim)
+    raise ValueError(f"Unknown norm_type={norm_type!r}. Use 'layer' or 'rms'.")
 # ============================================================
 # Activations
 # ============================================================
@@ -364,7 +225,210 @@ class MoEClassifier(nn.Module):
     def get_aux_loss(self):
         return self.last_aux_loss
 
+class ResUnit2(nn.Module):
+    """Daniel new Change"""
+    def __init__(self, in_channels, size=3, dilation=1, causal=False, in_ln=True,
+                 se=False, se_reduction=8, encoder_activation="leaky_relu"):
+        super(ResUnit2, self).__init__()
+        self.size = size
+        self.dilation = dilation
+        self.causal = causal
+        self.activation = make_activation(encoder_activation)
+        self.in_ln = in_ln
+        # 1. InstanceNorm1d
+        self.se = se
+        if self.in_ln:
+            self.ln1 = nn.InstanceNorm1d(in_channels, affine=True)
+            self.ln1.weight.data.fill_(1.0)
+        # 2. Bottleneck 1×1 convolution, Reduces channels: C -> C/2
+        self.conv_in = nn.Conv1d(in_channels, in_channels // 2, 1)
+        # 3. InstanceNorm1d
+        self.ln2 = nn.InstanceNorm1d(in_channels // 2, affine=True)
+        self.ln2.weight.data.fill_(1.0)
+        # 4. Dilated Conv1D
+        # 5. Optional causal convolution, the padding part
+        padding = dilation * (size - 1) if causal else dilation * (size - 1) // 2
+        self.conv_dilated = nn.Conv1d( in_channels // 2, in_channels // 2, size, dilation=dilation, padding=padding)
+        # 6. InstanceNorm1d
+        self.ln3 = nn.InstanceNorm1d(in_channels // 2, affine=True)
+        self.ln3.weight.data.fill_(1.0)
+        # 7. Bottleneck 1×1 convolution, Restores channels: C/2 -> C
+        self.conv_out = nn.Conv1d(in_channels // 2, in_channels, 1)
+        if self.se:
+            se_hidden = max(in_channels // se_reduction, 1)
+            self.se_fc1 = nn.Conv1d(in_channels, se_hidden, 1)
+            self.se_fc2 = nn.Conv1d(se_hidden, in_channels, 1)
+    def forward(self, inp):
+        x = inp
+        if self.in_ln:
+            x = self.ln1(x)
+        x = self.activation(x)
+        x = self.activation(self.ln2(self.conv_in(x)))
+        x = self.conv_dilated(x)
+        if self.causal and self.size > 1:
+            x = x[:, :, :-self.dilation * (self.size - 1)]
+        x = self.activation(self.ln3(x))
+        x = self.conv_out(x)
+        if self.se:
+            s = x.mean(dim=2, keepdim=True) # (B, 64, L) -> (B, 64, 1)
+            s = self.activation(self.se_fc1(s)) # (B, 64, 1) -> (B, 8, 1)
+            s = torch.sigmoid(self.se_fc2(s)) # (B, 8, 1) -> (B, 64, 1)
+            x = x * s # (B, 64, L) -> (B, 64, L)
+        # 8. Residual connection
+        out = x + inp
+        return out
 
+class CandyCrunch_CNN2(nn.Module):
+    """Daniel new Change"""
+    def __init__( self, num_classes=1, hidden_dim=1024, input_precursor_dim=None, dropout=0.2,
+                  se=None, se_reduction=None,norm_type=None,activation=None,encoder_activation=None, classifier_moe=False, classifier_num_experts=4,
+                  classifier_top_k=2, classifier_expert_hidden_dim=None):
+        super(CandyCrunch_CNN2, self).__init__()
+
+        self.classifier_moe = classifier_moe
+        self.type_emb = nn.Embedding(5, 24)
+        self.mode_emb = nn.Embedding(3, 24)
+        self.lc_emb = nn.Embedding(4, 24)
+        self.modification_emb = nn.Embedding(4, 24)
+        self.trap_emb = nn.Embedding(5, 24)
+        self.prec_block = nn.Sequential( nn.Linear(input_precursor_dim, 24), make_norm(norm_type,24),  make_activation(activation))
+        self.rt_block = nn.Sequential( nn.Linear(1, 24), make_norm(norm_type,24), make_activation(activation))
+
+        self.res_block = nn.Sequential( nn.Conv1d(in_channels=2, out_channels=64, kernel_size=1),
+                                        nn.LeakyReLU(),
+                                        ResUnit2(64, size=3, dilation=1, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
+                                        ResUnit2(64, size=3, dilation=2, causal=False, se=se, se_reduction=se_reduction,encoder_activation=encoder_activation ),
+                                        ResUnit2(64, size=3, dilation=4, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
+                                        ResUnit2(64, size=3, dilation=8, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
+                                        ResUnit2(64, size=3, dilation=16, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
+                                        ResUnit2(64, size=3, dilation=32, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
+                                        nn.AdaptiveMaxPool1d(102))#
+        # self.channel_reduce = nn.Conv1d(in_channels=64, out_channels=1, kernel_size=1)
+        self.fc_dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(in_features=6528, out_features=hidden_dim) #6528
+        self.comb_block1 = nn.Sequential(nn.Linear(hidden_dim + 24*7, hidden_dim//2),
+                                         make_norm(norm_type, hidden_dim//2),
+                                         make_activation(activation),
+                                         nn.Dropout(dropout))
+
+        # self.comb_lin1 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+        self.comb_block2 = nn.Sequential(make_norm(norm_type, hidden_dim//2),
+                                         make_activation(activation),
+                                         nn.Dropout(dropout))
+
+        if classifier_moe:
+            self.classifier_out = MoEClassifier(input_dim=hidden_dim//2,
+                                                num_classes=num_classes,
+                                                num_experts=classifier_num_experts,
+                                                top_k=classifier_top_k,
+                                                hidden_dim=classifier_expert_hidden_dim,
+                                                dropout=dropout,
+                                                activation="leaky_relu")
+        else:
+            self.comb_lin2 = nn.Linear(hidden_dim//2, num_classes)
+
+    def get_classifier_aux_loss(self):
+        if not self.classifier_moe:
+            return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
+        aux_loss = self.classifier_out.get_aux_loss()
+        if aux_loss is None:
+            return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
+
+        return aux_loss
+
+    def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False,
+                return_routing=False, return_aux_losses=False, return_selected_logits=True):
+        glycan_type = self.type_emb(glycan_type).squeeze(1)
+        mode = self.mode_emb(mode).squeeze(1)
+        lc = self.lc_emb(lc).squeeze(1)
+        modification = self.modification_emb(modification).squeeze(1)
+        trap = self.trap_emb(trap).squeeze(1)
+        precursor = self.prec_block(precursor)
+        rt = self.rt_block(rt)
+        mz = self.res_block(mz_features)
+        mz = flatten(mz, start_dim=1)
+        # mz = self.channel_reduce(mz)
+        # mz = mz.squeeze(1)
+        mz = self.fc_dropout(mz)
+        mz = F.leaky_relu(self.fc1(mz))
+        comb = torch.cat([mz,precursor,glycan_type,rt,mode,lc,modification,trap],dim=1)
+        comb = self.comb_block1(comb)
+        # comb_rep = self.comb_lin1(comb)
+        comb = self.comb_block2(comb)
+
+        if self.classifier_moe:
+            if return_routing:
+                logits, routing = self.classifier_out(
+                    comb,
+                    return_routing=True,
+                    return_selected_logits=return_selected_logits,
+                )
+            else:
+                logits = self.classifier_out(comb)
+                routing = None
+        else:
+            logits = self.comb_lin2(comb)
+            routing = None
+
+        if return_aux_losses:
+            classifier_aux = (self.get_classifier_aux_loss().reshape(1))
+
+        # if rep and return_routing and return_aux_losses:
+        #     return logits, comb_rep, routing, classifier_aux
+        # if rep and return_routing:
+        #     return logits, comb_rep, routing
+        # if rep and return_aux_losses:
+        #     return logits, comb_rep, classifier_aux
+        # if rep:
+        #     return logits, comb_rep
+        if return_routing and return_aux_losses:
+            return logits, routing, classifier_aux
+        if return_routing:
+            return logits, routing
+        if return_aux_losses:
+            return logits, classifier_aux
+        return logits
+
+
+#######################################################################################################################
+class ResUnit(nn.Module):
+
+    def __init__(self, in_channels, size = 3, dilation = 1, causal = False, in_ln = True):
+        super(ResUnit, self).__init__()
+        self.size = size
+        self.dilation = dilation
+        self.causal = causal
+        self.in_ln = in_ln
+        if self.in_ln:
+            self.ln1 = nn.InstanceNorm1d(in_channels, affine = True)
+            self.ln1.weight.data.fill_(1.0)
+        self.conv_in = nn.Conv1d(in_channels, in_channels // 2, 1)
+        self.ln2 = nn.InstanceNorm1d(in_channels // 2, affine = True)
+        self.ln2.weight.data.fill_(1.0)
+        self.conv_dilated = nn.Conv1d(in_channels // 2, in_channels // 2, size, dilation = self.dilation,
+                                      padding = ((dilation * (size - 1)) if causal else (dilation * (size - 1) // 2)))
+        self.ln3 = nn.InstanceNorm1d(in_channels // 2, affine = True)
+        self.ln3.weight.data.fill_(1.0)
+        self.conv_out = nn.Conv1d(in_channels // 2, in_channels, 1)
+
+    def forward(self, inp):
+        # Instance norms run as group norms with one channel per group (the same normalization, ~4x faster on CPU) and the convolutions as
+        # batched matrix products, the causal one as one product per tap on the shifted input (conv1d is slow for dilated kernel-2 convolutions)
+        n = inp.shape[0]
+        x = F.group_norm(inp, inp.shape[1], self.ln1.weight, self.ln1.bias, self.ln1.eps) if self.in_ln else inp
+        x = F.leaky_relu(x, inplace = self.in_ln)
+        x = torch.baddbmm(self.conv_in.bias[None, :, None], self.conv_in.weight[:, :, 0].expand(n, -1, -1), x)
+        x = F.leaky_relu(F.group_norm(x, x.shape[1], self.ln2.weight, self.ln2.bias, self.ln2.eps), inplace = True)
+        if self.causal:
+            w = self.conv_dilated.weight
+            y = torch.baddbmm(self.conv_dilated.bias[None, :, None], w[:, :, -1].expand(n, -1, -1), x)
+            for tap in range(self.size - 1):
+                shift = (self.size - 1 - tap) * self.dilation
+                y[:, :, shift:].baddbmm_(w[:, :, tap].expand(n, -1, -1), x[:, :, :-shift])
+        else:
+            y = self.conv_dilated(x)
+        x = F.leaky_relu(F.group_norm(y, y.shape[1], self.ln3.weight, self.ln3.bias, self.ln3.eps), inplace = True)
+        return torch.baddbmm(self.conv_out.bias[None, :, None], self.conv_out.weight[:, :, 0].expand(n, -1, -1), x).add_(inp)
 
 class CandyCrunch_CNN(torch.nn.Module):
 
@@ -376,7 +440,7 @@ class CandyCrunch_CNN(torch.nn.Module):
         self.mz_lin1 = torch.nn.Linear(input_dim, 2 * hidden_dim)  # not used
         self.prec_lin1 = torch.nn.Linear(input_precursor_dim, 24)
         self.rt_lin1 = torch.nn.Linear(1, 24)
-        self.comb_lin1 = torch.nn.Linear(2 * hidden_dim + 24 + 24 + 24 + 24 + 24 + 24 + 24, 2 * 512)
+        self.comb_lin1 = torch.nn.Linear(2*hidden_dim + 24*7, 2 * 512)
         self.comb_lin2 = torch.nn.Linear(2 * 512, 2 * 256)
         self.comb_lin3 = torch.nn.Linear(2 * 256, num_classes)
 
