@@ -398,6 +398,33 @@ def test_reducing_end_check(capsys):
     assert len(reduced) >= 15 and all(len(set(outs[m]['top1_pred'].dropna()) & reduced) >= 0.8 * len(reduced) for m in ['custom', '2AB'])
 
 
+def test_filter_out_is_airtight():
+    # A residue the user ignores stays out of every route to a structure, also the no-prediction rescue and impute
+    df = wrap_inference(str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx'), 'O', filter_out = {'HexA', 'Neu5Ac'})
+    assert not any('Neu5Ac' in p[0] for preds in df['predictions'] for p in (preds or []))
+
+
+def test_search_options_keep_the_checks(tmp_path):
+    # Without imputation and database search a run only loses what those two add: domain_filter still runs, so a [M+HCO3]- three times stronger than its [M-H]- is
+    # folded into that row and listed at its m/z
+    example = str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx')
+    off = {'supplement': False, 'experimental': False}
+    with_search, without = wrap_inference(example, 'O'), wrap_inference(example, 'O', **off)
+    assert 'adduct' in without.columns
+    assert {stringify_dict(c) for c in without['composition']} <= {stringify_dict(c) for c in with_search['composition']}
+    single = without[without['charge'] == -1]
+    mz, rt = single['num_spectra'].idxmax(), single.loc[single['num_spectra'].idxmax(), 'RT']
+    spectra = pd.read_excel(example)
+    plain = spectra[(np.abs(spectra['m/z'] - mz) < 0.3) & (np.abs(spectra['RT'] - rt) < 1)]
+    shift = mass_dict['HCO3-'] + PROTON_MASS
+    adduct = plain.assign(**{'m/z': plain['m/z'] + shift, 'intensity': plain['intensity'] * 3, 'scan': plain['scan'] + 1000000})
+    path = tmp_path / 'adduct.xlsx'
+    pd.concat([spectra, adduct], ignore_index = True).sort_values('RT').to_excel(path, index = False)
+    out = wrap_inference(str(path), 'O', **off)
+    assert (np.abs(out.index.values - mz) < 0.1).any() and not (np.abs(out.index.values - mz - shift) < 0.1).any()
+    assert out.loc[np.abs(out.index.values - mz) < 0.1, 'num_spectra'].max() > without.loc[mz, 'num_spectra']
+
+
 def test_onnx_model_matches_torch():
     # The built app runs the weights of model.py's CandyCrunch_CNN on ONNX Runtime: same logits as PyTorch, also for a norm scale below zero (which cannot
     # be folded into the convolution after it), and the same predictions for the example run
@@ -486,6 +513,62 @@ def test_quantification_synthetic(result_collector):
     result_collector.add_result({'test_dict': {'name': 'synthetic_quant'}, 'supplement': True, 'experimental': True, 'format': 'quant'}, score)
     result_collector.check_performance('synthetic_quant', ('synthetic_quant', True, True, 'quant'), score, pd.concat(designs))
     assert score > 0.6
+
+
+def test_anion_adduct_quantification():
+    # A neutral glycan's [M+HCO3-H]2- follows its [M-2H]2- and counts for its abundance, whichever got MS2, so a row that read it as the formate adduct of the
+    # composition with a Hex for its Fuc goes; [M+2HCO3]2- stays out, and a sialylated glycan shows none
+    assert [i[2] for i in anion_adduct_ions([2, 1], 'HCO3-')] == ['[M+HCO3-H]2-', '[M+HCO3]-'] and [i[2] for i in anion_adduct_ions([3], 'Formate')] == ['[M+Formate-2H]3-', '[M+2Formate-H]3-']
+    fucosylated = 'Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc'
+    sialylated = 'Neu5Ac(a2-3)Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Neu5Ac(a2-3)Gal(b1-4)GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc'
+    isobar = 'Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Gal(b1-4)GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc'
+    m_fuc, m_sia = [composition_to_mass(get_comp(g), modification = 'reduced') for g in (fucosylated, sialylated)]
+    bicarbonate = mass_dict['HCO3-'] + PROTON_MASS
+    ion = lambda m, n: (m + n * bicarbonate - 2 * PROTON_MASS) / 2
+    rts = np.arange(10, 30, 0.05)
+    shape = lambda apex: np.exp(-0.5 * ((rts - apex) / 0.12) ** 2)
+    peaks = [(ion(m_fuc, 0), 4e6 * shape(20)), (ion(m_fuc, 1), 2e6 * shape(20)), (ion(m_fuc, 2), 1e6 * shape(20)), (ion(m_sia, 0), 8e6 * shape(22))]
+    scans = [sorted((mz + j * ISOTOPE_SPACING / 2, trace[i] * 0.5 ** j) for mz, trace in peaks for j in range(4)) for i in range(len(rts))]
+    ms1 = (rts, np.array([m for scan in scans for m, _ in scan], dtype = np.float32), np.array([x for scan in scans for _, x in scan], dtype = np.float32),
+           np.cumsum([0] + [len(scan) for scan in scans]).astype(np.int64))
+    row = lambda mz, g, rt, adduct: {'m/z': mz, 'predictions': [(g, 0.9)], 'composition': get_comp(g), 'num_spectra': 5, 'charge': -2, 'RT': rt, 'rel_abundance': 1e6, 'top_fragments': [731.0, 1113.0],
+                                     'peak_d': {731.0: 100.0, 1113.0: 50.0}, 'annotation_score': 12.0, 'evidence': 'strong', 'adduct': adduct, 'top1_pred': g}
+    rows = pd.DataFrame([row(ion(m_fuc, 0), fucosylated, 20.0, None), row(ion(m_sia, 0), sialylated, 22.0, None), row(ion(m_fuc, 1), isobar, 20.0, 'Formate')]).set_index('m/z')
+    out, _ = finalise_predictions(rows, False, 'negative', 'reduced', None, 300, 1.0, glycan_class = 'N', ms1 = ms1, accurate_ms1 = True, xic_details = True)
+    assert out.attrs['run_anion'] == 'HCO3-' and sorted(out['top1_pred']) == sorted([fucosylated, sialylated])
+    fuc = out[out['top1_pred'] == fucosylated].iloc[0]
+    assert {o['ion'] for d in fuc['xic'] for o in d['others'] if o['ion']} == {'[M+HCO3-H]2-'}
+    # The summed envelopes of both glycans have the same width: 4 + 2 against 8
+    assert abs(fuc['rel_abundance'] / out['rel_abundance'].sum() - 6 / 14) < 0.03
+    # Without the anion, as in a run whose neutral glycans do not show it, only its own ion counts
+    out, _ = finalise_predictions(rows.drop(rows.index[2]), False, 'negative', 'reduced', None, 300, 1.0, glycan_class = 'N', ms1 = ms1, accurate_ms1 = True, run_anion = False)
+    assert abs(out[out['top1_pred'] == fucosylated]['rel_abundance'].iat[0] / out['rel_abundance'].sum() - 4 / 12) < 0.03
+
+
+def test_main_adduct(capsys):
+    from candycrunch.prediction import RUN_ADDUCTS, RUN_ANION, get_adduct_list, report_main_adduct
+    RUN_ANION.set('HCO3-')
+    assert get_adduct_list('negative') == ['HCO3-', 'Acetate', 'Formate'] and get_adduct_list('positive') == ['Na+', 'K+', 'NH4+']
+    RUN_ANION.set(None)
+    assert get_adduct_list('negative') == ['Acetate', 'Formate', 'HCO3-']
+    with pytest.raises(ValueError, match = 'run_anion'):
+        wrap_inference('spectra.mzML', 'N', run_anion = 'Na+')
+    RUN_ANION.set(None)
+    RUN_ADDUCTS.set(('Na+',))
+    report_main_adduct('run', [pd.DataFrame({'adduct': ['[M+Na]+', '[M+2Na]2+', None]})])
+    assert 'Na+ as main adduct: 2 of 3 peak(s)' in capsys.readouterr().out
+    report_main_adduct('run', [pd.DataFrame({'adduct': [None, '[M+K+H]2+']})])
+    assert 'the main adduct set' in capsys.readouterr().out
+    # An anion's report needs what MS1 integrated
+    RUN_ADDUCTS.set(())
+    RUN_ANION.set('HCO3-')
+    table = pd.DataFrame({'xic': [[{'others': [{'ion': '[M+HCO3-H]2-'}]}], [{'others': []}]]})
+    report_main_adduct('run', [table])
+    assert capsys.readouterr().out == ''
+    table.attrs['run_anion'] = 'HCO3-'
+    report_main_adduct('run', [table])
+    assert 'HCO3- as main adduct: 1 of 2 peak(s)' in capsys.readouterr().out
+    RUN_ANION.set(None)
 
 
 @pytest.mark.parametrize("quant_set", list(QUANT_SETS))

@@ -17,11 +17,12 @@ def build_parser():
     parser.add_argument('--glycan_class', help='Glycan class, or several measured together in one run (e.g. N O)', type=str, nargs='+', choices=['O', 'N', 'free', 'lipid'], required=True)
     parser.add_argument('--mode', help='negative/positive mode', type=str, choices=['negative', 'positive'], required=False)
     parser.add_argument('--max_charge', help='Maximum absolute precursor charge to consider', type=int, required=False)
-    parser.add_argument('--modification', help='Reducing-end modification: reduced (alditol), reduced_D (NaBD4), unreduced (free reducing end), a label, benzyl (benzyl glycoside), or custom: a label of --mass_tag Da', type=str, choices=['reduced', 'reduced_D', 'unreduced', '2AA', '2AB', 'procainamide', 'PA', 'APTS', 'aminoxyTMT', 'GirardP', 'benzyl', 'custom'], required=False)
+    parser.add_argument('--modification', help='Reducing-end modification: reduced (alditol), reduced_D (NaBD4), unreduced (free reducing end), a label, benzyl (benzyl glycoside), glycolate or lactate (O-glycans released oxidatively, on the glycolic acid of their Ser or the lactic acid of their Thr), or custom: a label of --mass_tag Da; several for glycans of several reducing ends side by side (e.g. glycolate lactate), the first being the run\'s own', type=str, nargs='+', choices=['reduced', 'reduced_D', 'unreduced', '2AA', '2AB', 'procainamide', 'PA', 'APTS', 'aminoxyTMT', 'GirardP', 'benzyl', 'glycolate', 'lactate', 'custom'], required=False)
     parser.add_argument('--mass_tag', help='Mass in Da of a --modification custom label', type=float, required=False)
     parser.add_argument('--sample_prep', help='Sample preparation', type=str, choices=['underivatized', 'permethylated', 'deuteropermethylated', 'peracetylated'], required=False)
     parser.add_argument('--sialic_derivatization', help='Linkage-specific sialic acid derivatization of underivatized samples (or of samples permethylated after it): EE (ethyl esterification), EEA (ethyl esterification + amidation), ME (methyl esterification), DMA (dimethylamidation), SALSA, GQ (glycoqueuing: aniline on every sialic acid, which tells no linkage), GQ-d5 (d5-aniline on a2-6, d0 on a2-3)', type=str, choices=['EE', 'EEA', 'ME', 'DMA', 'SALSA', 'GQ', 'GQ-d5'], required=False)
     parser.add_argument('--adducts', help='Ions that carry the charge of the precursors in place of protons, e.g. Li+ for lithium salts in the mobile phase; the usual adducts (Na+, K+, NH4+ or acetate, formate, HCO3-) are always considered', type=str, nargs='+', required=False)
+    parser.add_argument('--run_anion', help='Anion of the mobile phase in negative mode: read before the other anion adducts, and its adduct ions count for abundances; default: all are considered, and with survey scans the anion neutral glycans show counts', type=str, choices=['HCO3-', 'Formate', 'Acetate'], required=False)
     parser.add_argument('--reducing_end_variants', help='Other reducing ends the glycans may carry: free (glycans that escaped reduction or labelling, counted for their glycan), ethyl_glycoside (rows of their own), glycosylamine (PA glycans whose label was not reduced, counted for their glycan), glycosylaminitol (reduced N-glycans that were glycosylamines when reduced, counted for their glycan); default: free, plus ethyl_glycoside for lipid, glycosylamine for PA and glycosylaminitol for reduced N-glycans; give none of them to turn this off', type=str, nargs='*', choices=['free', 'ethyl_glycoside', 'glycosylamine', 'glycosylaminitol'], required=False)
     parser.add_argument('--lc', help='LC type', type=str, choices=['PGC', 'C18', 'other'], required=False)
     parser.add_argument('--trap', help='Mass analyzer of the MS2 spectra (the survey scan analyzer is read from the file); the instrument stored in the file overrides it', type=str, choices=['linear', 'orbitrap', 'amazon', 'other'], required=False)
@@ -65,13 +66,15 @@ def main(argv=None):
         parser.error(f"not found: {', '.join(missing)}")
     if len(filepaths) > 1 and args.intra_cat_thresh is None:
         parser.error('--intra_cat_thresh is required when processing several files')
-    if (args.mass_tag is not None) != (args.modification == 'custom'):
+    # One reducing end is that end, several side by side a list (the first being the run's own, which --mass_tag belongs to)
+    ends = args.modification or []
+    if (args.mass_tag is not None) != (ends[:1] == ['custom']):
         parser.error('--mass_tag and --modification custom go together (glycans with a free reducing end: --modification unreduced)')
     if args.max_charge == 0:
         parser.error('--max_charge has to be at least 1 (the ion mode is set by --mode)')
     # wrap_inference takes a free reducing end as a custom label without mass, as the app does
-    if args.modification == 'unreduced':
-        args.modification = 'custom'
+    ends = ['custom' if m == 'unreduced' else m for m in ends]
+    args.modification = (ends[0] if len(ends) == 1 else ends) if ends else None
     args_dict = {k:v for k, v in vars(args).items() if v is not None and k not in ('spectra_filepath', 'output', 'mode', 'filter_out', 'plot_glycans', 'intra_cat_thresh', 'top_n_isomers', 'n_jobs')}
     # wrap_inference takes the ion mode from the sign of max_charge
     if args.mode or args.max_charge:
@@ -82,6 +85,7 @@ def main(argv=None):
         args_dict['reducing_end_variants'] = {k: v for k, v in {'free': 0, 'ethyl glycoside': 'C2H4', 'glycosylamine': 'C5H4N2-O', 'glycosylaminitol': 'NH3-O'}.items() if k.replace(' ', '_') in args.reducing_end_variants}
     # Imported only now: it loads the model, which --help and argument errors do not need, and every process of --n_jobs imports this module again
     from candycrunch.prediction import wrap_inference, wrap_inference_batch
+    from candycrunch.references import add_references
     if len(filepaths) == 1:
         tables = [(args.output, wrap_inference(filepaths[0], n_jobs=args.n_jobs, **args_dict))]
     else:
@@ -97,7 +101,7 @@ def main(argv=None):
             if 'ms3' in df_out.columns:
                 df_out['ms3'] = [[(round(p, 4), {round(float(mz), 4): float(f'{i:.4g}') for mz, i in d.items()}) for p, d in x] if isinstance(x, list) else x for x in df_out['ms3']]
         # Per-file tables are indexed by m/z; the combined feature table has a plain row index that is not worth writing
-        df_flat = df_out.reset_index() if df_out.index.name else df_out
+        df_flat = add_references(df_out.reset_index() if df_out.index.name else df_out)
         if path.endswith('.csv'):
             df_flat.to_csv(path, index=False)
         if args.plot_glycans and 'top1_pred' in df_flat.columns:
