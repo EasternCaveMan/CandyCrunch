@@ -304,18 +304,14 @@ class CandyCrunch_CNN2(nn.Module):
                                         ResUnit2(64, size=3, dilation=32, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
                                         nn.AdaptiveMaxPool1d(102))#
         # self.channel_reduce = nn.Conv1d(in_channels=64, out_channels=1, kernel_size=1)
-        self.fc_dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(in_features=6528, out_features=hidden_dim) #6528
+        self.fc1 = nn.Sequential(nn.Linear(in_features=6528, out_features=hidden_dim),
+                                 make_norm(norm_type, hidden_dim),
+                                 make_activation(activation),
+                                 nn.Dropout(dropout)) #6528
         self.comb_block1 = nn.Sequential(nn.Linear(hidden_dim + 24*7, hidden_dim//2),
                                          make_norm(norm_type, hidden_dim//2),
                                          make_activation(activation),
                                          nn.Dropout(dropout))
-
-        # self.comb_lin1 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
-        self.comb_block2 = nn.Sequential(make_norm(norm_type, hidden_dim//2),
-                                         make_activation(activation),
-                                         nn.Dropout(dropout))
-
         if classifier_moe:
             self.classifier_out = MoEClassifier(input_dim=hidden_dim//2,
                                                 num_classes=num_classes,
@@ -323,16 +319,27 @@ class CandyCrunch_CNN2(nn.Module):
                                                 top_k=classifier_top_k,
                                                 hidden_dim=classifier_expert_hidden_dim,
                                                 dropout=dropout,
-                                                activation="leaky_relu")
+                                                activation=make_activation(activation))
         else:
             self.comb_lin2 = nn.Linear(hidden_dim//2, num_classes)
 
+    # def get_classifier_aux_loss(self):
+    #     if not self.classifier_moe:
+    #         return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
+    #     aux_loss = self.classifier_out.get_aux_loss()
+    #     if aux_loss is None:
+    #         return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
+    #
+    #     return aux_loss
+
     def get_classifier_aux_loss(self):
         if not self.classifier_moe:
-            return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
+            return self.fc1[0].weight.new_zeros(())
+
         aux_loss = self.classifier_out.get_aux_loss()
+
         if aux_loss is None:
-            return torch.tensor(0.0,device=self.fc1.weight.device,dtype=self.fc1.weight.dtype)
+            return self.fc1[0].weight.new_zeros(())
 
         return aux_loss
 
@@ -349,12 +356,10 @@ class CandyCrunch_CNN2(nn.Module):
         mz = flatten(mz, start_dim=1)
         # mz = self.channel_reduce(mz)
         # mz = mz.squeeze(1)
-        mz = self.fc_dropout(mz)
-        mz = F.leaky_relu(self.fc1(mz))
+        mz = self.fc1(mz)
         comb = torch.cat([mz,precursor,glycan_type,rt,mode,lc,modification,trap],dim=1)
         comb = self.comb_block1(comb)
         # comb_rep = self.comb_lin1(comb)
-        comb = self.comb_block2(comb)
 
         if self.classifier_moe:
             if return_routing:
