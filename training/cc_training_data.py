@@ -150,20 +150,26 @@ def run_settings(row):
     return settings
 
 
-def taxonomy(species):
+def taxonomy(species, glycan_class = None):
     # Candidate compositions from the glycans of the run's kingdom when its species are no mammals (wrap_inference's default Mammalia lacks many
-    # compositions of other animals); species unknown to glycowork count by their genus
-    from glycowork.glycan_data.loader import df_species
-    taxa = df_species.drop_duplicates('Species').set_index('Species')[['Genus', 'Class', 'Kingdom']]
+    # compositions of other animals); species unknown to glycowork count by their genus. A kingdom without glycans of the run's class (glycowork has no
+    # free glycans of Chromista, the kingdom of brown algae) would leave wrap_inference no candidates at all: its domain's glycans then
+    from glycowork.glycan_data.loader import df_glycan, df_species
+    taxa = df_species.drop_duplicates('Species').set_index('Species')[['Genus', 'Class', 'Kingdom', 'Domain']]
     found = []
     for s in (species or '').split(';'):
         s = s.strip()
         hit = taxa.loc[s] if s in taxa.index else taxa[taxa['Genus'] == s.split('_')[0]].head(1).squeeze(axis = 0) if (taxa['Genus'] == s.split('_')[0]).any() else None
         if hit is not None and len(hit):
-            found.append((hit['Class'], hit['Kingdom']))
-    if not found or all(c == 'Mammalia' for c, _ in found) or len({k for _, k in found}) > 1:
+            found.append((hit['Class'], hit['Kingdom'], hit['Domain']))
+    if not found or all(c == 'Mammalia' for c, _, _ in found) or len({k for _, k, _ in found}) > 1:
         return {}
-    return dict(taxonomy_level = 'Kingdom', taxonomy_filter = found[0][1])
+    _, kingdom, domain = found[0]
+    if glycan_class is not None:
+        of_class = df_glycan[df_glycan.glycan_type.isin([glycan_class] if isinstance(glycan_class, str) else list(glycan_class))]
+        if not of_class['Kingdom'].apply(lambda x: kingdom in x).any():
+            return dict(taxonomy_level = 'Domain', taxonomy_filter = domain) if of_class['Domain'].apply(lambda x: domain in x).any() else {}
+    return dict(taxonomy_level = 'Kingdom', taxonomy_filter = kingdom)
 
 
 def rescue_masses(mapping, settings):
@@ -215,7 +221,8 @@ def convert_run(task):
         except Exception:
             pass
     try:
-        settings = dict(run_settings(task['row']), **taxonomy(task['row'].get('Species') if isinstance(task['row'].get('Species'), str) else None))
+        settings = dict(run_settings(task['row']), **taxonomy(task['row'].get('Species') if isinstance(task['row'].get('Species'), str) else None,
+                                                             task['glycan_class']))
         ends = task['mapping']['reducing_end'] if task['mapping'] is not None and 'reducing_end' in task['mapping'].columns else pd.Series(dtype = object)
         if len(ends) and ends.notna().all() and ends.nunique() == 1 and ends.iloc[0] in REDUCING_ENDS:
             settings['modification'] = ends.iloc[0]
