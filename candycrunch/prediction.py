@@ -172,6 +172,48 @@ def unactivated(filter_string):
     return bool(stage) and not any(float(e) for e in re.findall(r'@[a-z]+([\d.]+)', stage[-1][1]))
 
 
+def averaged_precursor_mz(ms1, rt, mz, charge, averaged = 6, isotope_spacing = ISOTOPE_SPACING):
+    """the monoisotopic m/z of a peptide-like precursor from its survey scans, after Monocle (Rad et al. 2021): the scans around it summed, the offset of -3 to +1 isotope steps whose
+    envelope best fits a peptide averagine (5% better than the lighter offsets before it), and the intensity-weighted m/z there\n
+    | Arguments:
+    | :-
+    | ms1 (tuple): flat MS1 data from process_mzML_stack, (rts sorted ascending, mzs, intensities, scan offsets)
+    | rt (float): retention time of the precursor
+    | mz (float): its m/z as the instrument reported it
+    | charge (int): its charge
+    | averaged (int): survey scans summed on either side; default:6
+    | isotope_spacing (float): spacing of the isotopes; default:ISOTOPE_SPACING\n
+    | Returns:
+    | :-
+    | Returns the refined m/z
+    """
+    from scipy.stats import binom
+    rts, mzs, ints, offsets = ms1
+    center = max(int(np.searchsorted(rts, rt)) - 1, 0)
+    steps = np.arange(-4, 8)
+    total, weighted = np.zeros(len(steps)), np.zeros(len(steps))
+    for scan in range(max(center - averaged, 0), min(center + averaged + 1, len(rts) - 1)):
+        scan_mz, scan_int = mzs[offsets[scan]:offsets[scan + 1]], ints[offsets[scan]:offsets[scan + 1]]
+        for j, step in enumerate(steps):
+            target = mz + step * isotope_spacing / charge
+            lo, hi = np.searchsorted(scan_mz, target * (1 - 1e-5)), np.searchsorted(scan_mz, target * (1 + 1e-5), side = 'right')
+            if hi > lo:
+                k = lo + int(np.argmax(scan_int[lo:hi]))
+                total[j] += scan_int[k]
+                weighted[j] += scan_mz[k] * scan_int[k]
+    expected = np.concatenate([[0.0], binom.pmf(np.arange(6), int((mz - PROTON_MASS) * charge / 111 * 5.1), 0.011)])
+    best, offset = -1.0, 0
+    for step in (-3, -2, -1, 0, 1):
+        j = step + 4
+        observed = np.concatenate([[total[j - 1]], total[j:j + 6]])
+        if observed.sum() > 0:
+            fit = float(observed.dot(expected) / (np.linalg.norm(observed) * np.linalg.norm(expected)))
+            if fit > best * 1.05:
+                best, offset = fit, step
+    j = offset + 4
+    return weighted[j] / total[j] if total[j] > 0 else mz + offset * isotope_spacing / charge
+
+
 def refine_precursor_mz(ms1, mzs, rts, scans, refine, mz_tolerance = 0.3, isotope_tolerance = 0.25, min_explained = 0.7, charges = None, isolation_mz = False,
                         max_lighter = None, walk_charges = (1, 2)):
     """moves precursor m/z values the instrument never refined onto the monoisotopic centroid of their survey scan\n
@@ -1429,6 +1471,54 @@ def anion_adduct_ions(charges, anion):
             for z in charges for k in range(1, max(z, 2))]
 
 
+def ion_trace(ms1, mz, rt, half_width = 0.75, ppm = 7.0):
+    """an ion's extracted chromatogram around a retention time: the highest peak within its m/z window, per survey scan\n
+    | Arguments:
+    | :-
+    | ms1 (tuple): flat MS1 data from process_mzML_stack, (rts sorted ascending, mzs, intensities, scan offsets)
+    | mz (float): m/z of the ion
+    | rt (float): retention time at the trace's center
+    | half_width (float): minutes on either side; default:0.75
+    | ppm (float): half-width of the m/z window in ppm; default:7.0\n
+    | Returns:
+    | :-
+    | Returns an array with one intensity per survey scan
+    """
+    rts, mzs, ints, offsets = ms1
+    first, last = np.searchsorted(rts, rt - half_width), min(np.searchsorted(rts, rt + half_width), len(rts) - 1)
+    out = np.zeros(max(last - first, 0))
+    for n, scan in enumerate(range(first, last)):
+        scan_mz = mzs[offsets[scan]:offsets[scan + 1]]
+        lo, hi = np.searchsorted(scan_mz, mz * (1 - ppm * 1e-6)), np.searchsorted(scan_mz, mz * (1 + ppm * 1e-6), side = 'right')
+        if hi > lo:
+            out[n] = ints[offsets[scan]:offsets[scan + 1]][lo:hi].max()
+    return out
+
+
+def coeluting_lighter_ion(ms1, mz, charge, rt, mass_delta, min_height = 0.02, min_r = 0.8):
+    """whether an ion has a partner mass_delta lighter at the same charge that co-elutes with it, as an adduct has its protonated form\n
+    | Arguments:
+    | :-
+    | ms1 (tuple): flat MS1 data from process_mzML_stack, (rts sorted ascending, mzs, intensities, scan offsets)
+    | mz (float): monoisotopic m/z of the ion
+    | charge (int): its charge
+    | rt (float): its retention time
+    | mass_delta (float): how much lighter the partner is, in Da
+    | min_height (float): lowest apex of the partner, as a share of the ion's apex; default:0.02
+    | min_r (float): lowest correlation of the two traces; default:0.8\n
+    | Returns:
+    | :-
+    | Returns True if such a partner is there
+    """
+    hit = ion_trace(ms1, mz, rt)
+    if len(hit) < 5 or hit.max() <= 0:
+        return False
+    partner = ion_trace(ms1, mz - mass_delta / charge, rt)
+    if partner.max() < min_height * hit.max() or (partner > 0).sum() < 3:
+        return False
+    return bool(np.corrcoef(hit, partner)[0, 1] >= min_r)
+
+
 def extract_xic_areas(ms1, target_mzs, rt_centers, charges = None, rt_window = 1.0, mz_tolerance = 0.5, search_window = 0,
                       isotopes = 3, weights = None, mz_calibration = None, glycans = None, sample_prep = 'underivatized', other_charges = None, mode = 'negative',
                       details = None, adduct_ions = None):
@@ -1509,16 +1599,20 @@ def extract_xic_areas(ms1, target_mzs, rt_centers, charges = None, rt_window = 1
             apex_rts[t], apex_ints[t] = rts[apex], ints_arr[apex]
         else:
             apex = np.argmin(np.abs(rts - rt_centers[t]))
-        # Climb to the top of the peak the precursor sits on, then walk down both flanks to a valley (splitting co-eluting isomers), 1% of the peak height, or rt_window
+        # Climb to the top of the peak the precursor sits on, then walk down both flanks to a valley (splitting co-eluting isomers), 1% of the peak height, or rt_window.
+        # On the top 30% of a peak a rise of up to 10% above the lowest point so far is ripple, not a valley, as it cut flat-topped peaks (an overloaded column) short
         while 0 < apex < len(smooth) - 1 and max(smooth[apex - 1], smooth[apex + 1]) > smooth[apex]:
             apex += 1 if smooth[apex + 1] > smooth[apex - 1] else -1
         baseline = np.percentile(ints_arr, 10)
         cut = baseline + 0.01 * (smooth[apex] - baseline)
-        left, right = apex, apex
-        while left > 0 and rts[apex] - rts[left - 1] <= rt_window and smooth[left - 1] <= smooth[left] and smooth[left] > cut:
+        left, right, top, low = apex, apex, baseline + 0.7 * (smooth[apex] - baseline), smooth[apex]
+        while left > 0 and rts[apex] - rts[left - 1] <= rt_window and (smooth[left - 1] <= smooth[left] or (low >= top and smooth[left - 1] <= 1.1 * low)) and smooth[left] > cut:
             left -= 1
-        while right < len(smooth) - 1 and rts[right + 1] - rts[apex] <= rt_window and smooth[right + 1] <= smooth[right] and smooth[right] > cut:
+            low = min(low, smooth[left])
+        low = smooth[apex]
+        while right < len(smooth) - 1 and rts[right + 1] - rts[apex] <= rt_window and (smooth[right + 1] <= smooth[right] or (low >= top and smooth[right + 1] <= 1.1 * low)) and smooth[right] > cut:
             right += 1
+            low = min(low, smooth[right])
         areas[t], apex_scans[t] = _trapezoid(np.clip(ints_arr[left:right + 1] - baseline, 0, None), rts[left:right + 1]), s0 + apex
         if records is not None:
             # The trace again from rt_window before to rt_window after the scans searched, which shows the neighbouring peaks, and the survey scan at the
@@ -2609,8 +2703,10 @@ def assign_candidate_structures(df_in, df_glycan_in, comp_struct_map, topo_struc
             comps_out = _fill_adducts(plain, own, carriers = True)
     # Glucose oligomers in glycan preparations sit, as reduced Hex_n, 0.05 Da from sulfated O-glycans (Hex4 667.23 / Hex1HexNAc2S1 667.18, Hex5
     # 829.29 / Hex2HexNAc2S1 829.24), which ion-trap survey scans do not separate, and the sulfated composition took them. Their 1-4 linkages give a
-    # series of 2,4A ions (221, 383, 545, 707 for the reduced oligomers): a singly charged spectrum whose base peak is the 2,4A ion of the residue next
-    # to the reducing end (the precursor minus that residue and C4H6O3) and that has the next one (a Hex lighter) among its 10 most intense fragments
+    # series of 2,4A ions (221, 383, 545, 707 for the reduced oligomers): a singly charged spectrum whose base peak (the unfragmented precursor aside,
+    # often the most intense ion of ion-trap spectra of long chains) is the 2,4A ion of the residue next to the reducing end (the precursor minus that
+    # residue and C4H6O3) and that has another 2,4A ion of the series among its 10 most intense fragments (the next one, 221 for Hex4, can lie below an
+    # ion trap's low-mass cutoff, and in long chains it is often weaker than lower ones)
     # is the oligomer of n >= 4 Hex and keeps only that composition, scored as the 1-4 linked glucose chain (1-4 linked galactose would give the same
     # ions, glucose is the oligomer found in glycan preparations; Hex3 has a single 2,4A ion, which 4-linked lactose-based trisaccharides share)
     ladder = [False] * len(red_masses)
@@ -2619,11 +2715,11 @@ def assign_candidate_structures(df_in, df_glycan_in, comp_struct_map, topo_struc
         hex_res = composition_to_mass({'Hex': 2}, mass_value = 'monoisotopic') - composition_to_mass({'Hex': 1}, mass_value = 'monoisotopic')
         for i, (mz, peaks, kc) in enumerate(zip(red_masses, df_in['peak_d'], known_charges)):
             n = round((mz + PROTON_MASS - hex_end) / hex_res) + 1
-            top = sorted(peaks.items(), key = lambda x: x[1], reverse = True)[:10] if isinstance(peaks, dict) else []
+            top = sorted(((m, v) for m, v in peaks.items() if abs(m - mz) > 1.5), key = lambda x: x[1], reverse = True)[:10] if isinstance(peaks, dict) else []
             if n < 4 or kc not in (None, 1) or not top or abs(hex_end + (n - 1) * hex_res - PROTON_MASS - mz) > (ms1_ppm * mz / 1e6 if ms1_ppm else mass_tolerance):
                 continue
             a24 = mz - hex_end - calculate_adduct_mass('C4H6O3')
-            if abs(top[0][0] - a24) < mass_tolerance and any(abs(m - a24 + hex_res) < mass_tolerance for m, _ in top[1:]):
+            if abs(top[0][0] - a24) < mass_tolerance and any(abs(m - a24 + k * hex_res) < mass_tolerance for m, _ in top[1:] for k in range(1, n - 2)):
                 key, chain = stringify_dict({'Hex': n}), '(a1-4)'.join(['Glc'] * n)
                 comps_out[i] = (([({'Hex': n}, {key: chain}, {key: [chain]})], 0.0), 1)
                 ladder[i] = True
@@ -3390,6 +3486,36 @@ class DictStorage:
         df = pd.read_csv(filepath)
         df[dict_col] = df[dict_col].apply(self.deserialize_dict)
         return df
+
+
+def pair_spectra(df, max_scans = 30, ppm = 10.0):
+    """pairs each HCD scan with the EThcD, ETD, ECD, or ETciD scan it triggered in a product-triggered method: the next such scan of the same precursor\n
+    | Arguments:
+    | :-
+    | df (dataframe): MS2 spectra of one run, as load_spectra_filepath returns them, with activation and scan
+    | max_scans (int): how many scans later the partner may come; default:30
+    | ppm (float): tolerance of the precursor m/z; default:10.0\n
+    | Returns:
+    | :-
+    | Returns the HCD scans of df, with their partners' peaks, activation, analyzer, and scan number in paired_peak_d, paired_activation, paired_analyzer, and paired_scan
+    """
+    df = df.dropna(subset = ['precursor_charge']).sort_values('scan')
+    # Survey scans stay with the reader's table: pandas compares attrs when runs are concatenated, which raises on the arrays of different runs
+    df.attrs = {k: v for k, v in df.attrs.items() if k != 'ms1'}
+    electron = df[df['activation'].isin(['EThcD', 'ETD', 'ECD', 'ETciD'])]
+    hcd = df[~df.index.isin(electron.index)].copy()
+    e_scan, e_mz, e_z = electron['scan'].values, electron['m/z'].values, electron['precursor_charge'].values
+    partner = {}
+    for i, scan, mz, z in zip(hcd.index, hcd['scan'].values, hcd['m/z'].values, hcd['precursor_charge'].values):
+        for j in range(np.searchsorted(e_scan, scan), np.searchsorted(e_scan, scan + max_scans)):
+            if abs(e_mz[j] - mz) <= mz * ppm * 1e-6 and e_z[j] == z:
+                partner[i] = electron.index[j]
+                break
+    rows = pd.Series(partner, dtype = object)
+    hcd['paired_peak_d'] = pd.Series([df.at[j, 'peak_d'] for j in rows.values], index = rows.index, dtype = object).reindex(hcd.index)
+    for col in ('activation', 'analyzer', 'scan'):
+        hcd[f'paired_{col}'] = pd.Series(df.loc[rows.values, col].values if col in df else None, index = rows.index).reindex(hcd.index)
+    return hcd
 
 
 def load_spectra_filepath(spectra_filepath, extract_ms1 = False):
@@ -4224,6 +4350,92 @@ def finalise_predictions(df_out, get_missing, mode, modification, mass_tag, ppm_
                 df_out.iat[a, ns] += df_out.iat[b, ns]
                 df_out.iat[a, xc] = df_out.iat[a, xc] + df_out.iat[b, xc]
             df_out = df_out.iloc[[k for k in range(len(df_out)) if k not in into and k not in orphans]]
+            # A row whose composition is a co-eluting row's with two dHex for a Neu5Ac (or Hex + dHex for a Neu5Gc), 1.02 Da heavier at the same charge, is
+            # mostly that row's 13C peak read as the heavier isobar, and sometimes the reverse (the light row the heavy glycan's ion read 1 Da low). Ion traps
+            # merge their isotopes, the light glycan's M+1 and M+2 outweigh its M above ~2.5 kDa at z = 2, and the MS2 of the two fit both compositions, so
+            # neither spectra nor the precursor intensities deduplicate_predictions compares tell them apart (31 such pairs in our test runs, 17 of them a
+            # true light row with a false heavy one). The intensity-weighted centre of the whole isotope envelope does: it lies 1.02 / z higher for the heavy
+            # glycan alone. Centres are taken relative to the run's offset, the median offset of the other rows' envelope centres from their compositions'
+            # isotope patterns (a z = 1 calibration is often missing and ion-trap readings move by up to 0.2 m/z); a pair whose envelope sits within a third
+            # of the way from one glycan's pattern keeps that row, which takes the other's spectra (not its abundance, the same envelope's isotopes). Singly
+            # charged pairs, resolved on every instrument, are judged by peaks (BSM's Hex1HexNAc2Neu5Gc1 894.32 is a glycan 0.3 min before a 40x stronger
+            # Hex2HexNAc2dHex1 [M-H]-, which the envelope centre took it for)
+            isobar_deltas = ({'dHex': 2, 'Neu5Ac': -1}, {'Hex': 1, 'dHex': 1, 'Neu5Gc': -1})
+            comps2, zs2, rts2, mzs2 = list(df_out['composition']), np.abs(df_out['charge'].values).astype(int), df_out['RT'].values, df_out['theo_mz'].values
+            pairs = [(i, k) for i in range(len(df_out)) for k in range(len(df_out)) if i != k and isinstance(comps2[i], dict) and isinstance(comps2[k], dict)
+                     and zs2[i] == zs2[k] and abs(rts2[i] - rts2[k]) <= 0.3 and abs(mzs2[k] - mzs2[i] - 1.0204 / zs2[i]) < 0.01
+                     and any(all(comps2[k].get(r, 0) - comps2[i].get(r, 0) == d.get(r, 0) for r in set(comps2[k]) | set(comps2[i]) | set(d)) for d in isobar_deltas)]
+            if pairs:
+
+                def envelope_centre(mz, z, rt):
+                    # intensity-weighted mean m/z of the survey centroids from 0.45 / z below an ion to 5.5 / z above it, over 0.15 min around rt
+                    num, den = 0.0, 0.0
+                    for s in range(np.searchsorted(ms1[0], rt - 0.15), np.searchsorted(ms1[0], rt + 0.15, side = 'right')):
+                        m, v = ms1[1][ms1[3][s]:ms1[3][s + 1]], ms1[2][ms1[3][s]:ms1[3][s + 1]]
+                        a, b = np.searchsorted(m, mz - 0.45 / z), np.searchsorted(m, mz + 5.5 / z)
+                        num, den = num + float(np.dot(m[a:b].astype(np.float64), v[a:b])), den + float(v[a:b].sum())
+                    return num / den if den > 0 else np.nan
+
+                def isotope_pattern(comp):
+                    # relative abundances of a composition's isotope peaks M, M+1, ... from its elemental formula (None without one)
+                    try:
+                        formula = get_formula(comp, sample_prep = 'permethylated' if sample_prep == 'deuteropermethylated' else sample_prep)
+                    except ValueError:
+                        return None
+                    dist = np.array([1.0])
+                    for el, k in re.findall(r'([A-Z][a-z]?)(\d*)', formula):
+                        for _ in range(int(k or 1)):
+                            dist = np.convolve(dist, ISOTOPE_ABUNDANCES.get(el, [1.0]))[:12]
+                    return dist
+
+                def peak_sum(mz, rt):
+                    # summed survey intensity within 0.3 m/z of an ion over 0.15 min around rt
+                    total = 0.0
+                    for s in range(np.searchsorted(ms1[0], rt - 0.15), np.searchsorted(ms1[0], rt + 0.15, side = 'right')):
+                        m = ms1[1][ms1[3][s]:ms1[3][s + 1]]
+                        total += float(ms1[2][ms1[3][s]:ms1[3][s + 1]][np.searchsorted(m, mz - 0.3):np.searchsorted(m, mz + 0.3)].sum())
+                    return total
+
+                def pattern_centre(comp, mz, z, ref):
+                    # mean m/z of a composition's isotope pattern (monoisotopic at mz) within the window envelope_centre sums around ref
+                    dist = isotope_pattern(comp)
+                    if dist is None:
+                        return np.nan
+                    pos = mz + ISOTOPE_SPACING / z * np.arange(len(dist))
+                    inside = (pos >= ref - 0.45 / z) & (pos <= ref + 5.5 / z)
+                    return float(np.dot(pos[inside], dist[inside]) / dist[inside].sum())
+
+                paired = {x for p in pairs for x in p}
+                refs = [i for i in np.argsort(-np.nan_to_num(df_out['rel_abundance'].values.astype(float)), kind = 'stable') if isinstance(comps2[i], dict) and i not in paired][:30]
+                offs = [c - e for c, e in ((envelope_centre(mzs2[i], zs2[i], rts2[i]), pattern_centre(comps2[i], mzs2[i], zs2[i], mzs2[i])) for i in refs)
+                        if np.isfinite(c) and np.isfinite(e)]
+                off = float(np.median(offs)) if len(offs) >= 5 else shift
+                isobar_into = {}
+                for i, k in pairs:
+                    if i in isobar_into or k in isobar_into:
+                        continue
+                    if zs2[i] == 1:
+                        # singly charged ions are resolved, and a glycan 1 Da lighter is no misreading of one: the heavy row is the light glycan's M+1
+                        # if its peak (at its own RT) is at most 1.5x what the light glycan's peak there predicts, else both are glycans
+                        dist = isotope_pattern(comps2[i])
+                        if dist is None or len(dist) < 2:
+                            continue
+                        at_heavy, heavy_peak = peak_sum(mzs2[i] + off, rts2[k]), peak_sum(mzs2[k] + off, rts2[k])
+                        if heavy_peak <= 1.5 * at_heavy * dist[1] / dist[0]:
+                            isobar_into[k] = i
+                        continue
+                    light, heavy = pattern_centre(comps2[i], mzs2[i], zs2[i], mzs2[i]), pattern_centre(comps2[k], mzs2[k], zs2[i], mzs2[i])
+                    frac = (envelope_centre(mzs2[i], zs2[i], (rts2[i] + rts2[k]) / 2) - off - light) / (heavy - light)
+                    if frac <= 1 / 3:
+                        isobar_into[k] = i
+                    elif frac >= 2 / 3:
+                        isobar_into[i] = k
+                for b in isobar_into:
+                    a = isobar_into[b]
+                    while a in isobar_into:
+                        a = isobar_into[a]
+                    df_out.iat[a, ns] += df_out.iat[b, ns]
+                df_out = df_out.iloc[[k for k in range(len(df_out)) if k not in isobar_into]]
     if mode == 'positive' and 'adduct' in df_out.columns and 'rt_range' in df_out.columns:
         # In positive mode a glycan's metal adduct ([M+K+H]2+, [M+Na+H]2+) can dominate its (de)protonated ion, whose weak, noisy precursor intensities then
         # split one chromatographic peak into several clusters; (de)protonated rows of a composition inside the RT span of one of its adduct clusters are
