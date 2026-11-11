@@ -1,8 +1,8 @@
-"""Classification losses and reusable composition constraints."""
+"""Classification losses, reusable composition constraints and the contrastive pretraining loss."""
 
 import math
-from collections import defaultdict
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch_focalloss import MultiClassFocalLoss
@@ -69,263 +69,91 @@ class FocalLoss(torch.nn.Module):
         return loss
 
 
-def supervised_contrastive_masks(labels):
-    labels = labels.reshape(-1)
-    if labels.ndim != 1:
-        raise ValueError("labels must be a 1D tensor.")
-    same_class = labels.unsqueeze(0) == labels.unsqueeze(1)
-    self_mask = torch.eye(labels.numel(), device=labels.device, dtype=torch.bool)
-    positive_mask = same_class & ~self_mask
-    negative_mask = ~same_class
-    return positive_mask, negative_mask
+class PretrainingContrastiveLoss(torch.nn.Module):
+    """Multi-positive InfoNCE (SupCon, Khosla et al. 2020, Eq. 2) for contrastive pretraining on batches of repeated-index views.
 
-
-class SupConLoss(torch.nn.Module):
-    """Supervised contrastive loss from Khosla et al., Eq. 2."""
+    Targets are rows of the pretraining pool, and the views of one row are always positives. A key per row says which spectra may be one
+    molecule: composition_ids (supervised; -1 for none) or precursor_mz within mz_tolerance (unsupervised). Keys do not make positives,
+    since one composition or precursor mass spans the isomers fine-tuning has to tell apart; instead, spectra of one key in one setting
+    group (project, LC, ion mode, derivatization) eluting within same_peak_rt (RT2) of each other are positives, the same isomer in another
+    run of the group included; spectra of one key in one run at least isomer_rt apart are negatives (mostly isomers); other pairs of one key
+    are left out, as either could hold; and spectra of different keys are negatives. Without keys every other pair is a negative.
+    """
 
     uses_embeddings = True
 
-    def __init__(self, temperature=0.07, cand_mask=None):
+    def __init__(self, temperature = 0.1, composition_ids = None, precursor_mz = None, mz_tolerance = 0.5, run_ids = None, setting_ids = None,
+                 retention_times = None, same_peak_rt = 0.005, isomer_rt = 0.03):
         super().__init__()
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and positive.")
+        if not 0 <= same_peak_rt < isomer_rt:
+            raise ValueError("same_peak_rt must be non-negative and below isomer_rt.")
+        if composition_ids is not None and precursor_mz is not None:
+            raise ValueError("Pair spectra by composition_ids or by precursor_mz, not both.")
+        self.keyed = composition_ids is not None or precursor_mz is not None
+        context = {"run_ids": run_ids, "setting_ids": setting_ids, "retention_times": retention_times}
+        if self.keyed and any(value is None for value in context.values()):
+            raise ValueError("Pairing spectra by composition or precursor m/z needs run_ids, setting_ids and retention_times.")
         self.temperature = temperature
-        self.register_buffer("cand_mask", cand_mask)
+        self.mz_tolerance = mz_tolerance
+        self.same_peak_rt = same_peak_rt
+        self.isomer_rt = isomer_rt
+        buffers = dict(context, composition_ids = composition_ids, precursor_mz = precursor_mz)
+        for name, value in buffers.items():
+            dtype = torch.float32 if name in {"retention_times", "precursor_mz"} else torch.long
+            self.register_buffer(name, None if value is None or not self.keyed else torch.tensor(np.asarray(value), dtype = dtype), persistent = False)
 
-    def _gather_distributed(self, features, labels):
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return features, labels, 0
-        world_size = torch.distributed.get_world_size()
-        if world_size == 1:
-            return features, labels, 0
-        rank = torch.distributed.get_rank()
-        gathered_features = [torch.zeros_like(features) for _ in range(world_size)]
-        gathered_labels = [torch.zeros_like(labels) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_features, features.contiguous())
-        torch.distributed.all_gather(gathered_labels, labels.contiguous())
-        gathered_features[rank] = features
-        all_features = torch.cat(gathered_features, dim=0)
-        all_labels = torch.cat(gathered_labels, dim=0)
-        return all_features, all_labels, rank * features.size(0)
+    def pair_types(self, targets):
+        """Boolean [batch, batch] masks of each pair's role: same_row (views of one spectrum), same_peak (positives between spectra), isomer
+        (negatives within one key) and ignored (pairs left out of the loss)."""
+        targets = targets.reshape(-1)
+        if self.keyed:
+            targets = targets.to(self.run_ids.device)
+        same_row = targets.unsqueeze(0) == targets.unsqueeze(1)
+        nothing = torch.zeros_like(same_row)
+        if not self.keyed:
+            return {"same_row": same_row, "same_peak": nothing, "isomer": nothing, "ignored": nothing}
+        if self.composition_ids is not None:
+            composition = self.composition_ids[targets]
+            known = composition >= 0
+            same_key = (composition.unsqueeze(0) == composition.unsqueeze(1)) & known.unsqueeze(0) & known.unsqueeze(1)
+        else:
+            mz = self.precursor_mz[targets]
+            same_key = (mz.unsqueeze(0) - mz.unsqueeze(1)).abs() <= self.mz_tolerance
+        setting = self.setting_ids[targets]
+        run = self.run_ids[targets]
+        rt = self.retention_times[targets]
+        gap = (rt.unsqueeze(0) - rt.unsqueeze(1)).abs()
+        same_peak = same_key & (setting.unsqueeze(0) == setting.unsqueeze(1)) & (gap <= self.same_peak_rt) & ~same_row
+        isomer = same_key & (run.unsqueeze(0) == run.unsqueeze(1)) & (gap >= self.isomer_rt) & ~same_row
+        ignored = same_key & ~same_row & ~same_peak & ~isomer
+        return {"same_row": same_row, "same_peak": same_peak, "isomer": isomer, "ignored": ignored}
 
-    def forward(self, features, labels):
+    def pair_masks(self, targets):
+        """(positive, valid) [batch, batch] masks: valid pairs enter the softmax denominator, positives also its numerator."""
+        types = self.pair_types(targets)
+        not_self = ~torch.eye(types["same_row"].size(0), dtype = torch.bool, device = types["same_row"].device)
+        positive = (types["same_row"] | types["same_peak"]) & not_self
+        return positive, not_self & ~types["ignored"]
+
+    def forward(self, features, targets):
         if features.ndim != 2:
             raise ValueError("features must have shape [batch, embedding_dim].")
-        labels = labels.reshape(-1)
-        if labels.numel() != features.size(0):
-            raise ValueError("labels must match the feature batch size.")
-
-        features = F.normalize(features, dim=1)
-        all_features, all_labels, local_offset = self._gather_distributed(features, labels)
-        logits = torch.matmul(features, all_features.T) / self.temperature
-        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-
-        local_rows = torch.arange(features.size(0), device=features.device)
-        local_columns = local_rows + local_offset
-        logits_mask = torch.ones_like(logits, dtype=torch.bool)
-        logits_mask[local_rows, local_columns] = False
-        positive_mask = labels.unsqueeze(1) == all_labels.unsqueeze(0)
-        if self.cand_mask is not None:
-            # A different label that one of the two labels allows (Gal(b1-4)GlcNAc for Gal(b1-3/4)GlcNAc) may be the same glycan, so it is neither a positive nor a negative
-            maybe_same = self.cand_mask[labels.unsqueeze(1), all_labels.unsqueeze(0)] | self.cand_mask[all_labels.unsqueeze(0), labels.unsqueeze(1)]
-            logits_mask = logits_mask & ~(maybe_same & ~positive_mask)
-        positive_mask = positive_mask & logits_mask
-
-        positive_counts = positive_mask.sum(dim=1)
-        valid_anchors = positive_counts > 0
-        if not valid_anchors.any():
+        targets = targets.reshape(-1)
+        if targets.numel() != features.size(0):
+            raise ValueError("targets must match the feature batch size.")
+        positive, valid = self.pair_masks(targets)
+        counts = positive.sum(dim = 1)
+        anchors = counts > 0
+        if not anchors.any():
             return features.sum() * 0.0
-
-        log_denominator = torch.logsumexp(logits.masked_fill(~logits_mask, float("-inf")), dim=1)
-        log_prob = logits - log_denominator.unsqueeze(1)
-        anchor_losses = -(log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1) / positive_counts.clamp_min(1))
-        return anchor_losses[valid_anchors].mean()
-
-
-class UnsupervisedContrastiveLoss(torch.nn.Module):
-    """NT-Xent/InfoNCE loss where repeated augmented views of one sample are positives."""
-
-    uses_embeddings = True
-
-    def __init__(self, temperature=0.07, views_per_example=2):
-        super().__init__()
-        if not math.isfinite(temperature) or temperature <= 0:
-            raise ValueError("temperature must be finite and positive.")
-        if views_per_example < 2:
-            raise ValueError("views_per_example must be at least 2.")
-        self.temperature = temperature
-        self.views_per_example = int(views_per_example)
-
-    def _gather_distributed(self, features, sample_ids):
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return features, sample_ids, 0
-        world_size = torch.distributed.get_world_size()
-        if world_size == 1:
-            return features, sample_ids, 0
-        rank = torch.distributed.get_rank()
-        sample_ids = sample_ids + rank * sample_ids.max().add(1)
-        gathered_features = [torch.zeros_like(features) for _ in range(world_size)]
-        gathered_sample_ids = [torch.zeros_like(sample_ids) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_features, features.contiguous())
-        torch.distributed.all_gather(gathered_sample_ids, sample_ids.contiguous())
-        gathered_features[rank] = features
-        gathered_sample_ids[rank] = sample_ids
-        all_features = torch.cat(gathered_features, dim=0)
-        all_sample_ids = torch.cat(gathered_sample_ids, dim=0)
-        return all_features, all_sample_ids, rank * features.size(0)
-
-    def forward(self, features, labels=None):
-        if features.ndim != 2:
-            raise ValueError("features must have shape [batch, embedding_dim].")
-        batch_size = features.size(0)
-        if batch_size % self.views_per_example != 0:
-            raise ValueError("batch size must be divisible by views_per_example.")
-
-        features = F.normalize(features, dim=1)
-        sample_ids = torch.arange(
-            batch_size // self.views_per_example,
-            device=features.device,
-            dtype=torch.long,
-        ).repeat_interleave(self.views_per_example)
-        all_features, all_sample_ids, local_offset = self._gather_distributed(features, sample_ids)
-        logits = torch.matmul(features, all_features.T) / self.temperature
-        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-
-        local_rows = torch.arange(batch_size, device=features.device)
-        local_columns = local_rows + local_offset
-        logits_mask = torch.ones_like(logits, dtype=torch.bool)
-        logits_mask[local_rows, local_columns] = False
-        positive_mask = sample_ids.unsqueeze(1) == all_sample_ids.unsqueeze(0)
-        positive_mask = positive_mask & logits_mask
-
-        positive_counts = positive_mask.sum(dim=1)
-        valid_anchors = positive_counts > 0
-        if not valid_anchors.any():
-            return features.sum() * 0.0
-
-        log_denominator = torch.logsumexp(logits.masked_fill(~logits_mask, float("-inf")), dim=1)
-        log_prob = logits - log_denominator.unsqueeze(1)
-        anchor_losses = -(log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1) / positive_counts.clamp_min(1))
-        return anchor_losses[valid_anchors].mean()
-
-
-class ClassAwareContrastiveBatchSampler(torch.utils.data.Sampler):
-    """Yield repeated-index batches for two-view supervised contrastive learning."""
-
-    def __init__(
-        self,
-        targets,
-        classes_per_batch=64,
-        examples_per_class=4,
-        views_per_example=2,
-        drop_last=True,
-        seed=0,
-    ):
-        if classes_per_batch < 1:
-            raise ValueError("classes_per_batch must be positive.")
-        if examples_per_class < 2:
-            raise ValueError("examples_per_class must be at least 2.")
-        if views_per_example < 1:
-            raise ValueError("views_per_example must be positive.")
-        self.targets = torch.as_tensor(targets, dtype=torch.long).cpu().numpy()
-        self.classes_per_batch = int(classes_per_batch)
-        self.examples_per_class = int(examples_per_class)
-        self.views_per_example = int(views_per_example)
-        self.drop_last = bool(drop_last)
-        self.seed = int(seed)
-        self.epoch = 0
-        by_class = defaultdict(list)
-        for index, target in enumerate(self.targets):
-            by_class[int(target)].append(index)
-        self.class_to_indices = {
-            label: torch.as_tensor(indices, dtype=torch.long).numpy()
-            for label, indices in by_class.items()
-            if len(indices) >= self.examples_per_class
-        }
-        self.eligible_classes = sorted(self.class_to_indices)
-        if not self.eligible_classes:
-            raise ValueError("SupCon sampler needs at least one class with enough distinct examples.")
-        if self.drop_last and len(self.eligible_classes) < self.classes_per_batch:
-            raise ValueError("SupCon sampler has fewer eligible classes than classes_per_batch.")
-        self.original_batch_size = self.classes_per_batch * self.examples_per_class
-        self.batch_size = self.original_batch_size * self.views_per_example
-        eligible_examples = sum(len(self.class_to_indices[label]) for label in self.eligible_classes)
-        if self.drop_last:
-            self._num_batches = max(1, eligible_examples // self.original_batch_size)
-        else:
-            self._num_batches = math.ceil(eligible_examples / self.original_batch_size)
-
-    def __len__(self):
-        return self._num_batches
-
-    def set_epoch(self, epoch):
-        self.epoch = int(epoch)
-
-    def __iter__(self):
-        generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        class_count = len(self.eligible_classes)
-        for _ in range(self._num_batches):
-            permutation = torch.randperm(class_count, generator=generator).tolist()
-            chosen_labels = [self.eligible_classes[index] for index in permutation[: self.classes_per_batch]]
-            batch = []
-            for label in chosen_labels:
-                indices = self.class_to_indices[label]
-                positions = torch.randperm(len(indices), generator=generator)[: self.examples_per_class].tolist()
-                for position in positions:
-                    batch.extend([int(indices[position])] * self.views_per_example)
-            yield batch
-
-
-class UnlabeledContrastiveBatchSampler(torch.utils.data.Sampler):
-    """Yield repeated-index batches for augmented-view unsupervised contrastive learning."""
-
-    def __init__(
-        self,
-        num_samples,
-        examples_per_batch=256,
-        views_per_example=2,
-        drop_last=True,
-        seed=0,
-    ):
-        if num_samples < 1:
-            raise ValueError("num_samples must be positive.")
-        if examples_per_batch < 1:
-            raise ValueError("examples_per_batch must be positive.")
-        if views_per_example < 2:
-            raise ValueError("views_per_example must be at least 2.")
-        self.num_samples = int(num_samples)
-        self.examples_per_batch = int(examples_per_batch)
-        self.views_per_example = int(views_per_example)
-        self.drop_last = bool(drop_last)
-        self.seed = int(seed)
-        self.epoch = 0
-        self.original_batch_size = self.examples_per_batch
-        self.batch_size = self.examples_per_batch * self.views_per_example
-        if self.drop_last:
-            self._num_batches = self.num_samples // self.examples_per_batch
-        else:
-            self._num_batches = math.ceil(self.num_samples / self.examples_per_batch)
-        if self._num_batches < 1:
-            raise ValueError("Unlabeled contrastive sampler has fewer samples than examples_per_batch.")
-
-    def __len__(self):
-        return self._num_batches
-
-    def set_epoch(self, epoch):
-        self.epoch = int(epoch)
-
-    def __iter__(self):
-        generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        indices = torch.randperm(self.num_samples, generator=generator).tolist()
-        stop = self._num_batches * self.examples_per_batch if self.drop_last else self.num_samples
-        for start in range(0, stop, self.examples_per_batch):
-            examples = indices[start:start + self.examples_per_batch]
-            if self.drop_last and len(examples) < self.examples_per_batch:
-                continue
-            batch = []
-            for index in examples:
-                batch.extend([int(index)] * self.views_per_example)
-            yield batch
+        features = F.normalize(features, dim = 1)
+        logits = (features[anchors] @ features.T) / self.temperature
+        logits = logits - logits.max(dim = 1, keepdim = True).values.detach()
+        log_denominator = torch.logsumexp(logits.masked_fill(~valid[anchors], float("-inf")), dim = 1, keepdim = True)
+        log_prob = (logits - log_denominator).masked_fill(~positive[anchors], 0.0)
+        return (-log_prob.sum(dim = 1) / counts[anchors]).mean()
 
 
 class custom_loss(torch.nn.Module):

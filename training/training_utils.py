@@ -24,49 +24,6 @@ warnings.filterwarnings("ignore", category = UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category = UserWarning, module = "sklearn")
 
 
-class RawPretrainingInputs:
-    """Keep CC spectra sparse, expanding only the requested row.
-
-    Unlabelled composition candidates do not have the training vocabulary's
-    vector order. Use the supplied unknown-composition vector instead.
-    """
-
-    def __init__(self, frame, default_composition, num_bins):
-        required = {"model_input", "RT2", "mode", "lc_type", "modification", "trap"}
-        missing = required.difference(frame.columns)
-        if missing:
-            raise ValueError(f"Raw pretraining inputs are missing columns: {sorted(missing)}")
-        if default_composition is None:
-            raise ValueError("Raw pretraining inputs require default_composition.")
-        columns = sorted(required | ({"glycan_types"} if "glycan_types" in frame else set()))
-        self.frame = frame[columns].reset_index(drop=True)
-        self.default_composition = np.asarray(default_composition, dtype=np.float32)
-        self.num_bins = num_bins
-
-    def __len__(self):
-        return len(self.frame)
-
-    def __getitem__(self, index):
-        if index >= len(self):
-            raise IndexError(index)
-        row = self.frame.iloc[index]
-        sparse = row["model_input"]
-        occupied = np.asarray(sparse[0], dtype=np.intp)
-        mz = np.zeros(self.num_bins, dtype=np.float32)
-        mz_r = np.zeros_like(mz)
-        mz[occupied], mz_r[occupied] = sparse[1], sparse[2]
-        types = row.get("glycan_types", [])
-        types = np.asarray(types).reshape(-1)
-        glycan_type = int(types[0]) if len(types) and np.all(types == types[0]) else 3
-        mode = {"positive": 0, "negative": 1}.get(row["mode"], row["mode"])
-        if mode not in (0, 1):
-            raise ValueError(f"Unknown ion mode at pretraining row {index}: {mode!r}")
-        return (mz, mz_r, self.default_composition, glycan_type, float(row["RT2"]),
-                int(mode), {"PGC": 0, "C18": 1}.get(row["lc_type"], 2),
-                {"reduced": 0, "permethylated": 1}.get(row["modification"], 2),
-                {"linear": 0, "orbitrap": 1, "amazon": 2}.get(row["trap"], 3))
-
-
 class ResampledDataset(SimpleDataset):
     """Use the stored pooled spectrum or its member spectra for training.
 
@@ -143,21 +100,19 @@ class ResampledDataset(SimpleDataset):
 
 
 def load_dataset_inputs(source, targets=None, composition_vectors=None, default_composition=None, num_bins=2048):
-    """Load prepared inputs, a raw CC pretraining DataFrame, or a sparse store.
+    """Load prepared inputs or a sparse store.
 
     Labeled inputs receive composition vectors in the training vocabulary's
     order. Unlabeled inputs use their stored vectors or default_composition.
-    Raw CC DataFrames stay sparse until an item is requested and use the
-    supplied default composition. Existing prepared stores are densified here.
+    Existing prepared stores are densified here; pretraining reads raw
+    DataFrames and stores sparsely with training.pretraining.load_pretraining_pool.
     """
     source = Path(source)
     if source.is_file():
         with source.open("rb") as file:
             inputs = pickle.load(file)
         if isinstance(inputs, pd.DataFrame):
-            if targets is not None:
-                raise ValueError("Raw DataFrame inputs are supported for unlabelled pretraining only.")
-            return RawPretrainingInputs(inputs, default_composition, num_bins)
+            raise ValueError("A raw DataFrame is a pretraining pool; load it with training.pretraining.load_pretraining_pool.")
     else:
         with (source / "manifest.json").open() as file:
             manifest = json.load(file)
@@ -512,18 +467,22 @@ def forward_training_batch(model, inputs, needs_embeddings=False, return_routing
 def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_epochs=None,
                 patience=None, log_to_wandb=True, num_classes=None, model_type=True, setting_name=None,
                 classifier_moe_aux_loss_weight=0.0, checkpoint_metadata=None,
-                glycan_compositions=None, save_dir="./models",wandb_prefix=None,
-                contrastive_criterion=None,contrastive_loss_weight=0.0,cand_mask=None,
-                transformer_moe_aux_loss_weight=0.0):
+                glycan_compositions = None, save_dir = "./models", wandb_prefix = None, cand_mask = None,
+                transformer_moe_aux_loss_weight = 0.0, selection_metric = None):
     """
     Train a CNN, CNN2 or Transformer with SAM and optional MoE load balancing.
+    An optimizer without SAM's first_step (a plain torch optimizer) takes one
+    forward and backward pass per batch instead of SAM's two.
 
-    When contrastive_criterion is provided, fine-tuning optimizes the selected
-    classification loss plus contrastive_loss_weight times supervised
-    contrastive loss over the model embeddings.
+    A criterion with uses_embeddings (contrastive pretraining) is applied to
+    the model's rep output instead of its logits. selection_metric, if given,
+    is called with the model after each validation phase; its value (higher
+    is better, named by its name attribute) then picks the best epoch and
+    drives early stopping and the learning-rate schedule instead of the
+    validation loss.
 
     Both SAM passes use auxiliary losses from that same forward pass.
-    Validation reports classification loss alone for early stopping.
+    Validation uses the primary objective alone for early stopping.
     Routing statistics are optional WandB diagnostics and do not control
     regularization.
     """
@@ -531,25 +490,32 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     early_stopping = EarlyStopping(patience=patience,verbose=True)
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = float("inf")
+    best_monitored = float("inf")
     best_acc = 0.0
     val_losses = []
     val_acc = []
     train_losses = []
     train_acc = []
-    contrastive_enabled = contrastive_criterion is not None and contrastive_loss_weight > 0
+    selection_name = getattr(selection_metric, "name", "selection_metric")
     # ============================================================
     # Metrics
     # ============================================================
 
-    metric_names = ["loss","classification_loss","classifier_moe_aux_loss","transformer_moe_aux_loss","accuracy","mcc","f1_macro","f1_weighted","top5_accuracy","top10_accuracy"]
-    if contrastive_enabled:
-        metric_names.append("contrastive_loss")
+    uses_embedding_loss = getattr(criterion, "uses_embeddings", False)
+    uses_sam = callable(getattr(optimizer, "first_step", None))
+    primary_loss_name = "contrastive_loss" if uses_embedding_loss else "classification_loss"
+    metric_names = ["loss", primary_loss_name, "classifier_moe_aux_loss", "transformer_moe_aux_loss"]
+    if not uses_embedding_loss:
+        metric_names.extend(["accuracy", "mcc", "f1_macro", "f1_weighted", "top5_accuracy", "top10_accuracy"])
     metrics_dict = {"train": {name: [] for name in metric_names},"val": {name: [] for name in metric_names},"time_seconds": [],}
+    if selection_metric is not None:
+        metrics_dict["val"][selection_name] = []
     start = time.time_ns()
     if num_classes is None:
         num_classes = len(glycans)
     # cand_mask[i, j]: a prediction of class j counts as correct for label i (only j == i without candidate sets)
-    cand_mask = torch.eye(num_classes, dtype=torch.bool, device=device) if cand_mask is None else cand_mask.to(device)
+    if not uses_embedding_loss:
+        cand_mask = torch.eye(num_classes, dtype=torch.bool, device=device) if cand_mask is None else cand_mask.to(device)
     output_dir = Path(save_dir)
 
     def prefix_wandb_payload(payload):
@@ -567,7 +533,6 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
 
     base_model = get_base_model(model)
     mask_predictions = getattr(criterion, "mask_logits", None)
-    uses_embedding_loss = getattr(criterion, "uses_embeddings", False)
     supports_aux_losses = callable(getattr(base_model, "get_classifier_aux_loss", None))
     classifier_moe_enabled = supports_aux_losses and getattr(base_model, "classifier_moe", False)
     transformer_moe_enabled = (
@@ -575,7 +540,7 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
         and getattr(base_model, "use_transformer_ff", False)
         and getattr(base_model, "encoder_type", None) == "moe"
     )
-    classifier_routing_enabled = log_to_wandb and classifier_moe_enabled
+    classifier_routing_enabled = log_to_wandb and classifier_moe_enabled and not uses_embedding_loss
     classifier_num_experts = (base_model.classifier_out.num_experts if classifier_routing_enabled else 0)
     classifier_routing_device = (next(base_model.parameters()).device if classifier_routing_enabled else None)
     # ============================================================
@@ -594,33 +559,37 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     # ============================================================
     # Class distributions
     # ============================================================
-    val_class_counts, val_total = (calculate_class_distribution(dataloaders["val"],num_classes))
-    classes_in_val = np.sum(val_class_counts > 0)
-    print(f"Validation set: {classes_in_val}/{num_classes} classes present ({val_total} total samples)")
-    train_distribution = (calculate_class_distribution(dataloaders["train"],num_classes))
-    print(f"Training set: {np.sum(train_distribution[0] > 0)}/{num_classes} classes present")
-    # ============================================================
-    # Log dataset statistics
-    # ============================================================
-    if log_to_wandb:
-        train_class_counts, train_total = (calculate_class_distribution(dataloaders["train"],num_classes))
-        wandb.log(prefix_wandb_payload({"dataset_stats/train_samples":train_total,"dataset_stats/val_samples":val_total,
-                   "dataset_stats/train_classes_present":np.sum(train_class_counts > 0),
-                   "dataset_stats/val_classes_present":classes_in_val,
-                   "dataset_stats/total_classes":num_classes}))
-        # --------------------------------------------------------
-        # Top 20 most frequent classes
-        # --------------------------------------------------------
-        top_classes_idx = np.argsort(train_class_counts)[-20:][::-1]
-        top_classes_data = []
-        for idx in top_classes_idx:
-            if train_class_counts[idx] > 0:
-                class_name = (glycans[idx] if idx < len(glycans) else f"Class_{idx}")
-                class_name = class_name[:40]
-                top_classes_data.append([class_name, int(train_class_counts[idx])])
-        if top_classes_data:
-            class_table = wandb.Table(data=top_classes_data,columns=["Class","Train Count"])
-            wandb.log(prefix_wandb_payload({"top_20_classes":class_table}))
+    # Contrastive targets are pretraining-pool rows, not classes
+    if uses_embedding_loss:
+        print(f"Contrastive pretraining: {len(dataloaders['train'].dataset)} training and {len(dataloaders['val'].dataset)} validation spectra")
+    else:
+        val_class_counts, val_total = (calculate_class_distribution(dataloaders["val"], num_classes))
+        classes_in_val = np.sum(val_class_counts > 0)
+        print(f"Validation set: {classes_in_val}/{num_classes} classes present ({val_total} total samples)")
+        train_distribution = (calculate_class_distribution(dataloaders["train"], num_classes))
+        print(f"Training set: {np.sum(train_distribution[0] > 0)}/{num_classes} classes present")
+        # ============================================================
+        # Log dataset statistics
+        # ============================================================
+        if log_to_wandb:
+            train_class_counts, train_total = (calculate_class_distribution(dataloaders["train"], num_classes))
+            wandb.log(prefix_wandb_payload({"dataset_stats/train_samples": train_total, "dataset_stats/val_samples": val_total,
+                       "dataset_stats/train_classes_present": np.sum(train_class_counts > 0),
+                       "dataset_stats/val_classes_present": classes_in_val,
+                       "dataset_stats/total_classes": num_classes}))
+            # --------------------------------------------------------
+            # Top 20 most frequent classes
+            # --------------------------------------------------------
+            top_classes_idx = np.argsort(train_class_counts)[-20:][::-1]
+            top_classes_data = []
+            for idx in top_classes_idx:
+                if train_class_counts[idx] > 0:
+                    class_name = (glycans[idx] if idx < len(glycans) else f"Class_{idx}")
+                    class_name = class_name[:40]
+                    top_classes_data.append([class_name, int(train_class_counts[idx])])
+            if top_classes_data:
+                class_table = wandb.Table(data = top_classes_data, columns = ["Class", "Train Count"])
+                wandb.log(prefix_wandb_payload({"top_20_classes": class_table}))
     # ============================================================
     # Print MoE configuration
     # ============================================================
@@ -628,10 +597,8 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
         print("Classifier MoE auxiliary-loss weight:",classifier_moe_aux_loss_weight)
     if uses_embedding_loss:
         print("Embedding loss enabled:", criterion.__class__.__name__)
-    if contrastive_enabled:
-        print("Fine-tuning contrastive loss enabled:", contrastive_criterion.__class__.__name__)
-        print("Fine-tuning contrastive-loss weight:", contrastive_loss_weight)
-
+    if selection_metric is not None:
+        print(f"Best epoch picked by {selection_name} (higher is better) instead of the validation loss")
     # ============================================================
     # Training loop
     # ============================================================
@@ -653,7 +620,6 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             running_classification_loss = []
             running_classifier_aux = []
             running_transformer_aux = []
-            running_contrastive_loss = []
             running_acc = []
             running_mcc = []
             running_f1_macro = []
@@ -674,23 +640,18 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                 inputs, y = prepare_batch(data,model_type)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.set_grad_enabled(phase == "train"):
-                    needs_embeddings = uses_embedding_loss or (contrastive_enabled and phase == "train")
                     # =================================================
                     # FIRST FORWARD PASS
                     # =================================================
                     enable_running_stats(model)
                     pred, embeddings, classifier_routing, transformer_aux_raw, classifier_aux_raw = forward_training_batch(
-                        model, inputs, needs_embeddings=needs_embeddings, return_routing=classifier_routing_enabled)
+                        model, inputs, needs_embeddings = uses_embedding_loss, return_routing = classifier_routing_enabled)
                     if classifier_routing_enabled:
                         _accumulate_classifier_routing(
                             routing_class_sample_counts, routing_expert_selection_counts,
                             routing_expert_responsibility_sums, y, classifier_routing)
                     del classifier_routing
                     classification_loss = criterion(embeddings if uses_embedding_loss else pred,y)
-                    contrastive_loss = reduce_aux_loss(
-                        contrastive_criterion(embeddings, y) if contrastive_enabled and phase == "train" else None,
-                        classification_loss,
-                    )
                     # -------------------------------------------------
                     # Reduce auxiliary losses for enabled components
                     # -------------------------------------------------
@@ -702,16 +663,17 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                     total_loss = classification_loss + transformer_moe_aux_loss_weight * transformer_aux
                     if classifier_moe_enabled:
                         total_loss = total_loss + classifier_moe_aux_loss_weight * classifier_aux
-                    if contrastive_enabled and phase == "train":
-                        total_loss = total_loss + contrastive_loss_weight * contrastive_loss
                     if phase == "train":
                         loss = total_loss
                     else:
                         loss = classification_loss
                     # =================================================
-                    # SAM FIRST STEP
+                    # PLAIN OPTIMIZER STEP, OR SAM FIRST STEP
                     # =================================================
-                    if phase == "train":
+                    if phase == "train" and not uses_sam:
+                        total_loss.backward()
+                        optimizer.step()
+                    elif phase == "train":
                         total_loss.backward()
                         optimizer.first_step(zero_grad=True)
                         # =================================================
@@ -719,12 +681,8 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                         # =================================================
                         disable_running_stats(model)
                         pred_second, embeddings_second, _, transformer_aux_second_raw, classifier_aux_second_raw = forward_training_batch(
-                            model, inputs, needs_embeddings=uses_embedding_loss or contrastive_enabled)
+                            model, inputs, needs_embeddings = uses_embedding_loss)
                         classification_loss_second = (criterion(embeddings_second if uses_embedding_loss else pred_second,y))
-                        contrastive_loss_second = reduce_aux_loss(
-                            contrastive_criterion(embeddings_second, y) if contrastive_enabled else None,
-                            classification_loss_second,
-                        )
                         # ---------------------------------------------
                         # IMPORTANT:
                         #
@@ -741,21 +699,20 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                         loss_second = classification_loss_second + transformer_moe_aux_loss_weight * transformer_aux_second
                         if classifier_moe_enabled:
                             loss_second = loss_second + classifier_moe_aux_loss_weight * classifier_aux_second
-                        if contrastive_enabled:
-                            loss_second = loss_second + contrastive_loss_weight * contrastive_loss_second
                         loss_second.backward()
                         optimizer.second_step(zero_grad=True)
-                if mask_predictions is not None:
-                    pred = mask_predictions(pred.detach(), y)
-                # A prediction of any class the label allows counts as the label itself
-                pred_classes = pred.detach().argmax(dim=1)
-                pred_classes = torch.where(cand_mask[y, pred_classes], y, pred_classes)
-                # ====================================================
-                # Validation prediction accumulation
-                # ====================================================
-                if phase == "val":
-                    all_preds_epoch.append(pred_classes.cpu())
-                    all_labels_epoch.append(y.detach().cpu())
+                if not uses_embedding_loss:
+                    if mask_predictions is not None:
+                        pred = mask_predictions(pred.detach(), y)
+                    # A prediction of any class the label allows counts as the label itself
+                    pred_classes = pred.detach().argmax(dim=1)
+                    pred_classes = torch.where(cand_mask[y, pred_classes], y, pred_classes)
+                    # ====================================================
+                    # Validation prediction accumulation
+                    # ====================================================
+                    if phase == "val":
+                        all_preds_epoch.append(pred_classes.cpu())
+                        all_labels_epoch.append(y.detach().cpu())
                 # ====================================================
                 # Batch-level losses
                 # ====================================================
@@ -763,20 +720,19 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
                 running_classification_loss.append(classification_loss.detach().item())
                 running_classifier_aux.append(classifier_aux.detach().item())
                 running_transformer_aux.append(transformer_aux.detach().item())
-                if contrastive_enabled:
-                    running_contrastive_loss.append(contrastive_loss.detach().item())
                 # ====================================================
                 # Batch metrics
                 # ====================================================
-                k = min(10, pred.shape[1])
-                hits = cand_mask[y].gather(1, pred.detach().topk(k, dim=1).indices).cumsum(dim=1) > 0
-                running_acc.append(hits[:, 0].float().mean().item())
-                running_topk.append(hits[:, min(4, k - 1)].float().mean().item())
-                running_topk10.append(hits[:, -1].float().mean().item())
-                sklearn_metrics = calculate_metrics_sklearn_from_classes(pred_classes, y, num_classes, batch_size_small=True)
-                running_mcc.append(sklearn_metrics["mcc"])
-                running_f1_macro.append(sklearn_metrics["f1_macro"])
-                running_f1_weighted.append(sklearn_metrics["f1_weighted"])
+                if not uses_embedding_loss:
+                    k = min(10, pred.shape[1])
+                    hits = cand_mask[y].gather(1, pred.detach().topk(k, dim=1).indices).cumsum(dim=1) > 0
+                    running_acc.append(hits[:, 0].float().mean().item())
+                    running_topk.append(hits[:, min(4, k - 1)].float().mean().item())
+                    running_topk10.append(hits[:, -1].float().mean().item())
+                    sklearn_metrics = calculate_metrics_sklearn_from_classes(pred_classes, y, num_classes, batch_size_small=True)
+                    running_mcc.append(sklearn_metrics["mcc"])
+                    running_f1_macro.append(sklearn_metrics["f1_macro"])
+                    running_f1_weighted.append(sklearn_metrics["f1_weighted"])
             # ========================================================
             # Epoch averages
             # ========================================================
@@ -784,13 +740,12 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             epoch_classification_loss = (np.mean(running_classification_loss))
             epoch_classifier_aux = (np.mean(running_classifier_aux) if running_classifier_aux else 0.0)
             epoch_transformer_aux = np.mean(running_transformer_aux) if running_transformer_aux else 0.0
-            epoch_contrastive_loss = (np.mean(running_contrastive_loss) if running_contrastive_loss else 0.0)
-            epoch_acc = float(np.mean(running_acc))
-            epoch_topk = float(np.mean(running_topk))
-            epoch_topk10 = float(np.mean(running_topk10))
-            epoch_mcc = np.mean(running_mcc)
-            epoch_f1_macro = np.mean(running_f1_macro)
-            epoch_f1_weighted = np.mean(running_f1_weighted)
+            epoch_acc = float(np.mean(running_acc)) if running_acc else 0.0
+            epoch_topk = float(np.mean(running_topk)) if running_topk else 0.0
+            epoch_topk10 = float(np.mean(running_topk10)) if running_topk10 else 0.0
+            epoch_mcc = np.mean(running_mcc) if running_mcc else 0.0
+            epoch_f1_macro = np.mean(running_f1_macro) if running_f1_macro else 0.0
+            epoch_f1_weighted = np.mean(running_f1_weighted) if running_f1_weighted else 0.0
             # ========================================================
             # Full-validation metrics
             # ========================================================
@@ -809,26 +764,38 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             # ========================================================
             # Console/logging
             # ========================================================
-            message = ("{} " "Loss: {:.4f} " "Cls: {:.4f} " "C-MoE: {:.4f} " "Acc: {:.4f} " "MCC: {:.4f} " "F1-macro: {:.4f} " "F1-weighted: {:.4f} "
-                "Top-5: {:.4f} " "Top-10: {:.4f}").format(phase, epoch_loss, epoch_classification_loss, epoch_classifier_aux, epoch_acc, epoch_mcc_final,
-                epoch_f1_macro_final, epoch_f1_weighted_final, epoch_topk, epoch_topk10)
+            if uses_embedding_loss:
+                message = f"{phase} Loss: {epoch_loss:.4f} Contrastive: {epoch_classification_loss:.4f} C-MoE: {epoch_classifier_aux:.4f}"
+            else:
+                message = ("{} " "Loss: {:.4f} " "Cls: {:.4f} " "C-MoE: {:.4f} " "Acc: {:.4f} " "MCC: {:.4f} " "F1-macro: {:.4f} " "F1-weighted: {:.4f} "
+                    "Top-5: {:.4f} " "Top-10: {:.4f}").format(phase, epoch_loss, epoch_classification_loss, epoch_classifier_aux, epoch_acc, epoch_mcc_final,
+                    epoch_f1_macro_final, epoch_f1_weighted_final, epoch_topk, epoch_topk10)
             if transformer_moe_enabled:
                 message += f" T-MoE: {epoch_transformer_aux:.4f}"
-            if contrastive_enabled:
-                message += f" SupCon: {epoch_contrastive_loss:.4f}"
+            selection_score = None
+            if selection_metric is not None and phase == "val":
+                selection_score = float(selection_metric(model))
+                message += f" {selection_name}: {selection_score:.4f}"
             logging.info(message)
             print(message)
             # ========================================================
             # WandB
             # ========================================================
             if log_to_wandb:
-                wandb_payload = {f"{phase}/loss": epoch_loss, f"{phase}/classification_loss": epoch_classification_loss,
+                wandb_payload = {
+                    f"{phase}/loss": epoch_loss, f"{phase}/{primary_loss_name}": epoch_classification_loss,
                     f"{phase}/classifier_moe_aux_loss": epoch_classifier_aux,
-                    f"{phase}/transformer_moe_aux_loss": epoch_transformer_aux,
-                    f"{phase}/accuracy": epoch_acc, f"{phase}/mcc": epoch_mcc_final, f"{phase}/f1_score_macro": epoch_f1_macro_final,
-                    f"{phase}/f1_score_weighted": epoch_f1_weighted_final, f"{phase}/top5_accuracy": epoch_topk, f"{phase}/top10_accuracy": epoch_topk10, "epoch": epoch,}
-                if contrastive_enabled:
-                    wandb_payload[f"{phase}/contrastive_loss"] = float(epoch_contrastive_loss)
+                    f"{phase}/transformer_moe_aux_loss": epoch_transformer_aux, "epoch": epoch,
+                }
+                if not uses_embedding_loss:
+                    wandb_payload.update({
+                        f"{phase}/accuracy": epoch_acc, f"{phase}/mcc": epoch_mcc_final,
+                        f"{phase}/f1_score_macro": epoch_f1_macro_final,
+                        f"{phase}/f1_score_weighted": epoch_f1_weighted_final,
+                        f"{phase}/top5_accuracy": epoch_topk, f"{phase}/top10_accuracy": epoch_topk10,
+                    })
+                if selection_score is not None:
+                    wandb_payload[f"{phase}/{selection_name}"] = selection_score
                 if classifier_routing_enabled:
                     wandb_payload.update(_classifier_routing_wandb_payload(phase, epoch, glycans, routing_class_sample_counts, routing_expert_selection_counts,
                         routing_expert_responsibility_sums,glycan_compositions=glycan_compositions))
@@ -837,33 +804,39 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
             # Save metrics
             # ========================================================
             metrics_dict[phase]["loss"].append(float(epoch_loss))
-            metrics_dict[phase]["classification_loss"].append(float(epoch_classification_loss))
+            metrics_dict[phase][primary_loss_name].append(float(epoch_classification_loss))
             metrics_dict[phase]["classifier_moe_aux_loss"].append(float(epoch_classifier_aux))
             metrics_dict[phase]["transformer_moe_aux_loss"].append(float(epoch_transformer_aux))
-            if contrastive_enabled:
-                metrics_dict[phase]["contrastive_loss"].append(float(epoch_contrastive_loss))
-            metrics_dict[phase]["accuracy"].append(float(epoch_acc.item() if hasattr(epoch_acc, "item") else epoch_acc))
-            metrics_dict[phase]["mcc"].append(float(epoch_mcc_final))
-            metrics_dict[phase]["f1_macro"].append(float(epoch_f1_macro_final))
-            metrics_dict[phase]["f1_weighted"].append(float(epoch_f1_weighted_final))
-            metrics_dict[phase]["top5_accuracy"].append(float(epoch_topk.item() if hasattr(epoch_topk, "item") else epoch_topk))
-            metrics_dict[phase]["top10_accuracy"].append(float(epoch_topk10.item() if hasattr(epoch_topk10, "item") else epoch_topk10))
+            if selection_score is not None:
+                metrics_dict[phase][selection_name].append(selection_score)
+            if not uses_embedding_loss:
+                metrics_dict[phase]["accuracy"].append(float(epoch_acc.item() if hasattr(epoch_acc, "item") else epoch_acc))
+                metrics_dict[phase]["mcc"].append(float(epoch_mcc_final))
+                metrics_dict[phase]["f1_macro"].append(float(epoch_f1_macro_final))
+                metrics_dict[phase]["f1_weighted"].append(float(epoch_f1_weighted_final))
+                metrics_dict[phase]["top5_accuracy"].append(float(epoch_topk.item() if hasattr(epoch_topk, "item") else epoch_topk))
+                metrics_dict[phase]["top10_accuracy"].append(float(epoch_topk10.item() if hasattr(epoch_topk10, "item") else epoch_topk10))
             # ========================================================
             # Best model / early stopping
             # ========================================================
-            if (phase == "val" and epoch_loss <= best_loss):
+            # The selection metric, where given, replaces the validation loss (negated: lower is better for both)
+            monitored = -selection_score if selection_score is not None else epoch_loss
+            if (phase == "val" and monitored <= best_monitored):
+                best_monitored = monitored
                 best_loss = epoch_loss
                 best_model_wts = (copy.deepcopy(model.state_dict()))
-            if (phase == "val" and epoch_acc > best_acc):
+            if not uses_embedding_loss and phase == "val" and epoch_acc > best_acc:
                 best_acc = epoch_acc
             if phase == "val":
                 val_losses.append(epoch_loss)
-                val_acc.append(epoch_acc)
-                early_stopping(epoch_loss, model)
-                scheduler.step(epoch_loss)
+                if not uses_embedding_loss:
+                    val_acc.append(epoch_acc)
+                early_stopping(monitored, model)
+                scheduler.step(monitored)
             if phase == "train":
                 train_losses.append(epoch_loss)
-                train_acc.append(epoch_acc)
+                if not uses_embedding_loss:
+                    train_acc.append(epoch_acc)
             torch.cuda.empty_cache()
         # ============================================================
         # Early stopping
@@ -879,14 +852,23 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     # ================================================================
     time_elapsed = (time.time() - since)
     print("Training complete in " "{:.0f}m {:.0f}s".format(time_elapsed // 60, time_elapsed % 60))
-    print("Best val loss: {:4f}, " "best Accuracy score: {:.4f}".format(best_loss, best_acc))
+    if selection_metric is not None:
+        print(f"Best {selection_name}: {-best_monitored:.4f} (validation loss {best_loss:.4f})")
+    elif uses_embedding_loss:
+        print(f"Best validation contrastive loss: {best_loss:.4f}")
+    else:
+        print("Best val loss: {:4f}, " "best Accuracy score: {:.4f}".format(best_loss, best_acc))
     # Persist the trained model before optional reporting/plotting can fail.
     output_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = output_dir / f"CandyCrunch_{setting_name}.pt"
     checkpoint = dict(checkpoint_metadata or {})
     checkpoint["state_dict"] = best_model_wts
     checkpoint["best_val_loss"] = float(best_loss)
-    checkpoint["best_val_accuracy"] = float(best_acc)
+    if not uses_embedding_loss:
+        checkpoint["best_val_accuracy"] = float(best_acc)
+    if selection_metric is not None:
+        checkpoint["selection_metric"] = selection_name
+        checkpoint["best_selection_metric"] = float(-best_monitored)
     checkpoint["classifier_moe_aux_loss_weight"] = float(classifier_moe_aux_loss_weight)
     checkpoint["transformer_moe_aux_loss_weight"] = float(transformer_moe_aux_loss_weight)
     torch.save(checkpoint, best_model_path)
@@ -897,27 +879,35 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     os.makedirs(output_dir / "metrics", exist_ok=True)
     metrics_path = output_dir / "metrics" / f"CandyCrunch_metrics_{setting_name}.json"
     plot_path = output_dir / "metrics" / f"CandyCrunch_metric_{setting_name}.png"
-    metrics_dict["best"] = {"val_loss": float(best_loss), "val_accuracy": float(best_acc.item() if hasattr(best_acc, "item") else best_acc),}
+    metrics_dict["best"] = {"val_loss": float(best_loss)}
+    if not uses_embedding_loss:
+        metrics_dict["best"]["val_accuracy"] = float(best_acc)
+    if selection_metric is not None:
+        metrics_dict["best"][selection_name] = float(-best_monitored)
     metrics_dict["completed_epochs"] = len(metrics_dict["val"]["loss"])
     with open(metrics_path, "w") as f:
         json.dump(metrics_dict, f, indent=2)
     # ================================================================
     # Plot loss / accuracy
     # ================================================================
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    if uses_embedding_loss:
+        fig, ax1 = plt.subplots(figsize=(10, 4))
+    else:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
     ax1.plot(range(len(val_losses)), val_losses, label="Validation")
     ax1.plot(range(len(train_losses)), train_losses, label="Training")
     ax1.set_ylabel("Loss")
     ax1.set_title("Model Training - Loss")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    ax2.plot(range(len(val_acc)), val_acc, label="Validation")
-    ax2.plot(range(len(train_acc)), train_acc, label="Training")
-    ax2.set_xlabel("Number of Epochs")
-    ax2.set_ylabel("Accuracy")
-    ax2.set_title("Model Training - Accuracy")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    if not uses_embedding_loss:
+        ax2.plot(range(len(val_acc)), val_acc, label="Validation")
+        ax2.plot(range(len(train_acc)), train_acc, label="Training")
+        ax2.set_xlabel("Number of Epochs")
+        ax2.set_ylabel("Accuracy")
+        ax2.set_title("Model Training - Accuracy")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
@@ -928,8 +918,10 @@ def train_model(model,dataloaders, criterion,optimizer, scheduler, glycans, num_
     # Final WandB logging
     # ================================================================
     if log_to_wandb:
-        wandb.log(prefix_wandb_payload({"training_plots/loss_curves": wandb.Image(str(plot_path)), "best_metrics/best_val_loss": best_loss,
-            "best_metrics/best_val_accuracy": (best_acc.item() if hasattr(best_acc, "item") else best_acc),}))
+        best_payload = {"training_plots/loss_curves": wandb.Image(str(plot_path)), "best_metrics/best_val_loss": best_loss}
+        if not uses_embedding_loss:
+            best_payload["best_metrics/best_val_accuracy"] = float(best_acc)
+        wandb.log(prefix_wandb_payload(best_payload))
         wandb.save(str(best_model_path))
         wandb.save(str(metrics_path))
     # ================================================================

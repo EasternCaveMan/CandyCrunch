@@ -378,14 +378,14 @@ class CandyCrunch_CNN2(nn.Module):
         if return_aux_losses:
             classifier_aux = (self.get_classifier_aux_loss().reshape(1))
 
-        # if rep and return_routing and return_aux_losses:
-        #     return logits, comb_rep, routing, classifier_aux
-        # if rep and return_routing:
-        #     return logits, comb_rep, routing
-        # if rep and return_aux_losses:
-        #     return logits, comb_rep, classifier_aux
-        # if rep:
-        #     return logits, comb_rep
+        if rep and return_routing and return_aux_losses:
+            return logits, comb, routing, classifier_aux
+        if rep and return_routing:
+            return logits, comb, routing
+        if rep and return_aux_losses:
+            return logits, comb, classifier_aux
+        if rep:
+            return logits, comb
         if return_routing and return_aux_losses:
             return logits, routing, classifier_aux
         if return_routing:

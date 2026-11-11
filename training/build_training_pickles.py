@@ -4,6 +4,7 @@ sets; pretrain/<project>.pkl: unlabelled ones) into CandyCrunch-ready training p
 per-sample candidate masks and the pretraining inputs.  Adjust the paths in the configuration block before running.
 """
 
+import json
 import pickle
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from sklearn.model_selection import GroupShuffleSplit
 from glycowork.motif.graph import compare_glycans, glycan_to_nxGraph
 from glycowork.motif.tokenization import glycan_to_composition
 from glycowork.motif.processing import canonicalize_composition
-train_dataset="full20261031"
-pretrain_dataset="Prefull20261031"
+train_dataset="full20261109"
+pretrain_dataset="Prefull20261109"
 cc_training_dir = Path("/home/daniel/vahid/CandyCrunch-vahid2/data_processing/Final_Results_cc")
 exclude_projects = set()               # GlycoPost_IDs left out of training and pretraining
 output_dir = Path(f"prepared_datasets_{train_dataset}")
@@ -126,6 +127,11 @@ print("Writing intermediate dataframes")
 output_dir.mkdir(parents=True, exist_ok=True)
 train_df.to_pickle(output_dir / "train_second_GShS.pkl")
 test_df.to_pickle(output_dir / "test_second_GShS.pkl")
+# Each split's runs, so contrastive pretraining can leave the validation runs out (training/pretraining.py, fine_tuning_validation_runs)
+for split_name, split_df in (("train", train_df), ("test", test_df)):
+    runs = sorted({(str(project), str(filename)) for project, filename in zip(split_df["GlycoPost_ID"], split_df["filename"])})
+    with open(output_dir / f"runs_{split_name}_GShS.json", "w") as fh:
+        json.dump(runs, fh, indent = 1)
 
 print("Serialising tuples for CandyCrunch")
 # The member spectra of each input ride along as a tenth element where the conversion kept them (ResampledDataset re-pools them, SimpleDataset reads the first nine)
