@@ -355,10 +355,8 @@ def main(args):
     if pretraining_tag and args.pretraining_optimizer == "adamw":
         # Its own token after the pretraining tag, so SAM and AdamW runs of one setting keep separate checkpoints and leaderboard rows
         pretraining_tag += "_PtAdamW"
-    model_kwargs = {"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order)}
+    model_kwargs = {"num_classes": len(glycans),"input_precursor_dim": len(comp_vector_order), "input_dim":input_dim}
     model_class = CandyCrunch_CNN
-    if args.model == "CNN":
-        model_kwargs.update(input_dim=input_dim)
     if args.model == "CNN2":
         model_class = CandyCrunch_CNN2
         model_kwargs.update(
@@ -663,7 +661,7 @@ def build_parser():
     parser.add_argument("--pretraining-noise-peaks", type = float, default = 0.4,
                         help = "View augmentation: noise peaks added per peak of the spectrum, on average (default: 0.4).")
       # Loss and projection head
-    parser.add_argument("--supcon-temperature", "--pretraining-temperature", dest = "supcon_temperature", type = float, default = 0.2,
+    parser.add_argument("--supcon-temperature", "--pretraining-temperature", dest = "supcon_temperature", type = float, default = 0.1,
                         help = "Temperature of the contrastive pretraining loss (default: 0.1).")
     parser.add_argument("--pretraining-projection-dim", type = int, default = 128,
                         help = "Output width of the projection head the pretraining loss acts on; fine-tuning drops the head (default: 128).")

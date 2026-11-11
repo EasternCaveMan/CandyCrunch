@@ -280,11 +280,11 @@ class ResUnit2(nn.Module):
 
 class CandyCrunch_CNN2(nn.Module):
     """Daniel new Change"""
-    def __init__( self, num_classes=1, hidden_dim=1024, input_precursor_dim=None, dropout=0.2,
+    def __init__( self,input_dim, num_classes=1, hidden_dim=1024, input_precursor_dim=None, dropout=0.2,
                   se=None, se_reduction=None,norm_type=None,activation=None,encoder_activation=None, classifier_moe=False, classifier_num_experts=4,
                   classifier_top_k=2, classifier_expert_hidden_dim=None):
         super(CandyCrunch_CNN2, self).__init__()
-
+        self.input_dim = input_dim
         self.classifier_moe = classifier_moe
         self.type_emb = nn.Embedding(5, 24)
         self.mode_emb = nn.Embedding(3, 24)

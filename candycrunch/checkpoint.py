@@ -44,7 +44,7 @@ def load_checkpoint(model_path, device=None, temperature=1.15):
     return {
         "model": model,
         "glycans": glycans,
-        "bin_num": 2048, #  model_kwargs["input_dim"],
+        "bin_num": model_kwargs["input_dim"],
         "comp_vector_order": comp_vector_order,
         "temperature": float(temperature),
     }
