@@ -79,6 +79,11 @@ def make_activation(name):
 # Spectrum-level classifier Mixture of Experts
 # ============================================================
 
+# Glycan class codes, as the models take them: O 0, N 1, free/lipid 2 (prediction.CLASS_CODES); pretraining also uses 3 for spectra whose candidate
+# compositions span classes. Fixed routing by glycan class has one classifier expert per class code
+GLYCAN_CLASS_EXPERTS = 3
+
+
 class MoEClassifier(nn.Module):
     """
     Mixture-of-Experts classifier.
@@ -91,25 +96,38 @@ class MoEClassifier(nn.Module):
         [B, D] -> [B, num_classes]
     Final logits:
         logits =
-            sum_{e in TopK}
+            shared(h)                       (only with shared_expert)
+            + sum_{e in TopK}
                 gate_e * classifier_e(h)
+
+    top_k = num_experts is dense gating: every expert, weighted by the router's softmax, so the routing has no top-k switches (the
+    balancing loss is then constant at 1 and has no gradient).
+    shared_expert adds an expert that every spectrum uses (DeepSeekMoE's shared experts): each class's weights there learn from all of
+    its spectra, and the routed experts add to it.
+    fixed_routing replaces the router by expert indices given to forward (expert_indices, e.g. the glycan class): one expert per spectrum
+    and no balancing loss; a spectrum whose index names no expert gets the mean of all experts.
     """
-    def __init__(self,input_dim,num_classes,num_experts=4,top_k=2,hidden_dim=None,dropout=0.0,activation="gelu",):
+    def __init__(self, input_dim, num_classes, num_experts = 4, top_k = 2, hidden_dim = None, dropout = 0.0, activation = "gelu",
+                 shared_expert = False, fixed_routing = False):
         super().__init__()
         if top_k < 1 or top_k > num_experts:
             raise ValueError("top_k must be between 1 and num_experts.")
+        if fixed_routing and top_k != 1:
+            raise ValueError("Fixed routing sends each spectrum to one expert; use top_k=1.")
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.num_experts = num_experts
         self.top_k = top_k
+        self.fixed_routing = fixed_routing
         self.last_aux_loss = None
         self.last_gate_probs = None
         self.last_top_indices = None
         self.last_top_weights = None
         # ----------------------------------------------------
-        # Spectrum-level router
+        # Spectrum-level router (none with fixed routing)
         # ----------------------------------------------------
-        self.router = nn.Linear(input_dim,num_experts)
+        self.router = None if fixed_routing else nn.Linear(input_dim, num_experts)
+
         # ----------------------------------------------------
         # Classifier experts
         #
@@ -118,16 +136,18 @@ class MoEClassifier(nn.Module):
         #   Linear:
         #       D -> C
         #
-        # or shallow MLP:
+        # or shallow MLP (activation is a name, as make_activation takes it):
         #       D -> H -> C
         # ----------------------------------------------------
-        if hidden_dim is None:
-            self.experts = nn.ModuleList([nn.Linear(input_dim,num_classes) for _ in range(num_experts)])
-        else:
-            self.experts = nn.ModuleList([nn.Sequential(nn.Linear(input_dim,hidden_dim),
-                                                        make_activation(activation),
-                                                        nn.Dropout(dropout),
-                                                        nn.Linear(hidden_dim,num_classes)) for _ in range(num_experts)])
+        def make_expert():
+            if hidden_dim is None:
+                return nn.Linear(input_dim, num_classes)
+            return nn.Sequential(nn.Linear(input_dim, hidden_dim),
+                                 make_activation(activation),
+                                 nn.Dropout(dropout),
+                                 nn.Linear(hidden_dim, num_classes))
+        self.experts = nn.ModuleList([make_expert() for _ in range(num_experts)])
+        self.shared_expert = make_expert() if shared_expert else None
     def load_balancing_loss(self, gate_probs, top_indices):
         """
         gate_probs:
@@ -146,10 +166,24 @@ class MoEClassifier(nn.Module):
         load = (selected.mean(dim=0) / self.top_k)
         return self.num_experts * torch.sum(importance * load)
 
-    def forward(self,x,return_routing=False,return_selected_logits=True):
+    def fixed_gates(self, x, expert_indices):
+        """Fixed routing: gate probabilities [B, E], expert index [B, 1] and weight [B, 1] of each spectrum. A spectrum whose index names no
+        expert gets index -1, weight 0 and uniform gate probabilities (forward gives it the mean of all experts)."""
+        expert_indices = expert_indices.reshape(-1).to(device = x.device, dtype = torch.long)
+        if expert_indices.numel() != x.size(0):
+            raise ValueError("expert_indices needs one expert index per spectrum.")
+        known = (expert_indices >= 0) & (expert_indices < self.num_experts)
+        one_hot = F.one_hot(expert_indices.clamp(0, self.num_experts - 1), num_classes = self.num_experts).to(x.dtype)
+        gate_probs = torch.where(known.unsqueeze(1), one_hot, torch.full_like(one_hot, 1.0 / self.num_experts))
+        top_indices = torch.where(known, expert_indices, torch.full_like(expert_indices, -1)).unsqueeze(1)
+        return gate_probs, top_indices, known.to(x.dtype).unsqueeze(1)
+
+    def forward(self, x, return_routing = False, return_selected_logits = True, expert_indices = None):
         """
         x:
             [B, input_dim]
+        expert_indices:
+            [B] expert of each spectrum; required with fixed routing, ignored otherwise
 
         Returns:
             logits [B, num_classes]
@@ -158,25 +192,31 @@ class MoEClassifier(nn.Module):
             logits,
             routing_dictionary
         """
-
-        # ----------------------------------------------------
-        # 1. Router
-        # ----------------------------------------------------
-        gate_logits = self.router(x)
-        # [B,E]
-        gate_probs = torch.softmax(gate_logits,dim=-1)
-        # ----------------------------------------------------
-        # 2. Top-K classifier experts
-        # ----------------------------------------------------
-        top_weights, top_indices = torch.topk(gate_probs, k=self.top_k,dim=-1)
-        # ----------------------------------------------------
-        # 3. Renormalize selected router probabilities
-        # ----------------------------------------------------
-        top_weights = (top_weights / top_weights.sum(dim=-1,keepdim=True).clamp_min(1e-9))
-        # ----------------------------------------------------
-        # 4. Balancing loss
-        # ----------------------------------------------------
-        self.last_aux_loss = (self.load_balancing_loss(gate_probs,top_indices))
+        if self.fixed_routing:
+            if expert_indices is None:
+                raise ValueError("A classifier with fixed routing needs expert_indices.")
+            gate_probs, top_indices, top_weights = self.fixed_gates(x, expert_indices)
+            # No router, so nothing to balance
+            self.last_aux_loss = x.new_zeros(())
+        else:
+            # ----------------------------------------------------
+            # 1. Router
+            # ----------------------------------------------------
+            gate_logits = self.router(x)
+            # [B,E]
+            gate_probs = torch.softmax(gate_logits, dim = -1)
+            # ----------------------------------------------------
+            # 2. Top-K classifier experts
+            # ----------------------------------------------------
+            top_weights, top_indices = torch.topk(gate_probs, k = self.top_k, dim = -1)
+            # ----------------------------------------------------
+            # 3. Renormalize selected router probabilities
+            # ----------------------------------------------------
+            top_weights = (top_weights / top_weights.sum(dim = -1, keepdim = True).clamp_min(1e-9))
+            # ----------------------------------------------------
+            # 4. Balancing loss
+            # ----------------------------------------------------
+            self.last_aux_loss = (self.load_balancing_loss(gate_probs, top_indices))
         self.last_gate_probs = (gate_probs.detach())
         self.last_top_indices = (top_indices.detach())
         self.last_top_weights = (top_weights.detach())
@@ -207,13 +247,27 @@ class MoEClassifier(nn.Module):
 
             if return_routing and return_selected_logits:
                 selected_logits[batch_indices,slot_indices] = expert_output
+        if self.fixed_routing:
+            # Spectra whose index names no expert (e.g. the mixed glycan class of pretraining spectra) get the mean of all experts
+            unrouted = (top_indices[:, 0] < 0).nonzero(as_tuple = True)[0]
+            if unrouted.numel():
+                expert_input = x.index_select(0, unrouted)
+                mean_output = torch.stack([expert(expert_input) for expert in self.experts]).mean(dim = 0)
+                logits.index_add_(0, unrouted, mean_output)
+                if return_routing and return_selected_logits:
+                    selected_logits[unrouted, 0] = mean_output
+        # ----------------------------------------------------
+        # 6. Shared expert, used by every spectrum
+        # ----------------------------------------------------
+        if self.shared_expert is not None:
+            logits = logits + self.shared_expert(x)
         if return_routing:
             routing = {
                 "gate_probs": gate_probs,
                 "top_indices": top_indices,
                 "top_weights": top_weights,
                 "expert_batch_sizes": torch.bincount(
-                    top_indices.reshape(-1),
+                    top_indices[top_indices >= 0].reshape(-1),
                     minlength=self.num_experts,
                 ),
             }
@@ -282,10 +336,17 @@ class CandyCrunch_CNN2(nn.Module):
     """Daniel new Change"""
     def __init__( self,input_dim, num_classes=1, hidden_dim=1024, input_precursor_dim=None, dropout=0.2,
                   se=None, se_reduction=None,norm_type=None,activation=None,encoder_activation=None, classifier_moe=False, classifier_num_experts=4,
-                  classifier_top_k=2, classifier_expert_hidden_dim=None):
+                  classifier_top_k=2, classifier_expert_hidden_dim=None, classifier_shared_expert=False, classifier_fixed_routing=False):
         super(CandyCrunch_CNN2, self).__init__()
+        if (classifier_shared_expert or classifier_fixed_routing) and not classifier_moe:
+            raise ValueError("classifier_shared_expert and classifier_fixed_routing need classifier_moe=True.")
+        if classifier_fixed_routing and classifier_num_experts != GLYCAN_CLASS_EXPERTS:
+            # With more experts, the ones past the class codes would never be trained
+            raise ValueError(f"Fixed routing sends each spectrum to the expert of its glycan class (O, N, free/lipid), so it needs "
+                             f"classifier_num_experts={GLYCAN_CLASS_EXPERTS}.")
         self.input_dim = input_dim
         self.classifier_moe = classifier_moe
+        self.classifier_fixed_routing = bool(classifier_fixed_routing)
         self.type_emb = nn.Embedding(5, 24)
         self.mode_emb = nn.Embedding(3, 24)
         self.lc_emb = nn.Embedding(4, 24)
@@ -319,7 +380,10 @@ class CandyCrunch_CNN2(nn.Module):
                                                 top_k=classifier_top_k,
                                                 hidden_dim=classifier_expert_hidden_dim,
                                                 dropout=dropout,
-                                                activation=make_activation(activation))
+                                                # The activation's name: MoEClassifier makes the module for each MLP expert
+                                                activation=activation,
+                                                shared_expert=classifier_shared_expert,
+                                                fixed_routing=classifier_fixed_routing)
         else:
             self.comb_lin2 = nn.Linear(hidden_dim//2, num_classes)
 
@@ -345,6 +409,8 @@ class CandyCrunch_CNN2(nn.Module):
 
     def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False,
                 return_routing=False, return_aux_losses=False, return_selected_logits=True):
+        # Fixed routing sends each spectrum to the classifier expert of its glycan class code, taken before the code becomes its embedding
+        expert_indices = glycan_type if self.classifier_fixed_routing else None
         glycan_type = self.type_emb(glycan_type).squeeze(1)
         mode = self.mode_emb(mode).squeeze(1)
         lc = self.lc_emb(lc).squeeze(1)
@@ -367,9 +433,10 @@ class CandyCrunch_CNN2(nn.Module):
                     comb,
                     return_routing=True,
                     return_selected_logits=return_selected_logits,
+                    expert_indices=expert_indices,
                 )
             else:
-                logits = self.classifier_out(comb)
+                logits = self.classifier_out(comb, expert_indices=expert_indices)
                 routing = None
         else:
             logits = self.comb_lin2(comb)

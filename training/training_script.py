@@ -19,7 +19,7 @@ from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
 import pandas as pd
 import wandb
-from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, SimpleDataset, transform_mz, transform_rt
+from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, GLYCAN_CLASS_EXPERTS, SimpleDataset, transform_mz, transform_rt
 from candycrunch.transformer import CandyCrunch_Transformer
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
@@ -111,6 +111,16 @@ def main(args):
         raise ValueError(f"Unknown model={args.model!r}. Expected 'CNN', 'CNN2', or 'Transformer'.")
     if args.model == "CNN" and args.classifier_moe:
         raise ValueError("--classifier_moe requires --model CNN2 or Transformer.")
+    if (args.classifier_shared_expert or args.classifier_fixed_routing) and not args.classifier_moe:
+        raise ValueError("--classifier_shared_expert and --classifier_fixed_routing need --classifier_moe.")
+    if (args.classifier_shared_expert or args.classifier_fixed_routing) and args.model != "CNN2":
+        # The Transformer has its own classifier MoE (candycrunch/transformer.py) without these options
+        raise ValueError("--classifier_shared_expert and --classifier_fixed_routing are implemented for --model CNN2 only.")
+    if args.classifier_fixed_routing and (args.classifier_num_experts, args.classifier_top_k) != (GLYCAN_CLASS_EXPERTS, 1):
+        raise ValueError(f"--classifier_fixed_routing sends each spectrum to the expert of its glycan class (O, N, free/lipid): "
+                         f"use --classifier_num_experts {GLYCAN_CLASS_EXPERTS} --classifier_top_k 1.")
+    # Fixed routing has no router and so no balancing loss: train_model's log and the checkpoint then record its weight as 0
+    classifier_aux_weight = 0.0 if args.classifier_fixed_routing else args.classifier_moe_aux_loss_weight
     pretraining_enabled = args.sup_pretraining or args.unsup_pretraining
     if args.sup_pretraining and args.unsup_pretraining:
         raise ValueError("Use either --sup-pretraining True or --unsup-pretraining True, not both.")
@@ -371,6 +381,11 @@ def main(args):
             se=args.se,
             se_reduction=args.se_reduction
         )
+        # Only when on, so the checkpoints of other runs keep the constructor arguments that older code can load
+        if args.classifier_shared_expert:
+            model_kwargs["classifier_shared_expert"] = True
+        if args.classifier_fixed_routing:
+            model_kwargs["classifier_fixed_routing"] = True
     elif args.model == "Transformer":
         model_class = CandyCrunch_Transformer
         model_kwargs.update(heads =args.nheads,
@@ -401,9 +416,14 @@ def main(args):
     encoder_tag = ("NOFF" if not args.use_transformer_ff else (
         f"MoE{args.num_experts}K{args.moe_top_k}" if args.encoder_type == "moe" else "DENSE"))
     if args.classifier_moe:
-        classifier_tag = f"MoC{args.classifier_num_experts}K{args.classifier_top_k}W{args.classifier_moe_aux_loss_weight}"
+        # Fixed routing has no router and so no balancing loss whose weight the name would need: MoC3K1Fix
+        routing_tag = "Fix" if args.classifier_fixed_routing else f"W{args.classifier_moe_aux_loss_weight}"
+        classifier_tag = f"MoC{args.classifier_num_experts}K{args.classifier_top_k}{routing_tag}"
         if args.classifier_expert_hidden_dim is not None:
             classifier_tag += (f"H{args.classifier_expert_hidden_dim}")
+        # A shared expert ends the tag (MoC10K4W0.1S), so runs with and without it keep separate checkpoints and leaderboard rows
+        if args.classifier_shared_expert:
+            classifier_tag += "S"
     else:
         classifier_tag = "ShCl"
 
@@ -549,7 +569,7 @@ def main(args):
             pretrain_model, pretrain_dataloaders, pretrain_criterion, pretrain_optimizer, pretrain_scheduler,
             pretrain_pool.composition_labels or ["spectrum"], num_epochs = args.pretraining_epochs, patience = pretrain_patience,
             model_type = args.model, setting_name = pretrain_setting_name, transformer_moe_aux_loss_weight = args.transformer_moe_aux_loss_weight,
-            classifier_moe_aux_loss_weight = args.classifier_moe_aux_loss_weight
+            classifier_moe_aux_loss_weight = classifier_aux_weight
             , checkpoint_metadata = pretrain_metadata, save_dir = pretrain_model_dir, wandb_prefix = "pretrain",
             selection_metric = selection,
         )
@@ -577,11 +597,16 @@ def main(args):
     # ============================================================
     print("Start fine-tuning")
     if args.classifier_moe:
-        print("Classifier MoE auxiliary weight:",args.classifier_moe_aux_loss_weight)
+        if args.classifier_fixed_routing:
+            print("Classifier MoE: fixed routing by glycan class, no balancing loss")
+        else:
+            print("Classifier MoE auxiliary weight:",args.classifier_moe_aux_loss_weight)
+        if args.classifier_shared_expert:
+            print("Classifier MoE: with a shared expert that every spectrum uses")
     model_ft = train_model(model,dataloaders,criterion,optimizer_ft,scheduler,glycans, num_epochs=args.epoch,
         patience=args.patience,model_type=args.model,setting_name=setting_name,
         transformer_moe_aux_loss_weight=args.transformer_moe_aux_loss_weight,
-        classifier_moe_aux_loss_weight=args.classifier_moe_aux_loss_weight,checkpoint_metadata=checkpoint_metadata,glycan_compositions=glycan_compositions,
+        classifier_moe_aux_loss_weight=classifier_aux_weight,checkpoint_metadata=checkpoint_metadata,glycan_compositions=glycan_compositions,
         save_dir=model_dir,cand_mask=cand_mask)
     wandb.finish()
 # ================================================================
@@ -609,7 +634,7 @@ def build_parser():
     parser.add_argument("--epoch", type=int, default=30)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--pretraining-epochs",type=int,default=10,help="Number of contrastive pretraining epochs before fine-tuning (default: 10).")
-    parser.add_argument("--pretraining-patience", type = int, default = None, help = "Early-stopping patience for contrastive pretraining. Defaults to --patience when omitted.")
+    parser.add_argument("--pretraining-patience", type = int, default = 3, help = "Early-stopping patience for contrastive pretraining. Defaults to --patience when omitted.")
     # ============================================================
     # Training-loss
     # ============================================================
@@ -622,10 +647,10 @@ def build_parser():
                         help = "If True, pretrain the encoder contrastively on --sup-pretraining-dataset with composition labels shaping the pairs (spectra of a composition at one RT positive, at another RT in one run negative), then fine-tune with --loss_function (default: False).")
     parser.add_argument("--unsup-pretraining", "--unsup_pretraining", dest = "unsup_pretraining", type = str_to_bool, nargs = "?", const = True, default = False,
                         help = "If True, pretrain the encoder contrastively on --unsup-pretraining-dataset without labels, pairing spectra by precursor m/z and RT, then fine-tune with --loss_function (default: False).")
-    parser.add_argument("--sup-pretraining-dataset", "--sup_pretraining_dataset", dest="sup_pretraining_dataset", default=str(Path(__file__).resolve().parents[1] / "data_processing" / "Final_Results_cc" / "Prefull20261109.pkl"),
-                        help = "Pretraining DataFrame pickle with a composition column, or compositions with annotation_scores (default: data_processing/Final_Results_cc/Prefull20261109.pkl).")
-    parser.add_argument("--unsup-pretraining-dataset", "--unsup_pretraining_dataset", dest = "unsup_pretraining_dataset", type = str,default = str(Path(__file__).resolve().parents[1] / "data_processing" / "Final_Results_cc" / "Prefull20261109.pkl"),
-                        help = "Pretraining DataFrame pickle, prepared dataset name, or prepared directory (default: data_processing/Final_Results_cc/Prefull20261109.pkl).")
+    parser.add_argument("--sup-pretraining-dataset", "--sup_pretraining_dataset", dest="sup_pretraining_dataset", default=str(Path(__file__).resolve().parents[1] / "data_processing" / "Final_Results_cc" / "Prefull20261109_score10.pkl"),
+                        help = "Pretraining DataFrame pickle with a composition column, or compositions with annotation_scores (default: data_processing/Final_Results_cc/Prefull20261109_score10.pkl).")
+    parser.add_argument("--unsup-pretraining-dataset", "--unsup_pretraining_dataset", dest = "unsup_pretraining_dataset", type = str,default = str(Path(__file__).resolve().parents[1] / "data_processing" / "Final_Results_cc" / "Prefull20261109_score10.pkl"),
+                        help = "Pretraining DataFrame pickle, prepared dataset name, or prepared directory (default: data_processing/Final_Results_cc/Prefull20261109_score10.pkl).")
     parser.add_argument("--unsup-pretraining-cache", "--unsup_pretraining_cache", dest = "unsup_pretraining_cache", type = str, default = "pretrain_data",
                         help = "Input pickle or spectrum-store directory inside a prepared unsupervised pretraining dataset (default: pretrain_data).")
     parser.add_argument("--sup-pretraining-min-score-gap", type = float, default = 1.0,
@@ -707,9 +732,13 @@ def build_parser():
     parser.add_argument("--encoder_activation", default="leaky_relu", choices=["relu", "gelu", "leaky_relu", "silu", "elu"])
     parser.add_argument("--classifier_moe", action="store_true", help=("Replace the CNN2 or Transformer final classifier with a spectrum-level MoE classifier."))
     parser.add_argument("--classifier_num_experts",type=int,default=4,help=("Number of classifier experts."))
-    parser.add_argument("--classifier_top_k",type=int,default=2,help=("Number of classifier experts selected for each spectrum."))
+    parser.add_argument("--classifier_top_k",type=int,default=2,help=("Number of classifier experts selected for each spectrum. Equal to --classifier_num_experts, every expert is used, weighted by the router (dense gating: no top-k switches, and the balancing loss is constant)."))
     parser.add_argument("--classifier_expert_hidden_dim",type=int,default=None,help=("Hidden dimension inside each classifier expert. If omitted, every expert is a single Linear(512, num_classes) layer."))
     parser.add_argument("--classifier_moe_aux_loss_weight",type=float,default=0.01,help=("Weight applied to the classifier MoE load-balancing loss."))
+    parser.add_argument("--classifier_shared_expert", action="store_true",
+                        help=("Add a classifier expert that every spectrum uses next to the routed ones (DeepSeekMoE's shared experts), so each class's weights there learn from all of its spectra; CNN2 only. Adds S to the end of the MoC tag of the run name."))
+    parser.add_argument("--classifier_fixed_routing", action="store_true",
+                        help=(f"Send each spectrum to the classifier expert of its glycan class (O, N, free/lipid) instead of a learned router: no balancing loss, and no routing changes between SAM's two passes or test-time augmentation copies; needs --classifier_num_experts {GLYCAN_CLASS_EXPERTS} --classifier_top_k 1; CNN2 only. The run name's MoC tag gets Fix in place of the balancing weight (MoC3K1Fix)."))
     # ============================================================
     # Seeds
     # ============================================================
