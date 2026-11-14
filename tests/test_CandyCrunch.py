@@ -448,7 +448,8 @@ def test_search_options_keep_the_checks(tmp_path):
     with_search, without = wrap_inference(example, 'O'), wrap_inference(example, 'O', **off)
     assert 'adduct' in without.columns
     assert {stringify_dict(c) for c in without['composition']} <= {stringify_dict(c) for c in with_search['composition']}
-    single = without[without['charge'] == -1]
+    # (glucose oligomers are read as such only at their [M-H]-)
+    single = without[(without['charge'] == -1) & ~without['top1_pred'].str.startswith('Glc(a1-4)Glc', na = False)]
     mz, rt = single['num_spectra'].idxmax(), single.loc[single['num_spectra'].idxmax(), 'RT']
     spectra = pd.read_excel(example)
     plain = spectra[(np.abs(spectra['m/z'] - mz) < 0.3) & (np.abs(spectra['RT'] - rt) < 1)]
@@ -981,8 +982,10 @@ def test_isotope_support_and_fragment_ratio():
     ion = lambda g, z: (composition_to_mass(get_comp(g), modification = 'reduced') - z * PROTON_MASS) / z
     rts = np.arange(10, 30, 0.05)
     shape = lambda apex: np.exp(-0.5 * ((rts - apex) / 0.12) ** 2)
-    peaks = [(ion(disialyl, 2), 1e7 * shape(20)), (ion(monosialyl, 2), 2e6 * shape(20)), (ion(asialo, 2), 5e4 * shape(20)), (ion(wrong_charge, 3), 3e6 * shape(20.8)), (ion(on_13c, 2) - ISOTOPE_SPACING / 2, 4e6 * shape(21.6))]
-    scans = [sorted((mz + j * ISOTOPE_SPACING / 2, trace[i] * 0.5 ** j) for mz, trace in peaks for j in range(4)) for i in range(len(rts))]
+    envelope = lambda g: isotope_distribution(get_formula(get_comp(g)))
+    peaks = [(ion(disialyl, 2), 1e7 * shape(20), envelope(disialyl)), (ion(monosialyl, 2), 2e6 * shape(20), envelope(monosialyl)), (ion(asialo, 2), 5e4 * shape(20), envelope(asialo)),
+             (ion(wrong_charge, 3), 3e6 * shape(20.8), envelope(wrong_charge)), (ion(on_13c, 2) - ISOTOPE_SPACING / 2, 4e6 * shape(21.6), envelope(on_13c))]
+    scans = [sorted((mz + j * ISOTOPE_SPACING / 2, trace[i] * dist[j] / dist[0]) for mz, trace, dist in peaks for j in range(4)) for i in range(len(rts))]
     ms1 = (rts, np.array([m for scan in scans for m, _ in scan], dtype = np.float32), np.array([x for scan in scans for _, x in scan], dtype = np.float32),
            np.cumsum([0] + [len(scan) for scan in scans]).astype(np.int64))
     row = lambda g, z, rt, n: {'m/z': ion(g, z), 'predictions': [(g, 0.9)], 'composition': get_comp(g), 'num_spectra': n, 'charge': -z, 'RT': rt, 'rel_abundance': 1e6, 'top_fragments': [731.0, 1113.0],
@@ -2082,6 +2085,32 @@ def test_cc_survey_scans(tmp_path, monkeypatch):
             cc = extract_spectra(str(source), str(tmp_path / 'run.cc'), 'cc')
         back = load_spectra_filepath(cc, extract_ms1 = True)
         assert len(back) == spectra and len(back.attrs['ms1'][0]) == scans and back.attrs['ms1'][3][-1] == scans
+
+
+def test_rescore_psms():
+    from candycrunch.analysis import _qvalues_of, add_qvalues, rescore_psms
+    rng = np.random.default_rng(0)
+    # q-values in the order given, as add_qvalues gives them, tied scores included
+    scores, decoy = np.round(rng.normal(size = 300), 1), rng.random(300) < 0.3
+    q = add_qvalues(pd.DataFrame({'score': scores, 'is_decoy': decoy, 'row': np.arange(300)})).sort_values('row')['q_value'].to_numpy()
+    assert np.array_equal(_qvalues_of(scores, decoy), q)
+    # 1,500 true targets, 1,500 false targets, and 1,500 decoys: two features carry the signal, the third is noise; the model finds what neither feature finds alone
+    X = np.vstack([rng.normal([2.0, 2.0, 0.0], 1.0, (1500, 3)), rng.normal(0.0, 1.0, (3000, 3))])
+    decoy = np.r_[np.zeros(3000, dtype = bool), np.ones(1500, dtype = bool)]
+    targets = lambda v: int(((_qvalues_of(v, decoy) <= 0.01) & ~decoy).sum())
+    details = []
+    learned = rescore_psms(X, decoy, details = details)
+    assert targets(learned) > 1.5 * max(targets(X[:, 0]), targets(X[:, 1])) and len(details) == 3 and all(d['kept'] for d in details)
+    assert all(abs(d['weights'][2]) < 0.25 * min(d['weights'][:2]) for d in details)
+    # a feature true targets carry less of (missing evidence): without signs the model rewards its absence, with signs its weight stays at 0 and the targets found are those without it
+    missing = np.r_[rng.normal(-1.0, 1.0, 1500), rng.normal(0.0, 1.0, 3000)]
+    free, signed = [], []
+    rescore_psms(np.c_[X, missing], decoy, details = free)
+    assert targets(rescore_psms(np.c_[X, missing], decoy, details = signed, signs = [1, 1, 0, 1])) == targets(learned)
+    assert all(d['weights'][3] < 0 for d in free) and all(d['weights'][3] == 0 for d in signed)
+    # too few decoys to learn from
+    assert rescore_psms(X[:3050], decoy[:3050]) is None
+
 
 
 def test_library_edge_cases(tmp_path):
