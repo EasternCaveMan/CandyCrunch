@@ -82,6 +82,11 @@ def make_activation(name):
 # Glycan class codes, as the models take them: O 0, N 1, free/lipid 2 (prediction.CLASS_CODES); pretraining also uses 3 for spectra whose candidate
 # compositions span classes. Fixed routing by glycan class has one classifier expert per class code
 GLYCAN_CLASS_EXPERTS = 3
+# The instrument (acquisition setting) of a spectrum: its ion mode, LC, derivatization and mass analyzer inputs, with the names of their codes as
+# build_training_pickles.py and process_for_inference code them (the last name of each: any other value). Fixed routing by instrument has one
+# classifier expert per instrument of the training data
+INSTRUMENT_CODES = {"mode": ("positive", "negative"), "lc": ("PGC", "C18", "other"), "modification": ("reduced", "permethylated", "other"),
+                    "trap": ("linear", "orbitrap", "amazon", "other")}
 
 
 class MoEClassifier(nn.Module):
@@ -333,25 +338,40 @@ class ResUnit2(nn.Module):
         return out
 
 class CandyCrunch_CNN2(nn.Module):
-    """Daniel new Change"""
+    """Daniel new Change
+
+    Fixed routing (classifier_fixed_routing) sends each spectrum to one classifier expert, chosen by classifier_routing_key:
+        "glycan_class": the expert of its glycan class code (O 0, N 1, free/lipid 2), with classifier_num_experts = 3
+        "instrument": the expert of its instrument, i.e. its (mode, lc, modification, trap) codes, looked up in a table built from
+                      classifier_instrument_experts, the codes of each expert's instrument in expert order (training_script.py takes the
+                      instruments of the training data; checkpoints keep the list in model_kwargs)
+    A spectrum whose glycan class or instrument has no expert gets the mean of all experts (and the shared expert, if any)."""
     def __init__( self,input_dim, num_classes=1, hidden_dim=1024, input_precursor_dim=None, dropout=0.2,
                   se=None, se_reduction=None,norm_type=None,activation=None,encoder_activation=None, classifier_moe=False, classifier_num_experts=4,
-                  classifier_top_k=2, classifier_expert_hidden_dim=None, classifier_shared_expert=False, classifier_fixed_routing=False):
+                  classifier_top_k=2, classifier_expert_hidden_dim=None, classifier_shared_expert=False, classifier_fixed_routing=False,
+                  classifier_routing_key="glycan_class", classifier_instrument_experts=None):
         super(CandyCrunch_CNN2, self).__init__()
         if (classifier_shared_expert or classifier_fixed_routing) and not classifier_moe:
             raise ValueError("classifier_shared_expert and classifier_fixed_routing need classifier_moe=True.")
-        if classifier_fixed_routing and classifier_num_experts != GLYCAN_CLASS_EXPERTS:
+        if classifier_routing_key not in ("glycan_class", "instrument"):
+            raise ValueError(f"classifier_routing_key is 'glycan_class' or 'instrument', not {classifier_routing_key!r}.")
+        if classifier_fixed_routing and classifier_routing_key == "glycan_class" and classifier_num_experts != GLYCAN_CLASS_EXPERTS:
             # With more experts, the ones past the class codes would never be trained
             raise ValueError(f"Fixed routing sends each spectrum to the expert of its glycan class (O, N, free/lipid), so it needs "
                              f"classifier_num_experts={GLYCAN_CLASS_EXPERTS}.")
         self.input_dim = input_dim
         self.classifier_moe = classifier_moe
         self.classifier_fixed_routing = bool(classifier_fixed_routing)
+        self.classifier_routing_key = classifier_routing_key
         self.type_emb = nn.Embedding(5, 24)
         self.mode_emb = nn.Embedding(3, 24)
         self.lc_emb = nn.Embedding(4, 24)
         self.modification_emb = nn.Embedding(4, 24)
         self.trap_emb = nn.Embedding(5, 24)
+        if self.classifier_fixed_routing and classifier_routing_key == "instrument":
+            self.register_buffer("instrument_experts", self.instrument_lookup_table(classifier_instrument_experts, classifier_num_experts),
+                                 # The checkpoint keeps the instruments in model_kwargs, so the state dict does not need the table
+                                 persistent=False)
         self.prec_block = nn.Sequential( nn.Linear(input_precursor_dim, 24), make_norm(norm_type,24),  make_activation(activation))
         self.rt_block = nn.Sequential( nn.Linear(1, 24), make_norm(norm_type,24), make_activation(activation))
 
@@ -396,6 +416,25 @@ class CandyCrunch_CNN2(nn.Module):
     #
     #     return aux_loss
 
+    def instrument_lookup_table(self, instruments, num_experts):
+        """Table [mode, lc, modification, trap] -> expert index (-1: no expert) over every code the embeddings take, from the instrument codes of
+        each expert in expert order."""
+        sizes = (self.mode_emb.num_embeddings, self.lc_emb.num_embeddings, self.modification_emb.num_embeddings, self.trap_emb.num_embeddings)
+        if not instruments:
+            raise ValueError("Fixed routing by instrument needs classifier_instrument_experts: the (mode, lc, modification, trap) codes of each "
+                             "expert's instrument.")
+        if len(instruments) != num_experts:
+            raise ValueError(f"classifier_instrument_experts lists {len(instruments)} instruments for {num_experts} experts.")
+        table = torch.full(sizes, -1, dtype=torch.long)
+        for expert, codes in enumerate(instruments):
+            codes = tuple(int(code) for code in codes)
+            if len(codes) != len(sizes) or not all(0 <= code < size for code, size in zip(codes, sizes)):
+                raise ValueError(f"Instrument {codes} of expert {expert} is not four (mode, lc, modification, trap) codes the embeddings take.")
+            if table[codes] >= 0:
+                raise ValueError(f"Instrument {codes} is listed for experts {int(table[codes])} and {expert}.")
+            table[codes] = expert
+        return table
+
     def get_classifier_aux_loss(self):
         if not self.classifier_moe:
             return self.fc1[0].weight.new_zeros(())
@@ -409,8 +448,14 @@ class CandyCrunch_CNN2(nn.Module):
 
     def forward(self, mz_features, precursor, glycan_type, rt, mode, lc, modification, trap, rep=False,
                 return_routing=False, return_aux_losses=False, return_selected_logits=True):
-        # Fixed routing sends each spectrum to the classifier expert of its glycan class code, taken before the code becomes its embedding
-        expert_indices = glycan_type if self.classifier_fixed_routing else None
+        # Fixed routing sends each spectrum to the classifier expert of its glycan class code or of its instrument's codes, taken before the codes
+        # become their embeddings
+        if not self.classifier_fixed_routing:
+            expert_indices = None
+        elif self.classifier_routing_key == "instrument":
+            expert_indices = self.instrument_experts[mode.reshape(-1), lc.reshape(-1), modification.reshape(-1), trap.reshape(-1)]
+        else:
+            expert_indices = glycan_type
         glycan_type = self.type_emb(glycan_type).squeeze(1)
         mode = self.mode_emb(mode).squeeze(1)
         lc = self.lc_emb(lc).squeeze(1)

@@ -19,7 +19,7 @@ from glycowork.ml.model_training import training_setup
 from glycowork.motif.graph import compare_glycans
 import pandas as pd
 import wandb
-from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, GLYCAN_CLASS_EXPERTS, SimpleDataset, transform_mz, transform_rt
+from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, GLYCAN_CLASS_EXPERTS, INSTRUMENT_CODES, SimpleDataset, transform_mz, transform_rt
 from candycrunch.transformer import CandyCrunch_Transformer
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
@@ -104,6 +104,28 @@ def resolve_prepared_dataset_dir(dataset):
     raise ValueError(f"Prepared dataset {dataset!r} is ambiguous: {names}")
 
 
+# Positions of the instrument codes (ion mode, LC, derivatization, mass analyzer) in the input tuples (build_training_pickles.FEATURE_COLUMNS)
+INSTRUMENT_POSITIONS = {"mode": 5, "lc": 6, "modification": 7, "trap": 8}
+
+
+def count_instruments(samples):
+    """How many inputs each instrument, i.e. each (mode, lc, modification, trap) code tuple, has."""
+    counts = {}
+    for sample in samples:
+        codes = tuple(sample[position] for position in INSTRUMENT_POSITIONS.values())
+        try:
+            codes = tuple(int(code) for code in codes)
+        except (TypeError, ValueError):
+            raise ValueError(f"Instrument codes {codes} (mode, lc, modification, trap) are not all integers: re-encode the prepared dataset "
+                             f"(build_training_pickles.py) before routing by instrument.") from None
+        counts[codes] = counts.get(codes, 0) + 1
+    return counts
+
+
+def instrument_name(codes):
+    """The names of an instrument's codes, e.g. negative/PGC/reduced/linear."""
+    return "/".join(names[code] if code < len(names) else str(code) for names, code in zip(INSTRUMENT_CODES.values(), codes))
+
 
 def main(args):
     set_seed(args.current_seed)
@@ -116,8 +138,8 @@ def main(args):
     if (args.classifier_shared_expert or args.classifier_fixed_routing) and args.model != "CNN2":
         # The Transformer has its own classifier MoE (candycrunch/transformer.py) without these options
         raise ValueError("--classifier_shared_expert and --classifier_fixed_routing are implemented for --model CNN2 only.")
-    if args.classifier_fixed_routing and (args.classifier_num_experts, args.classifier_top_k) != (GLYCAN_CLASS_EXPERTS, 1):
-        raise ValueError(f"--classifier_fixed_routing sends each spectrum to the expert of its glycan class (O, N, free/lipid): "
+    if args.classifier_fixed_routing == "glycan_class" and (args.classifier_num_experts, args.classifier_top_k) != (GLYCAN_CLASS_EXPERTS, 1):
+        raise ValueError(f"--classifier_fixed_routing glycan_class sends each spectrum to the expert of its glycan class (O, N, free/lipid): "
                          f"use --classifier_num_experts {GLYCAN_CLASS_EXPERTS} --classifier_top_k 1.")
     # Fixed routing has no router and so no balancing loss: train_model's log and the checkpoint then record its weight as 0
     classifier_aux_weight = 0.0 if args.classifier_fixed_routing else args.classifier_moe_aux_loss_weight
@@ -209,6 +231,22 @@ def main(args):
     print("Preparing dataloaders")
     X_train = load_dataset_inputs(train_source, targets=y_train, composition_vectors=composition_vectors, num_bins=input_dim)
     X_test = load_dataset_inputs(val_source, targets=y_test, composition_vectors=composition_vectors, num_bins=input_dim)
+    instrument_experts = None
+    if args.classifier_fixed_routing == "instrument":
+        # One classifier expert per instrument of the training data, numbered in code order: the lookup table the model builds from this list
+        # (kept in the checkpoint's model_kwargs). Validation or inference spectra of other instruments get the mean of all experts
+        train_instruments, val_instruments = count_instruments(X_train), count_instruments(X_test)
+        instrument_experts = sorted(train_instruments)
+        args.classifier_num_experts, args.classifier_top_k = len(instrument_experts), 1
+        print(f"Fixed routing by instrument: {len(instrument_experts)} classifier experts, one per (mode, LC, derivatization, mass analyzer) "
+              f"of the training data")
+        print(f"  {'expert':>6}  {'instrument':<38}{'training':>10}{'validation':>12}")
+        for expert, codes in enumerate(instrument_experts):
+            print(f"  {expert:>6}  {instrument_name(codes):<38}{train_instruments[codes]:>10,}{val_instruments.get(codes, 0):>12,}")
+        unseen = {codes: count for codes, count in val_instruments.items() if codes not in train_instruments}
+        if unseen:
+            print(f"  Validation spectra of instruments without an expert (mean of all experts): {sum(unseen.values()):,} "
+                  f"({', '.join(instrument_name(codes) for codes in sorted(unseen))})")
     trainset = ResampledDataset(
         X_train, y_train, transform_mz=transform_mz, transform_rt=transform_rt,
         resample_mode=args.resample_dataset,
@@ -386,6 +424,10 @@ def main(args):
             model_kwargs["classifier_shared_expert"] = True
         if args.classifier_fixed_routing:
             model_kwargs["classifier_fixed_routing"] = True
+        if args.classifier_fixed_routing == "instrument":
+            # Glycan-class routing is the model's default key, so its checkpoints keep the arguments they had
+            model_kwargs["classifier_routing_key"] = "instrument"
+            model_kwargs["classifier_instrument_experts"] = [list(codes) for codes in instrument_experts]
     elif args.model == "Transformer":
         model_class = CandyCrunch_Transformer
         model_kwargs.update(heads =args.nheads,
@@ -416,8 +458,9 @@ def main(args):
     encoder_tag = ("NOFF" if not args.use_transformer_ff else (
         f"MoE{args.num_experts}K{args.moe_top_k}" if args.encoder_type == "moe" else "DENSE"))
     if args.classifier_moe:
-        # Fixed routing has no router and so no balancing loss whose weight the name would need: MoC3K1Fix
-        routing_tag = "Fix" if args.classifier_fixed_routing else f"W{args.classifier_moe_aux_loss_weight}"
+        # Fixed routing has no router and so no balancing loss whose weight the name would need: MoC3K1Fix (glycan class), MoC29K1FixInst
+        # (instrument)
+        routing_tag = {"glycan_class": "Fix", "instrument": "FixInst"}.get(args.classifier_fixed_routing, f"W{args.classifier_moe_aux_loss_weight}")
         classifier_tag = f"MoC{args.classifier_num_experts}K{args.classifier_top_k}{routing_tag}"
         if args.classifier_expert_hidden_dim is not None:
             classifier_tag += (f"H{args.classifier_expert_hidden_dim}")
@@ -598,7 +641,7 @@ def main(args):
     print("Start fine-tuning")
     if args.classifier_moe:
         if args.classifier_fixed_routing:
-            print("Classifier MoE: fixed routing by glycan class, no balancing loss")
+            print(f"Classifier MoE: fixed routing by {args.classifier_fixed_routing.replace('_', ' ')}, no balancing loss")
         else:
             print("Classifier MoE auxiliary weight:",args.classifier_moe_aux_loss_weight)
         if args.classifier_shared_expert:
@@ -737,8 +780,11 @@ def build_parser():
     parser.add_argument("--classifier_moe_aux_loss_weight",type=float,default=0.01,help=("Weight applied to the classifier MoE load-balancing loss."))
     parser.add_argument("--classifier_shared_expert", action="store_true",
                         help=("Add a classifier expert that every spectrum uses next to the routed ones (DeepSeekMoE's shared experts), so each class's weights there learn from all of its spectra; CNN2 only. Adds S to the end of the MoC tag of the run name."))
-    parser.add_argument("--classifier_fixed_routing", action="store_true",
-                        help=(f"Send each spectrum to the classifier expert of its glycan class (O, N, free/lipid) instead of a learned router: no balancing loss, and no routing changes between SAM's two passes or test-time augmentation copies; needs --classifier_num_experts {GLYCAN_CLASS_EXPERTS} --classifier_top_k 1; CNN2 only. The run name's MoC tag gets Fix in place of the balancing weight (MoC3K1Fix)."))
+    parser.add_argument("--classifier_fixed_routing", nargs="?", const="instrument", default=None, choices=("instrument", "glycan_class"),
+                        help=(f"Send each spectrum to a fixed classifier expert instead of a learned router: no balancing loss, and no routing changes between SAM's two passes or test-time augmentation copies; CNN2 only. "
+                              f"Alone or as 'instrument': one expert per instrument, i.e. combination of ion mode, LC, derivatization and mass analyzer, of the training data, which sets --classifier_num_experts (one per instrument) and --classifier_top_k 1; the checkpoint keeps the instrument of each expert, and spectra of other instruments get the mean of all experts (MoC29K1FixInst). "
+                              f"'glycan_class': one expert per glycan class (O, N, free/lipid); needs --classifier_num_experts {GLYCAN_CLASS_EXPERTS} --classifier_top_k 1 (MoC3K1Fix). "
+                              f"Add --classifier_shared_expert for an expert every spectrum uses besides."))
     # ============================================================
     # Seeds
     # ============================================================
