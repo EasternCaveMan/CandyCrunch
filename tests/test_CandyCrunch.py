@@ -685,7 +685,8 @@ def test_filter_out_is_airtight():
 
 def test_search_options_keep_the_checks(tmp_path):
     # Without imputation and database search a run only loses what those two add: domain_filter still runs, so a [M+HCO3]- three times stronger than its [M-H]- is
-    # folded into that row and listed at its m/z
+    # never listed at its own m/z, and its spectra count for the row of their glycan nearest in RT. That holds also where the model names none of them: spectra
+    # without a structure kept (get_missing), the adduct of the fucosylated glycan reads as the formate adduct of the composition with a Hex for its Fuc
     example = str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx')
     off = {'supplement': False, 'experimental': False}
     with_search, without = wrap_inference(example, 'O'), wrap_inference(example, 'O', **off)
@@ -702,30 +703,36 @@ def test_search_options_keep_the_checks(tmp_path):
     pd.concat([spectra, adduct], ignore_index = True).sort_values('RT').to_excel(path, index = False)
     out = wrap_inference(str(path), 'O', **off)
     assert (np.abs(out.index.values - mz) < 0.1).any() and not (np.abs(out.index.values - mz - shift) < 0.1).any()
-    assert out.loc[np.abs(out.index.values - mz) < 0.1, 'num_spectra'].max() > without.loc[mz, 'num_spectra']
+    kept, out = wrap_inference(example, 'O', get_missing = True, **off), wrap_inference(str(path), 'O', get_missing = True, **off)
+    assert not (np.abs(out.index.values - mz - shift) < 0.1).any()
+    # (each isomer within the minute gets the adduct spectra of its own peak; before, the first one in RT got all of them)
+    at_peak = lambda df: df.loc[(np.abs(df.index.values - mz) < 0.1) & (np.abs(df['RT'].values - rt) < 0.1), 'num_spectra'].sum()
+    assert at_peak(out) - at_peak(kept) == ((adduct['RT'] - rt).abs() < 0.5).sum()
 
 
 def test_onnx_model_matches_torch():
-    # The built app runs the weights of model.py's CandyCrunch_CNN on ONNX Runtime: same logits as PyTorch, also for a norm scale below zero (which cannot
+    # The built app runs the weights of model.py's CandyCrunch_CNN2 on ONNX Runtime: same logits as PyTorch, also for a norm scale below zero (which cannot
     # be folded into the convolution after it), and the same predictions for the example run
     pytest.importorskip('onnxruntime')
     from candycrunch.inference import CandyCrunchCNN, load_weights
-    from candycrunch.model import CandyCrunch_CNN
+    from candycrunch.model import CandyCrunch_CNN2
     weights = load_weights(BASE_DIR / 'candycrunch' / 'candycrunch.pt')
     rng = np.random.default_rng(0)
     mz = np.zeros((8, 2, 2048), np.float32)
     for row in mz:
         peaks = rng.choice(2048, 40, replace = False)
         row[:, peaks] = rng.random((2, 40))
-    inputs = (mz, rng.random((8, 12)).astype(np.float32), rng.integers(0, 3, 8), rng.random((8, 1)).astype(np.float32), *rng.integers(0, 3, (4, 8)))
-    for state in (weights, {**weights, 'res3.ln2.weight': -weights['res3.ln2.weight']}):
-        model = CandyCrunch_CNN(2048, num_classes = len(glycans), input_precursor_dim = 12)
+    inputs = (mz, rng.random((8, len(comp_vector_order))).astype(np.float32), rng.integers(0, 3, 8), rng.random((8, 1)).astype(np.float32), *rng.integers(0, 3, (4, 8)))
+    for state in (weights, {**weights, 'res_block.4.ln2.weight': -weights['res_block.4.ln2.weight']}):
+        model = CandyCrunch_CNN2(2048, num_classes = len(glycans), input_precursor_dim = len(comp_vector_order), **MODEL_KWARGS)
         model.load_state_dict({k: torch.from_numpy(v) for k, v in state.items()})
         with torch.inference_mode():
             logits = model.eval()(*[torch.from_numpy(x if x.ndim > 1 else x[:, None]) for x in inputs]).numpy()
         assert np.abs(CandyCrunchCNN(state)(*inputs) - logits).max() < 1e-3
+    # Against PyTorch explicitly: the default model is the ONNX one where there is no GPU
+    model.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
     example = str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx')
-    onnx, default = wrap_inference(example, 'O', model = CandyCrunchCNN(weights)), wrap_inference(example, 'O')
+    onnx, default = wrap_inference(example, 'O', model = CandyCrunchCNN(weights)), wrap_inference(example, 'O', model = model.to('cuda:0' if torch.cuda.is_available() else 'cpu'))
     assert onnx.index.equals(default.index) and onnx['top1_pred'].equals(default['top1_pred'])
 
 
@@ -1063,6 +1070,29 @@ def test_label_inputs_drift_terms():
     # (the Neu5Ac inputs 1.1 and 1.6 min after their rows are other peaks; the Neu5Gc isomer and the own row are labeled at their peaks)
     assert sorted(labelled['spec_id']) == [k for k in range(len(glycans)) if k not in (22, 24)]
     assert (labelled.set_index('spec_id').loc[[25, 26, 27], 'rt_error'].abs() < 0.01).all()
+
+
+def test_label_inputs_past_anchors():
+    # Twelve anchors from 10 to 32 min drift by 1 - 0.1 x RT; a row 13 min past the last one (no anchor: its composition has an isomer row) is held at
+    # the drift of 32 min, -2.2, while its peak sits 0.8 min earlier, still inside rt_window: it is labeled there, and its run_rt is that peak, not the
+    # held RT (rows inside the anchors' range keep the drift)
+    import training.pipeline_labels as pl
+    from glycowork.motif.tokenization import glycan_to_composition
+    chain = lambda m, h: 'Gal(b1-4)GlcNAc(b1-3)' * m + 'Gal(b1-4)' * h + 'Glc'
+    glycans = [chain(m, h) for m in range(2, 5) for h in range(4)] + ['Gal(b1-4)GlcNAc(b1-3)Gal(b1-4)Glc', 'Gal(b1-3)GlcNAc(b1-3)Gal(b1-4)Glc']
+    map_rts = [10.0 + 2 * k for k in range(12)] + [20.5, 45.0]
+    run_rts = [t + 1 - 0.1 * t for t in map_rts[:13]] + [45.0 - 2.2 - 0.8]
+    masses = [300.0 + 37 * k for k in range(13)] + [300.0 + 37 * 12]
+    inputs = pd.DataFrame({'spec_id': range(len(glycans)), 'RT': run_rts, 'intensity': 1e5, 'peak_d': [{50.0: 1.0}] * len(glycans), 'rt_range': [(t, t) for t in run_rts],
+                           'num_spectra': 3, 'composition': [glycan_to_composition(g) for g in glycans], 'charge': 1, 'annotation_score': 12.0,
+                           'model_input': [np.zeros((3, 1), np.float32)] * len(glycans), 'RT2': 0.3, 'glycan_type': 1, 'compositional_vector': [np.zeros(12)] * len(glycans)},
+                          index = pd.Index(masses, name = 'm/z'))
+    inputs.attrs.update(mode = 'negative', trap = 'linear', lc = 'PGC', modification = 'reduced', mass_tag = None, sample_prep = 'underivatized')
+    labelled, _ = pl.label_inputs(inputs, pd.DataFrame({'Mass': masses, 'RT': map_rts, 'glycan': glycans}))
+    assert labelled.attrs['rt_alignment'] == 'model' and labelled.attrs['rt_anchors'] == 12
+    assert labelled.set_index('spec_id').loc[13, 'glycan'] == glycans[13]
+    run_rt = [r['run_rt'] for r in labelled.attrs['map_rows']]
+    assert np.allclose(run_rt[:13], run_rts[:13], atol = 0.01) and abs(run_rt[13] - run_rts[13]) < 1e-9
 
 
 def test_label_inputs_map_intercepts():
