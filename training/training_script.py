@@ -20,6 +20,7 @@ from glycowork.motif.graph import compare_glycans
 import pandas as pd
 import wandb
 from candycrunch.model import CandyCrunch_CNN,CandyCrunch_CNN2, GLYCAN_CLASS_EXPERTS, INSTRUMENT_CODES, SimpleDataset, transform_mz, transform_rt
+from candycrunch.model import RESIDUE_DILATION_SCHEDULES, residue_dilations
 from candycrunch.transformer import CandyCrunch_Transformer
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
@@ -127,10 +128,60 @@ def instrument_name(codes):
     return "/".join(names[code] if code < len(names) else str(code) for names, code in zip(INSTRUMENT_CODES.values(), codes))
 
 
+DILATION_SCHEDULES = ("pow2", *RESIDUE_DILATION_SCHEDULES)
+# Run-name codes of the schedules; a custom list of dilations is Cu
+DILATION_CODES = {"pow2": "Pw", "native": "Na", "permethylated": "Pe", "residue": "Re"}
+
+
+def dilation_schedule(values):
+    """The --dilations label that run names and checkpoints keep: a schedule name (pow2, native, permethylated, residue), or the integers
+    joined by '-' (4 8 16, [4,8,16] or 4,8,16 -> 4-8-16)."""
+    values = [values] if isinstance(values, str) else [str(value) for value in values]
+    if len(values) == 1 and values[0] in DILATION_SCHEDULES:
+        return values[0]
+    text = " ".join(values)
+    if re.fullmatch(r"\d+(?:-\d+)+", text):
+        # A label this function made before: main runs once per seed with the same args
+        text = text.replace("-", " ")
+    # The integers may also be written as a list: [4,8,16] or 4,8,16
+    tokens = text.replace("[", " ").replace("]", " ").replace(",", " ").split()
+    try:
+        dilations = [int(token) for token in tokens]
+    except ValueError:
+        raise ValueError(f"--dilations takes one of {', '.join(DILATION_SCHEDULES)} or positive integers, not {' '.join(values)!r}.") from None
+    if not dilations or min(dilations) < 1:
+        raise ValueError("--dilations must be positive integers.")
+    return "-".join(str(dilation) for dilation in dilations)
+
+
+def schedule_dilations(schedule, input_dim=2048):
+    """The ResUnit2 dilations of a --dilations label; None for pow2, which the model builds from --num-res-units (1, 2, 4, ...)."""
+    if schedule == "pow2":
+        return None
+    if schedule in RESIDUE_DILATION_SCHEDULES:
+        return residue_dilations(schedule, input_dim)
+    return [int(dilation) for dilation in schedule.split("-")]
+
+
 def main(args):
     set_seed(args.current_seed)
     if args.model not in {"CNN", "CNN2", "Transformer"}:
         raise ValueError(f"Unknown model={args.model!r}. Expected 'CNN', 'CNN2', or 'Transformer'.")
+    if args.model == "CNN2":
+        args.dilations = dilation_schedule(args.dilations)
+        if args.dilations == "pow2":
+            args.num_res_units = 6 if args.num_res_units is None else args.num_res_units
+            if args.num_res_units < 1:
+                raise ValueError("--num-res-units must be a positive integer.")
+        else:
+            # One ResUnit2 per dilation
+            blocks = len(schedule_dilations(args.dilations))
+            if args.num_res_units not in (None, blocks):
+                raise ValueError(f"--dilations {args.dilations} builds {blocks} ResUnit2 blocks, one per dilation; leave out --num-res-units or "
+                                 f"set it to {blocks}.")
+            args.num_res_units = blocks
+        if args.in_channel < 2:
+            raise ValueError("--in-channel must be at least 2 (ResUnit2 halves it in its bottleneck).")
     if args.model == "CNN" and args.classifier_moe:
         raise ValueError("--classifier_moe requires --model CNN2 or Transformer.")
     if (args.classifier_shared_expert or args.classifier_fixed_routing) and not args.classifier_moe:
@@ -407,8 +458,13 @@ def main(args):
     model_class = CandyCrunch_CNN
     if args.model == "CNN2":
         model_class = CandyCrunch_CNN2
+        dilations = schedule_dilations(args.dilations, input_dim)
+        if dilations is not None:
+            args.num_res_units = len(dilations)
         model_kwargs.update(
             hidden_dim=args.hidden_dim,
+            num_res_units=args.num_res_units,
+            in_channel=args.in_channel,
             classifier_moe=args.classifier_moe,
             classifier_num_experts=args.classifier_num_experts,
             classifier_top_k=args.classifier_top_k,
@@ -420,6 +476,8 @@ def main(args):
             se_reduction=args.se_reduction
         )
         # Only when on, so the checkpoints of other runs keep the constructor arguments that older code can load
+        if dilations is not None:
+            model_kwargs["dilations"] = dilations
         if args.classifier_shared_expert:
             model_kwargs["classifier_shared_expert"] = True
         if args.classifier_fixed_routing:
@@ -478,8 +536,11 @@ def main(args):
             f"{loss_tag}{pretraining_tag}_{args.resample_dataset}_{dataset_tag}")
 
     elif args.model == "CNN2":
-        se_tag = f"ES{args.se}RS{args.se_reduction}" if args.se else str(args.se)
-        setting_name = (f"{args.model}_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_{se_tag}"
+        se_tag = f"SE(T)RS{args.se_reduction}" if args.se else str("SE(F)")
+        # The dilation schedule in two letters follows the block count, as in the leaderboard: RU6D(Pw)CH64SE(F), RU5D(Na)CH64SE(F). A custom list
+        # is Cu (the list itself is in training_args and model_kwargs), so runs with two custom lists and otherwise equal settings share a name
+        dilation_code = DILATION_CODES.get(args.dilations, "Cu")
+        setting_name = (f"{args.model}9_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_RU{args.num_res_units}D({dilation_code})CH{args.in_channel}{se_tag}"
             f"{loss_tag}{pretraining_tag}_{args.resample_dataset}_{dataset_tag}")
     else:
         setting_name = (f"{args.model}_{classifier_tag}_{args.split}{loss_tag}"
@@ -713,20 +774,20 @@ def build_parser():
     parser.add_argument("--unsup-pretraining-mz-tolerance", type = float, default = 0.5,
                         help = "Precursor m/z tolerance for one unsupervised pair key (default: 0.5).")
       # What goes into a batch
-    parser.add_argument("--pretraining-examples-per-batch", "--unsup-pretraining-examples-per-batch", "--unsup_pretraining_examples_per_batch",dest = "pretraining_examples_per_batch", type = int, default = 128,
+    parser.add_argument("--pretraining-examples-per-batch", "--unsup-pretraining-examples-per-batch", "--unsup_pretraining_examples_per_batch",dest = "pretraining_examples_per_batch", type = int, default = 256,
                         help = "Distinct spectra per pretraining batch (default: 128).")
-    parser.add_argument("--pretraining-views-per-example", "--unsup-pretraining-views-per-example", "--unsup_pretraining_views_per_example, --supcon-views-per-example", dest = "pretraining_views_per_example", type = int, default = 2,
+    parser.add_argument("--pretraining-views-per-example", "--unsup-pretraining-views-per-example", "--unsup_pretraining_views_per_example, --supcon-views-per-example", dest = "pretraining_views_per_example", type = int, default = 4,
                         help = "Independently augmented views per spectrum in a pretraining batch (default: 2).")
-    parser.add_argument("--pretraining-examples-per-group", "--sup-pretraining-examples-per-group", dest = "pretraining_examples_per_group", type = int, default = 4,
+    parser.add_argument("--pretraining-examples-per-group", "--sup-pretraining-examples-per-group", dest = "pretraining_examples_per_group", type = int, default = 8,
                         help = "Spectra drawn from each composition (supervised) or precursor-m/z (unsupervised) group per batch visit (default: 4).")
       # How the two views differ
-    parser.add_argument("--pretraining-peak-dropout", type = float, default = 0.3,
+    parser.add_argument("--pretraining-peak-dropout", type = float, default = 0.2,
                         help = "View augmentation: chance of dropping the weakest peaks, falling to 0 for the base peak (default: 0.3).")
-    parser.add_argument("--pretraining-intensity-jitter", type = float, default = 0.1,
+    parser.add_argument("--pretraining-intensity-jitter", type = float, default = 0.05,
                         help = "View augmentation: log-normal intensity noise sd of the base peak, growing with 1/sqrt(relative intensity) (default: 0.1).")
-    parser.add_argument("--pretraining-mz-jitter", type = float, default = 0.02,
+    parser.add_argument("--pretraining-mz-jitter", type = float, default = 0.01,
                         help = "View augmentation: m/z remainder noise sd of the base peak, growing like the intensity noise (default: 0.02).")
-    parser.add_argument("--pretraining-noise-peaks", type = float, default = 0.4,
+    parser.add_argument("--pretraining-noise-peaks", type = float, default = 0.3,
                         help = "View augmentation: noise peaks added per peak of the spectrum, on average (default: 0.4).")
       # Loss and projection head
     parser.add_argument("--supcon-temperature", "--pretraining-temperature", dest = "supcon_temperature", type = float, default = 0.1,
@@ -743,6 +804,17 @@ def build_parser():
     # ============================================================
     # CNN2
     # ============================================================
+    parser.add_argument("--num-res-units", "--num_res_units", type=int, default=None,
+                        help="Number of CNN2 ResUnit2 blocks with --dilations pow2 (dilations 1, 2, 4, ...); must be positive (default: 6). The other "
+                             "dilation schedules build one block per dilation.")
+    parser.add_argument("--dilations", nargs="+", default=["pow2"],
+                        help="Dilations of the CNN2 ResUnit2 blocks: pow2 (1, 2, 4, ... for --num-res-units blocks; default), or one block per residue "
+                             "mass in bins, so that each kernel looks exactly one residue away: native (dHex 101, Hex 112, HexNAc 140, Neu5Ac 201, "
+                             "Neu5Gc 212), permethylated (dHex 120, Hex 141, HexNAc 170, Neu5Ac 250) or residue (both sets); or a list of integers "
+                             "(e.g. 1 2 101 112 or [1,2,101,112]). Adds D(<code>) after RU<n> in the run name: Pw, Na, Pe, Re, or Cu for a custom list.")
+    parser.add_argument("--in-channel", "--in_channel", type=int, default=64,
+                        help="CNN2 encoder width: output channels of the input 1x1 convolution and of every ResUnit2 (bottleneck in_channel // 2); "
+                             "fc1 reads in_channel x 102 pooled features. Adds CH<in_channel> after RU<n> in the run name (default: 64).")
     parser.add_argument("--se","--se",type=str_to_bool,nargs="?",const=True,default=False,help=("If True, use SE blocks."))
     parser.add_argument("--se-reduction","--se-reduction",type=int,default=8,help=("SE reduction factor."))
     parser.add_argument("--hidden-dim","--hidden-dim",type=int,default=1024,help=("Hidden dimension."))

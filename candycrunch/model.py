@@ -88,6 +88,26 @@ GLYCAN_CLASS_EXPERTS = 3
 INSTRUMENT_CODES = {"mode": ("positive", "negative"), "lc": ("PGC", "C18", "other"), "modification": ("reduced", "permethylated", "other"),
                     "trap": ("linear", "orbitrap", "amazon", "other")}
 
+# ============================================================
+# Residue-mass dilations for CandyCrunch_CNN2's ResUnit2 blocks
+# ============================================================
+
+# Monosaccharide residue masses (Da), native and permethylated. A ResUnit2 whose dilation is one of them in bins compares each bin with the
+# bins one residue mass below and above it
+RESIDUE_MASSES = {"native": {"dHex": 146.0579, "Hex": 162.0528, "HexNAc": 203.0794, "Neu5Ac": 291.0954, "Neu5Gc": 307.0903},
+                  "permethylated": {"dHex": 174.0892, "Hex": 204.0998, "HexNAc": 245.1263, "Neu5Ac": 361.1737}}
+RESIDUE_DILATION_SCHEDULES = {"native": ("native",), "permethylated": ("permethylated",), "residue": ("native", "permethylated")}
+
+
+def residue_dilations(schedule, input_dim=2048, min_mz=39.714, max_mz=3000.0):
+    """ResUnit2 dilations, ascending, for the residue masses of a schedule, in bins of the input grid linspace(min_mz, max_mz, input_dim):
+    'native' (dHex 101, Hex 112, HexNAc 140, Neu5Ac 201, Neu5Gc 212 on the 2,048-bin grid), 'permethylated' (dHex 120, Hex 141, HexNAc 170,
+    Neu5Ac 250) or 'residue' (both sets)."""
+    if schedule not in RESIDUE_DILATION_SCHEDULES:
+        raise ValueError(f"Unknown residue dilation schedule {schedule!r}; use one of {', '.join(RESIDUE_DILATION_SCHEDULES)}.")
+    width = (max_mz - min_mz) / (input_dim - 1)
+    return sorted({round(mass / width) for masses in RESIDUE_DILATION_SCHEDULES[schedule] for mass in RESIDUE_MASSES[masses].values()})
+
 
 class MoEClassifier(nn.Module):
     """
@@ -112,7 +132,7 @@ class MoEClassifier(nn.Module):
     fixed_routing replaces the router by expert indices given to forward (expert_indices, e.g. the glycan class): one expert per spectrum
     and no balancing loss; a spectrum whose index names no expert gets the mean of all experts.
     """
-    def __init__(self, input_dim, num_classes, num_experts = 4, top_k = 2, hidden_dim = None, dropout = 0.0, activation = "gelu",
+    def __init__(self, input_dim, num_classes, num_experts = 4, top_k = 2, hidden_dim = None, dropout = 0.2, activation = "gelu",
                  shared_expert = False, fixed_routing = False):
         super().__init__()
         if top_k < 1 or top_k > num_experts:
@@ -340,6 +360,12 @@ class ResUnit2(nn.Module):
 class CandyCrunch_CNN2(nn.Module):
     """Daniel new Change
 
+    num_res_units controls the number of ResUnit2 blocks, with dilations 1, 2, 4, ... (default: six blocks).
+    dilations replaces that schedule with one ResUnit2 per listed dilation, e.g. residue_dilations("native"); num_res_units is then the length
+    of the list.
+    in_channel is the encoder width: the output channels of the input 1x1 convolution and of every ResUnit2 (whose bottleneck has
+    in_channel // 2); fc1 reads in_channel x 102 pooled features (default: 64, the width of checkpoints from before it was configurable).
+
     Fixed routing (classifier_fixed_routing) sends each spectrum to one classifier expert, chosen by classifier_routing_key:
         "glycan_class": the expert of its glycan class code (O 0, N 1, free/lipid 2), with classifier_num_experts = 3
         "instrument": the expert of its instrument, i.e. its (mode, lc, modification, trap) codes, looked up in a table built from
@@ -349,8 +375,23 @@ class CandyCrunch_CNN2(nn.Module):
     def __init__( self,input_dim, num_classes=1, hidden_dim=1024, input_precursor_dim=None, dropout=0.2,
                   se=None, se_reduction=None,norm_type=None,activation=None,encoder_activation=None, classifier_moe=False, classifier_num_experts=4,
                   classifier_top_k=2, classifier_expert_hidden_dim=None, classifier_shared_expert=False, classifier_fixed_routing=False,
-                  classifier_routing_key="glycan_class", classifier_instrument_experts=None):
+                  classifier_routing_key="glycan_class", classifier_instrument_experts=None, num_res_units=None, in_channel=64, dilations=None):
         super(CandyCrunch_CNN2, self).__init__()
+        if dilations is None:
+            # Dilations 1, 2, 4, ...; six blocks unless num_res_units says otherwise
+            num_res_units = 6 if num_res_units is None else num_res_units
+            if isinstance(num_res_units, bool) or not isinstance(num_res_units, int) or num_res_units < 1:
+                raise ValueError("num_res_units must be a positive integer.")
+            dilations = [2 ** index for index in range(num_res_units)]
+        else:
+            dilations = list(dilations)
+            if not dilations or any(isinstance(dilation, bool) or not isinstance(dilation, int) or dilation < 1 for dilation in dilations):
+                raise ValueError("dilations must be a non-empty list of positive integers.")
+            if num_res_units not in (None, len(dilations)):
+                raise ValueError(f"num_res_units={num_res_units} does not match the {len(dilations)} dilations {dilations}.")
+            num_res_units = len(dilations)
+        if isinstance(in_channel, bool) or not isinstance(in_channel, int) or in_channel < 2:
+            raise ValueError("in_channel must be an integer of at least 2 (ResUnit2 halves it in its bottleneck).")
         if (classifier_shared_expert or classifier_fixed_routing) and not classifier_moe:
             raise ValueError("classifier_shared_expert and classifier_fixed_routing need classifier_moe=True.")
         if classifier_routing_key not in ("glycan_class", "instrument"):
@@ -360,6 +401,9 @@ class CandyCrunch_CNN2(nn.Module):
             raise ValueError(f"Fixed routing sends each spectrum to the expert of its glycan class (O, N, free/lipid), so it needs "
                              f"classifier_num_experts={GLYCAN_CLASS_EXPERTS}.")
         self.input_dim = input_dim
+        self.num_res_units = num_res_units
+        self.dilations = dilations
+        self.in_channel = in_channel
         self.classifier_moe = classifier_moe
         self.classifier_fixed_routing = bool(classifier_fixed_routing)
         self.classifier_routing_key = classifier_routing_key
@@ -375,24 +419,20 @@ class CandyCrunch_CNN2(nn.Module):
         self.prec_block = nn.Sequential( nn.Linear(input_precursor_dim, 24), make_norm(norm_type,24),  make_activation(activation))
         self.rt_block = nn.Sequential( nn.Linear(1, 24), make_norm(norm_type,24), make_activation(activation))
 
-        self.res_block = nn.Sequential( nn.Conv1d(in_channels=2, out_channels=64, kernel_size=1),
+        self.res_block = nn.Sequential( nn.Conv1d(in_channels=2, out_channels=in_channel, kernel_size=1),
                                         nn.LeakyReLU(),
-                                        ResUnit2(64, size=3, dilation=1, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
-                                        ResUnit2(64, size=3, dilation=2, causal=False, se=se, se_reduction=se_reduction,encoder_activation=encoder_activation ),
-                                        ResUnit2(64, size=3, dilation=4, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
-                                        ResUnit2(64, size=3, dilation=8, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
-                                        ResUnit2(64, size=3, dilation=16, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
-                                        ResUnit2(64, size=3, dilation=32, causal=False, se=se, se_reduction=se_reduction, encoder_activation=encoder_activation),
+                                        *(ResUnit2(in_channel, size=3, dilation=dilation, causal=False, se=se, se_reduction=se_reduction,
+                                                   encoder_activation=encoder_activation) for dilation in dilations),
                                         nn.AdaptiveMaxPool1d(102))#
-        # self.channel_reduce = nn.Conv1d(in_channels=64, out_channels=1, kernel_size=1)
-        self.fc1 = nn.Sequential(nn.Linear(in_features=6528, out_features=hidden_dim),
+        # in_channel x 102 pooled positions (6528 at the default 64 channels)
+        self.fc1 = nn.Sequential(nn.Linear(in_features=in_channel * 102, out_features=hidden_dim),
                                  make_norm(norm_type, hidden_dim),
                                  make_activation(activation),
-                                 nn.Dropout(dropout)) #6528
+                                 nn.Dropout(dropout))
         self.comb_block1 = nn.Sequential(nn.Linear(hidden_dim + 24*7, hidden_dim//2),
                                          make_norm(norm_type, hidden_dim//2),
                                          make_activation(activation),
-                                         nn.Dropout(dropout))
+                                         nn.Dropout(dropout),)
         if classifier_moe:
             self.classifier_out = MoEClassifier(input_dim=hidden_dim//2,
                                                 num_classes=num_classes,
@@ -400,7 +440,6 @@ class CandyCrunch_CNN2(nn.Module):
                                                 top_k=classifier_top_k,
                                                 hidden_dim=classifier_expert_hidden_dim,
                                                 dropout=dropout,
-                                                # The activation's name: MoEClassifier makes the module for each MLP expert
                                                 activation=activation,
                                                 shared_expert=classifier_shared_expert,
                                                 fixed_routing=classifier_fixed_routing)
@@ -465,8 +504,6 @@ class CandyCrunch_CNN2(nn.Module):
         rt = self.rt_block(rt)
         mz = self.res_block(mz_features)
         mz = flatten(mz, start_dim=1)
-        # mz = self.channel_reduce(mz)
-        # mz = mz.squeeze(1)
         mz = self.fc1(mz)
         comb = torch.cat([mz,precursor,glycan_type,rt,mode,lc,modification,trap],dim=1)
         comb = self.comb_block1(comb)
