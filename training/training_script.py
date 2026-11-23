@@ -4,7 +4,10 @@ import argparse
 import random
 import hashlib
 import re
+import subprocess
+import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import numpy as np
 import torch
 from candycrunch.losses import (
@@ -25,22 +28,18 @@ from candycrunch.transformer import CandyCrunch_Transformer
 from glycowork.motif.annotate import annotate_dataset, get_k_saccharides
 from glycowork.motif.tokenization import glycan_to_composition
 from sklearn.metrics import pairwise_distances
-# if __package__:
-#     from .pretraining import (
-#         GroupedViewBatchSampler, IsomerProbe, PretrainingDataset, ProjectionHeadModel, ViewAugmentation, ViewBatchSampler, describe_pairs,
-#         embedding_dim, fine_tuning_validation_runs, load_pretraining_pool, split_pretraining_runs,
-#     )
-#     from .training_utils import ResampledDataset, load_dataset_inputs, seed_worker, train_model
-# else:
-#     from pretraining import (
-#         GroupedViewBatchSampler, IsomerProbe, PretrainingDataset, ProjectionHeadModel, ViewAugmentation, ViewBatchSampler, describe_pairs,
-#         embedding_dim, fine_tuning_validation_runs, load_pretraining_pool, split_pretraining_runs,
-#     )
-#     from training_utils import ResampledDataset, load_dataset_inputs, seed_worker, train_model
-
-from pretraining import (GroupedViewBatchSampler, IsomerProbe, PretrainingDataset, ProjectionHeadModel, ViewAugmentation, ViewBatchSampler,describe_pairs,
-                         embedding_dim, fine_tuning_validation_runs, load_pretraining_pool, split_pretraining_runs,)
-from training_utils import ResampledDataset, load_dataset_inputs, seed_worker, train_model
+if __package__:
+    from .pretraining import (
+        GroupedViewBatchSampler, IsomerProbe, PretrainingDataset, ProjectionHeadModel, ViewAugmentation, ViewBatchSampler, describe_pairs,
+        embedding_dim, fine_tuning_validation_runs, load_pretraining_pool, split_pretraining_runs,
+    )
+    from .training_utils import ResampledDataset, load_dataset_inputs, seed_worker, train_model
+else:
+    from pretraining import (
+        GroupedViewBatchSampler, IsomerProbe, PretrainingDataset, ProjectionHeadModel, ViewAugmentation, ViewBatchSampler, describe_pairs,
+        embedding_dim, fine_tuning_validation_runs, load_pretraining_pool, split_pretraining_runs,
+    )
+    from training_utils import ResampledDataset, load_dataset_inputs, seed_worker, train_model
 
 warnings.filterwarnings("ignore",category=RuntimeWarning,module="sklearn.utils.extmath")
 
@@ -66,10 +65,9 @@ def str_to_bool(value):
     raise argparse.ArgumentTypeError("Expected a boolean value such as True or False.")
 
 
-def set_seed(seed=None):
+def set_seed(seed):
+    # PyTorch seeds the CPU and CUDA generators together.
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
@@ -163,7 +161,7 @@ def schedule_dilations(schedule, input_dim=2048):
     return [int(dilation) for dilation in schedule.split("-")]
 
 
-def main(args):
+def main(args, model_dir=Path("models")):
     set_seed(args.current_seed)
     if args.model not in {"CNN", "CNN2", "Transformer"}:
         raise ValueError(f"Unknown model={args.model!r}. Expected 'CNN', 'CNN2', or 'Transformer'.")
@@ -353,13 +351,13 @@ def main(args):
         loader_kwargs = {
             "pin_memory": pin_memory,
             "num_workers": num_workers,
+            "generator": generator,
         }
         if batch_sampler is None:
             loader_kwargs.update(
                 batch_size=args.batch_size,
                 shuffle=shuffle,
                 drop_last=shuffle,
-                generator=generator,
             )
         else:
             loader_kwargs["batch_sampler"] = batch_sampler
@@ -508,6 +506,8 @@ def main(args):
                         classifier_num_experts=args.classifier_num_experts,
                         classifier_top_k=args.classifier_top_k,
                         classifier_expert_hidden_dim= args.classifier_expert_hidden_dim)
+    # Isolate model initialization from RNG use during data preparation.
+    set_seed(args.current_seed)
     model = model_class(**model_kwargs)
     checkpoint_model_class = model_class.__name__
     # --------------------------------------------------------
@@ -530,22 +530,24 @@ def main(args):
 
     dataset_tag = dataset_dir.name.removeprefix("prepared_datasets_")
     if args.model == "Transformer":
-        setting_name = (f"{args.model}_{encoder_tag}_{classifier_tag}_{args.split}_H{args.nheads}L{args.nlayers}"
+        model_setting = (f"{args.model}_{encoder_tag}_{classifier_tag}_{args.split}_H{args.nheads}L{args.nlayers}"
             f"PHD{resolve_transformer_peak_hidden_dim(args)}_{'FFD' + str(args.ff_dim) + '_' if args.ff_dim is not None else ''}"
             f"PE({args.peak_encoder})_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation}_FF({args.use_transformer_ff})"
-            f"{loss_tag}{pretraining_tag}_{args.resample_dataset}_{dataset_tag}")
+            f"{loss_tag}")
 
     elif args.model == "CNN2":
         se_tag = f"SE(T)RS{args.se_reduction}" if args.se else str("SE(F)")
         # The dilation schedule in two letters follows the block count, as in the leaderboard: RU6D(Pw)CH64SE(F), RU5D(Na)CH64SE(F). A custom list
         # is Cu (the list itself is in training_args and model_kwargs), so runs with two custom lists and otherwise equal settings share a name
         dilation_code = DILATION_CODES.get(args.dilations, "Cu")
-        setting_name = (f"{args.model}9_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_RU{args.num_res_units}D({dilation_code})CH{args.in_channel}{se_tag}"
-            f"{loss_tag}{pretraining_tag}_{args.resample_dataset}_{dataset_tag}")
+        model_setting = (f"{args.model}a_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_RU{args.num_res_units}D({dilation_code})CH{args.in_channel}{se_tag}"
+            f"{loss_tag}")
     else:
-        setting_name = (f"{args.model}_{classifier_tag}_{args.split}{loss_tag}"
-                        f"{pretraining_tag}_{args.resample_dataset}_{dataset_tag}")
+        model_setting = f"{args.model}_{classifier_tag}_{args.split}{loss_tag}"
 
+    model_setting += f"{pretraining_tag}_{args.resample_dataset}"
+    setting_name = f"{model_setting}_SD{args.current_seed}_{dataset_tag}"
+    benchmark_setting_name = f"{model_setting}_{dataset_tag}"
     pretrain_setting_name = setting_name if pretraining_enabled else None
     # ============================================================
     # Checkpoint metadata
@@ -627,8 +629,6 @@ def main(args):
     wandb.init(
         project="CandyCrunch_5",
         entity=("vahid-atabaigielmi-university-of-gothenburg"),name=setting_name,save_code=True)
-    # Runs with several seeds share one setting_name, so each seed gets its own folder instead of overwriting the previous seed's checkpoint and metrics
-    model_dir = Path("./models") if len(args.random_seeds) == 1 else Path("./models") / f"seed{args.current_seed}"
     if pretraining_enabled:
         pretrain_model = place(ProjectionHeadModel(backbone, representation_dim, projection_dim = args.pretraining_projection_dim))
         pretrain_patience = args.pretraining_patience if args.pretraining_patience is not None else args.patience
@@ -707,12 +707,56 @@ def main(args):
             print("Classifier MoE auxiliary weight:",args.classifier_moe_aux_loss_weight)
         if args.classifier_shared_expert:
             print("Classifier MoE: with a shared expert that every spectrum uses")
-    model_ft = train_model(model,dataloaders,criterion,optimizer_ft,scheduler,glycans, num_epochs=args.epoch,
+    train_model(model,dataloaders,criterion,optimizer_ft,scheduler,glycans, num_epochs=args.epoch,
         patience=args.patience,model_type=args.model,setting_name=setting_name,
         transformer_moe_aux_loss_weight=args.transformer_moe_aux_loss_weight,
         classifier_moe_aux_loss_weight=classifier_aux_weight,checkpoint_metadata=checkpoint_metadata,glycan_compositions=glycan_compositions,
         save_dir=model_dir,cand_mask=cand_mask)
     wandb.finish()
+    return model_dir / f"CandyCrunch_{setting_name}.pt", benchmark_setting_name
+
+
+def train_and_test_seeds(args):
+    repo_dir = Path(__file__).resolve().parents[1]
+    tests_dir = repo_dir / "tests"
+    seeds = list(dict.fromkeys(args.random_seeds))
+    accuracy_results = []
+    failed_seeds = []
+    with TemporaryDirectory(dir=tests_dir) as temp_path:
+        temp_dir = Path(temp_path)
+        seed_csv = temp_dir / "seed.csv"
+        combined_csv = temp_dir / "combined.csv"
+        for seed in seeds:
+            print(f"\n=== Running with seed {seed} ===", flush=True)
+            seed_args = argparse.Namespace(**{**vars(args), "current_seed": seed})
+            checkpoint, setting_name = main(seed_args)
+            print(f"\n=== Testing {checkpoint} ===", flush=True)
+            seed_csv.unlink(missing_ok=True)
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "--input-format", "both", "-p", "candycrunch.checkpoint_plugin",
+                 "--checkpoint", str(checkpoint.resolve()), "--leaderboard-dir", str(tests_dir), "--accuracy-csv", str(seed_csv),
+                 "tests/test_CandyCrunch.py", "-k", "candycrunch_accuracy", "-rs"],
+                cwd=repo_dir, check=False,
+            )
+            has_results = seed_csv.is_file()
+            if has_results:
+                accuracy_results.append(pd.read_csv(seed_csv, keep_default_na=False).assign(seed=seed))
+                csv_path = tests_dir / f"{setting_name}.csv"
+                pd.concat(accuracy_results, ignore_index=True).to_csv(combined_csv, index=False)
+                combined_csv.replace(csv_path)
+                print(f"Saved accuracy results to {csv_path}", flush=True)
+            else:
+                print(f"No accuracy results collected for seed {seed}.", file=sys.stderr)
+            if result.returncode != 0 or not has_results:
+                failed_seeds.append(seed)
+            # An assertion failure can still produce scores. A pytest startup or execution error stops the sweep.
+            if result.returncode not in (0, 1):
+                print(f"Pytest exited with code {result.returncode} for seed {seed}.", file=sys.stderr)
+                break
+    if failed_seeds:
+        print(f"Accuracy testing failed for seeds {', '.join(map(str, failed_seeds))}.", file=sys.stderr)
+    return int(bool(failed_seeds))
+
 # ================================================================
 # Command-line interface
 # ================================================================
@@ -774,20 +818,20 @@ def build_parser():
     parser.add_argument("--unsup-pretraining-mz-tolerance", type = float, default = 0.5,
                         help = "Precursor m/z tolerance for one unsupervised pair key (default: 0.5).")
       # What goes into a batch
-    parser.add_argument("--pretraining-examples-per-batch", "--unsup-pretraining-examples-per-batch", "--unsup_pretraining_examples_per_batch",dest = "pretraining_examples_per_batch", type = int, default = 256,
+    parser.add_argument("--pretraining-examples-per-batch", "--unsup-pretraining-examples-per-batch", "--unsup_pretraining_examples_per_batch",dest = "pretraining_examples_per_batch", type = int, default = 128,
                         help = "Distinct spectra per pretraining batch (default: 128).")
-    parser.add_argument("--pretraining-views-per-example", "--unsup-pretraining-views-per-example", "--unsup_pretraining_views_per_example, --supcon-views-per-example", dest = "pretraining_views_per_example", type = int, default = 4,
+    parser.add_argument("--pretraining-views-per-example", "--unsup-pretraining-views-per-example", "--unsup_pretraining_views_per_example, --supcon-views-per-example", dest = "pretraining_views_per_example", type = int, default = 2,
                         help = "Independently augmented views per spectrum in a pretraining batch (default: 2).")
-    parser.add_argument("--pretraining-examples-per-group", "--sup-pretraining-examples-per-group", dest = "pretraining_examples_per_group", type = int, default = 8,
+    parser.add_argument("--pretraining-examples-per-group", "--sup-pretraining-examples-per-group", dest = "pretraining_examples_per_group", type = int, default = 4,
                         help = "Spectra drawn from each composition (supervised) or precursor-m/z (unsupervised) group per batch visit (default: 4).")
       # How the two views differ
-    parser.add_argument("--pretraining-peak-dropout", type = float, default = 0.2,
+    parser.add_argument("--pretraining-peak-dropout", type = float, default = 0.3,
                         help = "View augmentation: chance of dropping the weakest peaks, falling to 0 for the base peak (default: 0.3).")
-    parser.add_argument("--pretraining-intensity-jitter", type = float, default = 0.05,
+    parser.add_argument("--pretraining-intensity-jitter", type = float, default = 0.1,
                         help = "View augmentation: log-normal intensity noise sd of the base peak, growing with 1/sqrt(relative intensity) (default: 0.1).")
-    parser.add_argument("--pretraining-mz-jitter", type = float, default = 0.01,
+    parser.add_argument("--pretraining-mz-jitter", type = float, default = 0.02,
                         help = "View augmentation: m/z remainder noise sd of the base peak, growing like the intensity noise (default: 0.02).")
-    parser.add_argument("--pretraining-noise-peaks", type = float, default = 0.3,
+    parser.add_argument("--pretraining-noise-peaks", type = float, default = 0.4,
                         help = "View augmentation: noise peaks added per peak of the spectrum, on average (default: 0.4).")
       # Loss and projection head
     parser.add_argument("--supcon-temperature", "--pretraining-temperature", dest = "supcon_temperature", type = float, default = 0.1,
@@ -860,13 +904,9 @@ def build_parser():
     # ============================================================
     # Seeds
     # ============================================================
-    parser.add_argument("--random_seeds",nargs="+",type=int,default=[42],help="List of random seeds.")
+    parser.add_argument("--random_seeds",nargs="+",type=int,default=[42, 123, 456, 789, 999],help="List of random seeds.")
     return parser
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
-    for seed in args.random_seeds:
-        print(f"\n=== Running with seed {seed} ===")
-        args.current_seed = seed
-        main(args)
+    raise SystemExit(train_and_test_seeds(build_parser().parse_args()))
