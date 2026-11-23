@@ -627,7 +627,7 @@ def main(args, model_dir=Path("models")):
         raise ValueError(f"Unknown fine-tuning loss_function={args.loss_function!r}.")
 
     wandb.init(
-        project="CandyCrunch_5",
+        project="CandyCrunch_6",
         entity=("vahid-atabaigielmi-university-of-gothenburg"),name=setting_name,save_code=True)
     if pretraining_enabled:
         pretrain_model = place(ProjectionHeadModel(backbone, representation_dim, projection_dim = args.pretraining_projection_dim))
