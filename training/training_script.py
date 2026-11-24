@@ -540,7 +540,7 @@ def main(args, model_dir=Path("models")):
         # The dilation schedule in two letters follows the block count, as in the leaderboard: RU6D(Pw)CH64SE(F), RU5D(Na)CH64SE(F). A custom list
         # is Cu (the list itself is in training_args and model_kwargs), so runs with two custom lists and otherwise equal settings share a name
         dilation_code = DILATION_CODES.get(args.dilations, "Cu")
-        model_setting = (f"{args.model}a_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_RU{args.num_res_units}D({dilation_code})CH{args.in_channel}{se_tag}"
+        model_setting = (f"{args.model}_{classifier_tag}_{args.split}_HD{args.hidden_dim}_N({args.norm_type})_ACT({args.activation})_EACT({args.encoder_activation})_RU{args.num_res_units}D({dilation_code})CH{args.in_channel}{se_tag}"
             f"{loss_tag}")
     else:
         model_setting = f"{args.model}_{classifier_tag}_{args.split}{loss_tag}"
@@ -730,14 +730,20 @@ def train_and_test_seeds(args):
             print(f"\n=== Running with seed {seed} ===", flush=True)
             seed_args = argparse.Namespace(**{**vars(args), "current_seed": seed})
             checkpoint, setting_name = main(seed_args)
+
+            if not args.test_after_training:
+                print(f"Skipping testing for {checkpoint}", flush=True)
+                continue
             print(f"\n=== Testing {checkpoint} ===", flush=True)
             seed_csv.unlink(missing_ok=True)
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q", "--input-format", "both", "-p", "candycrunch.checkpoint_plugin",
-                 "--checkpoint", str(checkpoint.resolve()), "--leaderboard-dir", str(tests_dir), "--accuracy-csv", str(seed_csv),
+                 "--checkpoint", str(checkpoint.resolve()), "--leaderboard-dir", str(tests_dir), "--accuracy-csv",
+                 str(seed_csv),
                  "tests/test_CandyCrunch.py", "-k", "candycrunch_accuracy", "-rs"],
                 cwd=repo_dir, check=False,
             )
+
             has_results = seed_csv.is_file()
             if has_results:
                 accuracy_results.append(pd.read_csv(seed_csv, keep_default_na=False).assign(seed=seed))
@@ -772,6 +778,7 @@ def build_parser():
     # ============================================================
     # Training fix value
     # ============================================================
+    parser.add_argument("--test-after-training",action=argparse.BooleanOptionalAction,default=True,help="Run accuracy tests after training each seed (default: True).")
     parser.add_argument("--batch-size", type=int, default=256, help=("batch size"))
     parser.add_argument("--num-workers",type=int,default=2,help="Training DataLoader workers.")
     parser.add_argument("--val-num-workers",type=int,default=0,help="Validation DataLoader workers.")
@@ -783,6 +790,7 @@ def build_parser():
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--pretraining-epochs",type=int,default=10,help="Number of contrastive pretraining epochs before fine-tuning (default: 10).")
     parser.add_argument("--pretraining-patience", type = int, default = 3, help = "Early-stopping patience for contrastive pretraining. Defaults to --patience when omitted.")
+
     # ============================================================
     # Training-loss
     # ============================================================
