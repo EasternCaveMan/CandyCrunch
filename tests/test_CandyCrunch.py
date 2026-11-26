@@ -677,6 +677,18 @@ def test_reducing_end_check(capsys):
     assert len(reduced) >= 15 and all(len(set(outs[m]['top1_pred'].dropna()) & reduced) >= 0.8 * len(reduced) for m in ['custom', '2AB'])
 
 
+def test_mode_override(capsys):
+    # A run of the other ion mode than max_charge asks for: the checks and passes after the override run in the file's mode, so it warns once (it did for
+    # every reducing end the check tried) and gives the same table; permethylated glycans asked for in positive mode on a negative run drop their default
+    # Na+ (it raised that Na+ cannot carry the charge)
+    example = str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx')
+    overridden = wrap_inference(example, 'O', max_charge = 3, modification = '2AB')
+    assert capsys.readouterr().out.count('Overriding to negative mode') == 1
+    assert overridden.equals(wrap_inference(example, 'O', modification = '2AB'))
+    wrap_inference(example, 'O', sample_prep = 'permethylated', max_charge = 3)
+    assert RUN_ADDUCTS.get() == ()
+
+
 def test_filter_out_is_airtight():
     # A residue the user ignores stays out of every route to a structure, also the no-prediction rescue and impute
     df = wrap_inference(str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx'), 'O', filter_out = {'HexA', 'Neu5Ac'})
@@ -1118,6 +1130,87 @@ def test_label_inputs_past_anchors():
     assert labelled.set_index('spec_id').loc[13, 'glycan'] == glycans[13]
     run_rt = [r['run_rt'] for r in labelled.attrs['map_rows']]
     assert np.allclose(run_rt[:13], run_rts[:13], atol = 0.01) and abs(run_rt[13] - run_rts[13]) < 1e-9
+
+
+def test_label_inputs_own_anchors():
+    # A run whose map rows carry its own RTs (RT_<run>, rt_own) for all but two rows, each 0.6 min after the map's RT (map_rt), as are the peaks of the
+    # other two. The two rows' inputs alone are too few to anchor a shift (they stay at their map RT); with each own row anchoring by its own RT minus
+    # its map RT, they move 0.6 min onto their peaks, while the own rows keep their RTs
+    import training.pipeline_labels as pl
+    from glycowork.motif.tokenization import glycan_to_composition
+    chain = lambda m, h: 'Gal(b1-4)GlcNAc(b1-3)' * m + 'Gal(b1-4)' * h + 'Glc'
+    glycans = [chain(m, h) for m in range(2, 5) for h in range(3)]
+    map_rts = [10.0 + 2 * k for k in range(9)]
+    run_rts = [t + 0.6 for t in map_rts]
+    masses = [300.0 + 37 * k for k in range(9)]
+    own = [True] * 7 + [False] * 2
+    inputs = pd.DataFrame({'spec_id': range(9), 'RT': run_rts, 'intensity': 1e5, 'peak_d': [{50.0: 1.0}] * 9, 'rt_range': [(t, t) for t in run_rts], 'num_spectra': 3,
+                           'composition': [glycan_to_composition(g) for g in glycans], 'charge': 1, 'annotation_score': 12.0,
+                           'model_input': [np.zeros((3, 1), np.float32)] * 9, 'RT2': 0.3, 'glycan_type': 1, 'compositional_vector': [np.zeros(12)] * 9},
+                          index = pd.Index(masses, name = 'm/z'))
+    inputs.attrs.update(mode = 'negative', trap = 'linear', lc = 'PGC', modification = 'reduced', mass_tag = None, sample_prep = 'underivatized')
+    mapping = pd.DataFrame({'Mass': masses, 'RT': [r if o else t for r, t, o in zip(run_rts, map_rts, own)], 'glycan': glycans, 'rt_own': own})
+    labelled, _ = pl.label_inputs(inputs, mapping)
+    assert labelled.attrs['rt_alignment'] == 'none' and labelled.attrs['rt_anchors'] == 2
+    assert np.allclose([r['run_rt'] for r in labelled.attrs['map_rows']], run_rts[:7] + map_rts[7:])
+    labelled, _ = pl.label_inputs(inputs, mapping.assign(map_rt = map_rts))
+    assert labelled.attrs['rt_alignment'] == 'median' and labelled.attrs['rt_anchors'] == 9 and abs(labelled.attrs['rt_shift'] - 0.6) < 1e-9
+    assert np.allclose([r['run_rt'] for r in labelled.attrs['map_rows']], run_rts) and sorted(labelled['spec_id']) == list(range(9))
+
+
+def test_label_inputs_own_anchors_acid_drift():
+    # A run whose sialylated glycans elute 1.2 min later per Neu5Ac against the map than its neutral ones: its own rows (RT_<run>) anchor a drift with an
+    # acid term, but three trisialylated ones sit at their map RT (carried over from another run), and the map's other two rows anchor by their inputs.
+    # The whole-map check judges each own row against the drift, not the anchors' median: the mono- and disialylated rows count as placed and the three off
+    # the drift do not, so the drift stays and the disialylated row without an own RT is labeled on its peak (by the median, the three counted and the
+    # sialylated ones did not, the map went to the median and that row sat 2.4 min before its peak)
+    import training.pipeline_labels as pl
+    from glycowork.motif.tokenization import glycan_to_composition
+    chain = lambda m, h: 'Gal(b1-4)GlcNAc(b1-3)' * m + 'Gal(b1-4)' * h + 'Glc'
+    neutral = [chain(m, h) for m in range(1, 4) for h in range(3)]
+    glycans = neutral[:8] + ['Neu5Ac(a2-3)' + g for g in neutral[:3]] + ['Neu5Ac(a2-8)Neu5Ac(a2-3)' + g for g in neutral[:4]]
+    glycans += ['Neu5Ac(a2-8)Neu5Ac(a2-8)Neu5Ac(a2-3)' + g for g in neutral[:3]] + [neutral[8], 'Neu5Ac(a2-8)Neu5Ac(a2-3)' + neutral[4]]
+    acid = [0] * 8 + [1] * 3 + [2] * 4 + [3] * 3 + [0, 2]
+    jitter = [0.04, -0.06, 0.08, -0.02, 0.06, -0.08, 0.02, -0.04, 0.05, -0.05, 0.03, -0.03, 0.07, -0.07, 0.04, 0.0, 0.0, 0.0, 0.01, -0.01]
+    map_rts = [10.0 + 0.25 * k for k in range(20)]
+    run_rts = [t + j + (1.2 * a if a < 3 else 0.0) for t, j, a in zip(map_rts, jitter, acid)]
+    masses = [300.0 + 37 * k for k in range(20)]
+    own = [True] * 18 + [False] * 2
+    inputs = pd.DataFrame({'spec_id': [0, 1], 'RT': run_rts[18:], 'intensity': 1e5, 'peak_d': [{50.0: 1.0}] * 2, 'rt_range': [(t, t) for t in run_rts[18:]],
+                           'num_spectra': 3, 'composition': [glycan_to_composition(g) for g in glycans[18:]], 'charge': 1, 'annotation_score': 12.0,
+                           'model_input': [np.zeros((3, 1), np.float32)] * 2, 'RT2': 0.3, 'glycan_type': 1, 'compositional_vector': [np.zeros(12)] * 2},
+                          index = pd.Index(masses[18:], name = 'm/z'))
+    inputs.attrs.update(mode = 'negative', trap = 'linear', lc = 'PGC', modification = 'reduced', mass_tag = None, sample_prep = 'underivatized')
+    mapping = pd.DataFrame({'Mass': masses, 'RT': [r if o else t for r, t, o in zip(run_rts, map_rts, own)], 'map_rt': map_rts, 'glycan': glycans, 'rt_own': own})
+    labelled, _ = pl.label_inputs(inputs, mapping)
+    assert labelled.attrs['rt_alignment'] == 'model' and labelled.attrs['rt_anchors'] == 20
+    assert sorted(labelled['spec_id']) == [0, 1] and (labelled['rt_error'].abs() < 0.1).all()
+    assert np.allclose([r['run_rt'] for r in labelled.attrs['map_rows']][:18], run_rts[:18])
+
+
+def test_label_inputs_own_anchors_per_map():
+    # A run reading an N-glycan map and an O-glycan map whose RTs come from different reference runs: the N map's own rows (RT_<run>) sit 0.9 min before
+    # their map RT, the O map's two own rows on theirs. Five anchors give one median, -0.88, which put the O map's a2-6 / a2-3 isomer pair 0.9 min early,
+    # so the a2-6 isomer's peak was labeled with the a2-3 isomer; each map's own anchors set its own intercept, and both isomers are labeled on their peaks
+    import training.pipeline_labels as pl
+    from glycowork.motif.tokenization import glycan_to_composition
+    chain = lambda m, h: 'Gal(b1-4)GlcNAc(b1-3)' * m + 'Gal(b1-4)' * h + 'Glc'
+    glycans = [chain(m, 1) for m in range(1, 4)] + ['Gal(b1-3)GalNAc', 'GlcNAc(b1-6)[Gal(b1-3)]GalNAc', 'Gal(b1-3)[Neu5Ac(a2-6)]GalNAc', 'Neu5Ac(a2-3)Gal(b1-3)GalNAc']
+    map_rts = [18.0, 19.5, 21.0, 10.0, 11.0, 12.6, 13.4]
+    run_rts = [17.08, 18.6, 20.12, 10.03, 10.97, 12.62, 13.38]
+    masses = [700.0, 1065.0, 1430.0, 384.15, 587.23, 675.25, 675.25]
+    own = [True] * 5 + [False] * 2
+    inputs = pd.DataFrame({'spec_id': [0, 1], 'RT': run_rts[5:], 'intensity': 1e5, 'peak_d': [{50.0: 1.0}] * 2, 'rt_range': [(t, t) for t in run_rts[5:]],
+                           'num_spectra': 3, 'composition': [glycan_to_composition(g) for g in glycans[5:]], 'charge': 1, 'annotation_score': 12.0,
+                           'model_input': [np.zeros((3, 1), np.float32)] * 2, 'RT2': 0.3, 'glycan_type': 1, 'compositional_vector': [np.zeros(12)] * 2},
+                          index = pd.Index(masses[5:], name = 'm/z'))
+    inputs.attrs.update(mode = 'negative', trap = 'linear', lc = 'PGC', modification = 'reduced', mass_tag = None, sample_prep = 'underivatized')
+    mapping = pd.DataFrame({'Mass': masses, 'RT': [r if o else t for r, t, o in zip(run_rts, map_rts, own)], 'map_rt': map_rts, 'glycan': glycans, 'rt_own': own,
+                            'map_file': ['N.csv'] * 3 + ['O.csv'] * 4})
+    labelled, _ = pl.label_inputs(inputs, mapping)
+    assert list(labelled.sort_values('spec_id')['glycan']) == [pl.canonicalize_iupac(g) for g in glycans[5:]] and (labelled['rt_error'].abs() < 0.1).all()
+    assert labelled.attrs['rt_alignment'] == 'model' and labelled.attrs['rt_anchors'] == 5
+    assert np.allclose([r['run_rt'] for r in labelled.attrs['map_rows']][5:], run_rts[5:], atol = 0.1)
 
 
 def test_label_inputs_map_intercepts():
@@ -2331,6 +2424,63 @@ def test_spectra_readers(tmp_path):
     assert [p['charge'] for p in params] == [[2], [-3], [2, 3]] and [p['pepmass'] for p in params] == [(675.25, None), (675.25, 1e5), (675.25, None)]
 
 
+def test_inputs_of_other_writers(tmp_path):
+    # A run as other tools write it reads as the run itself: gzipped (msconvert --gzip), without mzML 1.1's namespace (whose ion mode, analyzer and charges
+    # were lost), stored with msconvert's truncation and zlib; delta or linear predictions are refused, not read as numbers
+    import gzip
+
+    def mzml(ns = ' xmlns="http://psi.hupo.org/ms/mzml"', compression = 'MS:1000574'):
+        def arrays(mzs, ints):
+            return ''.join(f'<binaryDataArray encodedLength="0"><cvParam cvRef="MS" accession="{acc}" name="" value=""/><cvParam cvRef="MS" accession="MS:1000523" '
+                           f'name="" value=""/><cvParam cvRef="MS" accession="{compression}" name="" value=""/><binary>'
+                           f'{base64.b64encode(zlib.compress(np.array(v, "<f8").tobytes())).decode()}</binary></binaryDataArray>' for acc, v in (('MS:1000514', mzs), ('MS:1000515', ints)))
+
+        def spectrum(i, level, rt, filt, mzs, ints, precursor = ''):
+            return (f'<spectrum index="{i}" id="controllerType=0 controllerNumber=1 scan={i + 1}" defaultArrayLength="{len(mzs)}"><cvParam cvRef="MS" accession="MS:1000511" '
+                    f'name="ms level" value="{level}"/><cvParam cvRef="MS" accession="MS:1000129" name="negative scan" value=""/><cvParam cvRef="MS" accession="MS:1000127" '
+                    f'name="centroid spectrum" value=""/><scanList count="1"><scan><cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="{rt}" '
+                    f'unitName="second"/><cvParam cvRef="MS" accession="MS:1000512" name="filter string" value="{filt}"/></scan></scanList>{precursor}'
+                    f'<binaryDataArrayList count="2">{arrays(mzs, ints)}</binaryDataArrayList></spectrum>')
+        precursor = ('<precursorList count="1"><precursor spectrumRef="controllerType=0 controllerNumber=1 scan=1"><selectedIonList count="1"><selectedIon>'
+                     '<cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="675.25"/><cvParam cvRef="MS" accession="MS:1000041" name="charge state" '
+                     'value="2"/></selectedIon></selectedIonList><activation><cvParam cvRef="MS" accession="MS:1000133" name="" value=""/></activation></precursor></precursorList>')
+        return (f'<?xml version="1.0" encoding="utf-8"?><mzML{ns} version="1.1.0"><run id="r"><spectrumList count="2">' +
+                spectrum(0, 1, 600, 'ITMS - p ESI Full ms [400.00-2000.00]', [675.25, 675.75, 676.25], [100.0, 60.0, 20.0]) +
+                spectrum(1, 2, 601, 'ITMS - c ESI d Full ms2 675.25@cid35.00 [175.00-1365.00]', [290.09, 384.15, 675.25], [100.0, 40.0, 10.0], precursor) +
+                '</spectrumList></run></mzML>')
+
+    (tmp_path / 'run.mzML').write_text(mzml())
+    ref = load_spectra_filepath(str(tmp_path / 'run.mzML'), extract_ms1 = True)
+    assert ref.attrs['detected_mode'] == 'negative' and ref.attrs['detected_trap'] == 'linear' and ref['precursor_charge'].tolist() == [2]
+    (tmp_path / 'gz.mzML.gz').write_bytes(gzip.compress(mzml().encode()))
+    (tmp_path / 'nons.mzML').write_text(mzml(ns = ''))
+    (tmp_path / 'trunc.mzML').write_text(mzml(compression = 'MS:1003088'))
+    for name in ('gz.mzML.gz', 'nons.mzML', 'trunc.mzML'):
+        df = load_spectra_filepath(str(tmp_path / name), extract_ms1 = True)
+        assert df.drop(columns = 'peak_d').equals(ref.drop(columns = 'peak_d')) and df['peak_d'].tolist() == ref['peak_d'].tolist(), name
+        assert {k: v for k, v in df.attrs.items() if k != 'ms1'} == {k: v for k, v in ref.attrs.items() if k != 'ms1'}, name
+    (tmp_path / 'delta.mzML').write_text(mzml(compression = 'MS:1003089'))
+    with pytest.raises(ValueError, match = 'prediction'):
+        load_spectra_filepath(str(tmp_path / 'delta.mzML'))
+    (tmp_path / 'short.mzML.gz').write_bytes(gzip.compress(mzml().encode())[:200])
+    with pytest.raises(ValueError, match = 'not a complete gzip file'):
+        load_spectra_filepath(str(tmp_path / 'short.mzML.gz'))
+    # mgf retention times without RTINSECONDS: RTINMINUTES, Mascot Distiller's elution span, a time in minutes in the title (Bruker DataAnalysis); a time every
+    # title repeats is part of a name, and none at all is an error
+    titles = ['RTINMINUTES={}', 'TITLE=File: run.wiff, Elution from: {} to {} period: 0', 'TITLE=Cmpd 1, +MSn(675.2500), {:.2f} min']
+    for k, title in enumerate(titles):
+        (tmp_path / f'rt{k}.mgf').write_text(''.join(f'BEGIN IONS\n{title.format(rt, rt)}\nPEPMASS=675.25\nCHARGE=2-\n290.09 100\nEND IONS\n' for rt in (10.0, 10.5)))
+        assert np.allclose(load_spectra_filepath(str(tmp_path / f'rt{k}.mgf'))['RT'], [10.0, 10.5]), title
+    (tmp_path / 'gz.mgf.gz').write_bytes(gzip.compress((tmp_path / 'rt0.mgf').read_bytes()))
+    assert load_spectra_filepath(str(tmp_path / 'gz.mgf.gz')).equals(load_spectra_filepath(str(tmp_path / 'rt0.mgf')))
+    (tmp_path / 'named.mgf').write_text('BEGIN IONS\nTITLE=glycans 5 min gradient\nPEPMASS=675.25\n290.09 100\nEND IONS\n' * 2)
+    with pytest.raises(ValueError, match = 'no retention time'):
+        load_spectra_filepath(str(tmp_path / 'named.mgf'))
+    (tmp_path / 'none.mgf').write_text('BEGIN IONS\nTITLE=run.1.1.2\nPEPMASS=675.25\n290.09 100\nEND IONS\n')
+    with pytest.raises(ValueError, match = 'no retention time'):
+        load_spectra_filepath(str(tmp_path / 'none.mgf'))
+
+
 def test_mass_spec_helpers_from_glycopeptide_search():
     from candycrunch.analysis import add_qvalues, has_ion, intensity_share, match_peaks
     from candycrunch.prediction import averaged_precursor_mz, coeluting_lighter_ion, ion_trace, pair_spectra
@@ -2381,6 +2531,12 @@ def test_mass_spec_helpers_from_glycopeptide_search():
     # A run of EThcD scans alone keeps them as its spectra, unpaired
     paired = pair_spectra(df[df['activation'].eq('EThcD')]).set_index('scan')
     assert paired.index.tolist() == [2, 50] and paired['paired_peak_d'].isna().all() and paired.loc[2, 'peak_d'] == {2.0: 2.0}
+    # A method that acquires each precursor's electron-activated scan before its HCD scan pairs each HCD scan with the nearest one before it
+    df = pd.DataFrame({'scan': [1, 2, 3, 4, 5], 'm/z': [500.0, 700.0, 500.001, 700.0, 500.0], 'precursor_charge': [2, 3, 2, 3, 2],
+                       'activation': ['ETciD', 'ETciD', 'HCD', 'HCD', 'ETciD'], 'analyzer': ['orbitrap'] * 5,
+                       'peak_d': [{1.0: 1.0}, {2.0: 2.0}, {3.0: 3.0}, {4.0: 4.0}, {5.0: 5.0}]})
+    paired = pair_spectra(df).set_index('scan')
+    assert paired.index.tolist() == [3, 4] and paired.loc[3, 'paired_scan'] == 1 and paired.loc[4, 'paired_scan'] == 2 and paired.loc[3, 'paired_peak_d'] == {1.0: 1.0}
 
 
 def test_cc_survey_scans(tmp_path, monkeypatch):
@@ -2453,3 +2609,30 @@ def test_library_edge_cases(tmp_path):
     pairs = pd.DataFrame({'predictions': [[('Neu5Gc(a2-3)Gal', 0.9)], [('Neu5Ac(a2-3)Gal', 0.9), ('X', 0.1)], [('Neu5Ac(a2-3)Gal', 0.9), ('X', 0.1)]], 'RT': [10.0, 10.5, 20.0]},
                          index = pd.Index([600.0, 584.0, 584.0], name = 'm/z'))
     assert [len(p) for p in Ac_follows_Gc(pairs)['predictions']] == [1, 2, 1]
+
+
+def test_side_product_isotope_row():
+    # An ion-trap PA run: the glycosylamine of a glycan (2.016 Da below it, 14 spectra at 39.0 min) gives a PA reading on its own M+2 (2 spectra at 38.9), which
+    # folds with it into the glycan's row at 42.7; one spacing below (a glycosylaminitol) is no such isotope, and its glycan's row there stays
+    glycan = 'Neu5Ac(a2-6)Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Gal(b1-4)GlcNAc(b1-2)[Gal(b1-4)GlcNAc(b1-6)]Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc'
+    mz = (composition_to_mass(get_comp(glycan), modification = 'PA') + 2 * PROTON_MASS) / 2
+    row = lambda rt, n, ab, offset, end: {'m/z': mz, 'predictions': [(glycan, 0.9)], 'composition': get_comp(glycan), 'num_spectra': n, 'charge': 2, 'RT': rt,
+                                          'rel_abundance': ab, 'top_fragments': [1865.8, 698.3], 'peak_d': {1865.8: 100.0, 698.3: 50.0}, 'annotation_score': 25.0,
+                                          'evidence': 'side product' if offset else 'strong', 'adduct': None, 'top1_pred': glycan, 're_offset': offset, 'reducing_end': end}
+    for offset, end, rows in [(-calculate_adduct_mass('H2'), 'glycosylamine', 1), (calculate_adduct_mass('NH3-O'), 'glycosylaminitol', 2)]:
+        df = pd.DataFrame([row(42.7, 22, 3e6, 0.0, None), row(38.9, 2, 1e5, 0.0, None), row(39.0, 14, 2e6, offset, end)]).set_index('m/z')
+        out, _ = finalise_predictions(df, False, 'positive', 'PA', None, 300, 1.0, glycan_class = 'N')
+        assert sorted(out['num_spectra']) == ([38] if rows == 1 else [16, 22])
+
+
+def test_in_source_fragment_of_either_antenna():
+    # FA2G2 at a tenth of a triantennary sialylated glycan, at its RT: an in-source fragment whichever antenna the parent's structure carries the Neu5Ac on
+    # (losing the sialylated antenna of its 3-arm leaves an isomer of FA2G2), while A2G2, two cleavages away (the antenna and the core Fuc), is not one
+    fa2g2 = 'Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Gal(b1-4)GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc'
+    a2g2 = 'Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Gal(b1-4)GlcNAc(b1-2)Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc'
+    for parent in ['Neu5Ac(a2-6)Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Gal(b1-4)GlcNAc(b1-2)[Gal(b1-4)GlcNAc(b1-6)]Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc',
+                   'Gal(b1-4)GlcNAc(b1-2)Man(a1-3)[Gal(b1-4)GlcNAc(b1-2)[Neu5Ac(a2-6)Gal(b1-4)GlcNAc(b1-6)]Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc']:
+        df = pd.DataFrame({'top1_pred': [parent, fa2g2, a2g2], 'RT': [42.74, 42.76, 42.75], 'charge': [2, 1, 1], 'rel_abundance': [80.0, 8.0, 8.0]},
+                          index = pd.Index([1282.0, 1865.8, 1719.7], name = 'm/z'))
+        notes = flag_coeluting_substructures(df, 'N')['notes'].tolist()
+        assert notes[1].startswith(f'Possible in-source fragment of {parent}') and 'in-source' not in notes[2]

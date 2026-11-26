@@ -168,7 +168,7 @@ def test_gui_wheel_scrolls_past_settings(app):
     app.removeEventFilter(guard)
 
 
-def test_gui_results_curation(app):
+def test_gui_results_curation(app, tmp_path):
     from candycrunch import gui
     df = pd.DataFrame({'top1_pred': ['Gal(b1-3)GalNAc', 'Fuc(a1-2)Gal(b1-3)GalNAc'],
                        'predictions': [[('Gal(b1-3)GalNAc', 0.9), ('Gal(b1-4)GlcNAc', 0.05)], [('Fuc(a1-2)Gal(b1-3)GalNAc', 0.8)]],
@@ -193,6 +193,35 @@ def test_gui_results_curation(app):
     assert out['top1_pred'].tolist() == ['Gal(b1-4)GlcNAc'] and out['curation'].tolist() == ['reassigned']
     # the reduced (alditol) Hex1HexNAc1 of the default reducing end, after its composition
     assert out['formula'].tolist() == ['C14H27NO11'] and list(out.columns).index('formula') == list(out.columns).index('composition') + 1
+    # compositions as the table shows them (names by default); View > Compositions as switches table, detail pane, and exports together, the choice kept in
+    # QSettings: of a test organization, in an INI file of its own, so that the user's settings stay as they are
+    from PySide6.QtCore import QSettings
+    assert out['composition'].tolist() == ['Hex1HexNAc1']
+    names = app.organizationName(), app.applicationName()
+    QSettings.setDefaultFormat(QSettings.IniFormat)
+    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path))
+    app.setOrganizationName('CandyCrunchTest')
+    app.setApplicationName('CandyCrunchTest')
+    try:
+        menu = gui.QMenu()
+        for style, table, detail in (('letters', ['H1N1', 'H1N1F1'], 'H1N1F1'), ('names', ['Hex1HexNAc1', 'Hex1HexNAc1dHex1'], 'Hex1HexNAc1dHex1')):
+            gui._composition_menu(menu, view.set_composition_style)
+            next(a for a in menu.actions() if a.data() == style).trigger()
+            gui._composition_menu(menu, view.set_composition_style)
+            assert [a.data() for a in menu.actions() if a.isChecked()] == [style] and QSettings().value('composition_format') == style
+            assert next(c for c in view.model.columns if c['title'] == 'Composition')['text'] == table and view.composition.text() == detail
+            assert view.export_frame(view.current_frame())['composition'].tolist() == table[:1]
+        # the filter finds a composition in either notation
+        view.filter('H1N1F1')
+        assert view.proxy.rowCount() == 1
+        view.filter('')
+    finally:
+        gui.DISPLAY['composition'] = 'names'
+        app.setOrganizationName(names[0])
+        app.setApplicationName(names[1])
+        QSettings.setDefaultFormat(QSettings.NativeFormat)
+    assert gui.format_composition({'Hex': 5, 'HexNAc': 4, 'dHex': 1, 'Neu5Ac': 2}, 'letters') == 'H5N4F1A2'
+    assert gui.format_composition({'Hex': 5, 'HexNAc': 4, 'Neu5Ac_a2-6': 1, 'Neu5Ac_a2-3': 1}, 'names') == 'H5N4E1L1'
 
 
 def test_gui_ms3(app):
@@ -268,6 +297,16 @@ def test_gui_quantification(app):
     assert 'earlier CandyCrunch' in view.quant.message.text()
     view.quant.show([], 50.0)
     assert 'survey scans' in view.quant.message.text()
+    # The glycan map's chromatogram sums every integrated peak, so its area is the run's summed area (but the ramps from zero into each range), and the
+    # selected peak is ringed on it too
+    view.dataset.setCurrentIndex(view.dataset.findData('a'))
+    top, grid, total = view.map_chromatogram
+    assert np.isclose((getattr(np, 'trapezoid', None) or np.trapz)(total, grid), sum(raw), rtol = 1e-3)
+    view.tabs.setCurrentWidget(view.map)
+    assert len(view.map.canvas.rings) == 2 and view.map.canvas.rings[1][0] is top
+    # A run without records (run b) has none, and the feature table draws the runs that have one
+    view.dataset.setCurrentIndex(view.dataset.findData('b'))
+    assert view.map_chromatogram is None and len(view.map.canvas.rings) == 1
 
 
 def test_gui_experiments(app):
@@ -296,6 +335,11 @@ def test_gui_run_folders_from_add_files(app, tmp_path):
     panel = gui.SettingsPanel()
     panel.add_paths([str(tmp_path / x) for x in ('a.d/analysis.tdf', 'b.D/AcqData', 'b.D/AcqData/MSScan.bin', 'c.raw/_FUNC001.DAT')], detect = False)
     assert sorted(map(os.path.basename, panel.paths())) == ['a.d', 'b.D', 'c.raw']
+    # One run in several formats is added once, from its vendor file, whether picked together or found in a folder (a folder named as a run stays)
+    for name in ('d.raw', 'd.mzML', 'plain/e.mzML', 'plain/e.raw', 'plain/e.mgf', 'plain.mzML'):
+        (tmp_path / name).write_bytes(b'')
+    panel.add_paths([str(tmp_path / x) for x in ('d.mzML', 'd.raw', 'plain', 'plain.mzML')], detect = False)
+    assert sorted(map(os.path.basename, panel.paths())) == ['a.d', 'b.D', 'c.raw', 'd.raw', 'e.raw', 'plain.mzML', 'x.mzML']
     # Add files… opens beside a run folder it was left in, passes through other folders, and takes a run folder it is opened into as that run
     window, added, seen = QtWidgets.QMainWindow(), [], []
     window.store, window.add_runs = QSettings(str(tmp_path / 'settings.ini'), QSettings.IniFormat), added.extend
@@ -884,6 +928,68 @@ def test_gui_row_state_and_exclusion(app):
     assert view.quant_source is None and view.map.canvas.rings == []
 
 
+def test_gui_feature_curation_filter_and_crumbs_peaks(app):
+    from candycrunch import gui
+    row = lambda spectrum: pd.DataFrame({'top1_pred': ['Gal(b1-3)GalNAc'], 'predictions': [[('Gal(b1-3)GalNAc', 0.9), ('Gal(b1-4)GlcNAc', 0.05)]],
+                                         'composition': [{'Hex': 1, 'HexNAc': 1}], 'num_spectra': [3 if spectrum else 0], 'charge': [-1], 'RT': [11.0],
+                                         'rel_abundance': [100.0], 'notes': [''], 'ppm_error': [10.0], 'GlyTouCan_ID': ['']}, index = pd.Index([384.15], name = 'm/z'))
+    features = pd.DataFrame({'top1_pred': ['Gal(b1-3)GalNAc'], 'm/z': [384.15], 'RT': [11.0], 'charge': [-1], 'composition': [{'Hex': 1, 'HexNAc': 1}], 'GlyTouCan_ID': [''],
+                             'n_files_ms2': [1], 'a': [100.0], 'b': [100.0], 'evidence_a': ['ms2'], 'evidence_b': ['ms1_only']})
+    view = gui.ResultsView(gui.GlycanImages())
+    view.set_results({'files': ['a.mzML', 'b.mzML'], 'settings': dict(gui.DEFAULTS), 'tables': {'a': (row(True), [{204.09: 0.04, 384.15: 0.73}]), 'b': (row(False), [{}])},
+                      'features': features})
+    # A feature's structure reaches the row of a run with MS1 signal only (gap filled) too, as its exclusion does
+    view.select_row(0)
+    view.curate('Gal(b1-4)GlcNAc', 'reassigned')
+    assert [view.payload['tables'][r][0]['top1_pred'].iat[0] for r in ('a', 'b')] == ['Gal(b1-4)GlcNAc'] * 2
+    # The filter finds a composition by its shorthand
+    view.filter('H1N1')
+    assert view.proxy.rowCount() == 1
+    view.filter('')
+    # Open in CandyCrumbs writes intensities as they are, also those below 1
+    sent = []
+    view.open_in_crumbs.connect(sent.append)
+    view.send_to_crumbs()
+    crumbs = gui.CrumbsTab(gui.GlycanImages())
+    crumbs.load(sent[-1])
+    assert [float(line.split('\t')[1]) for line in crumbs.peaks.toPlainText().splitlines()] == [0.04, 0.73]
+
+
+def test_gui_crumbs_settings_and_filtered_export(app, tmp_path, monkeypatch):
+    from candycrunch import gui
+    table = pd.DataFrame({'top1_pred': ['Gal(b1-3)GalNAc', 'Gal(b1-4)GlcNAc'], 'predictions': [[('Gal(b1-3)GalNAc', 0.9), ('Gal(b1-4)GlcNAc', 0.05)], [('Gal(b1-4)GlcNAc', 0.9)]],
+                          'composition': [{'Hex': 1, 'HexNAc': 1}] * 2, 'num_spectra': [3, 2], 'charge': [1, 1], 'RT': [11.0, 14.0], 'rel_abundance': [60.0, 40.0],
+                          'notes': ['', ''], 'ppm_error': [1.0, 1.0], 'GlyTouCan_ID': ['', ''], 'adduct': [None, None]}, index = pd.Index([386.17, 386.17], name = 'm/z'))
+    view = gui.ResultsView(gui.GlycanImages())
+    view.set_results({'files': ['a.mzML'], 'settings': dict(gui.DEFAULTS, trap = 'orbitrap'), 'tables': {'a': (table, [{204.09: 40.0, 386.17: 100.0}, {204.09: 30.0, 386.17: 100.0}])},
+                      'features': None})
+    # Open in CandyCrumbs annotates as the results' spectrum does: fragments of a protonated precursor carry no metal cation, with its competing structures and analyzer
+    view.select_row(0)
+    sent = []
+    view.open_in_crumbs.connect(sent.append)
+    view.send_to_crumbs()
+    crumbs = gui.CrumbsTab(gui.GlycanImages())
+    calls = []
+    monkeypatch.setattr(crumbs.spectrum, 'annotate', lambda *args, **kwargs: calls.append(kwargs))
+    crumbs.load(sent[-1])
+    assert crumbs.carrier.currentData() is False and calls[-1]['metal_cations'] is False
+    assert calls[-1]['candidates'] == ['Gal(b1-4)GlcNAc'] and calls[-1]['ion_trap'] is False
+    # peaks of another spectrum are annotated without that spectrum's competing structures
+    crumbs.peaks.setPlainText('204.09	10')
+    crumbs.annotate()
+    assert 'candidates' not in calls[-1] and calls[-1]['metal_cations'] is False
+    # This table as CSV writes the rows a filter shows
+    view.filter('GlcNAc')
+    assert view.proxy.rowCount() == 1
+    path = str(tmp_path / 'shown.csv')
+    monkeypatch.setattr(gui.QFileDialog, 'getSaveFileName', lambda *args, **kwargs: (path, ''))
+    view.export_table('csv')
+    assert list(pd.read_csv(path)['top1_pred']) == ['Gal(b1-4)GlcNAc']
+    view.filter('')
+    view.export_table('csv')
+    assert len(pd.read_csv(path)) == 2
+
+
 def test_gui_spectrum_palette(app):
     # A panel draws its spectra in the palette it is given, as an app with a palette of its own shows them, and CandyCrunch's own panels in candy
     import time
@@ -897,3 +1003,33 @@ def test_gui_spectrum_palette(app):
             app.processEvents()
             time.sleep(0.05)
         assert panel.drawn is not None and panel.canvas.figure.pal.name == (palette or gui.PALETTE)
+
+
+def test_gui_annotation_process(app):
+    # Annotations and their drawings come from the annotation process (a daemon, which ends with the window's process) exactly as the panel's thread makes
+    # them, in a palette only the window's process has registered
+    import dataclasses
+    import io
+    import pickle
+    import time
+    from candycrunch import gui
+    from candycrunch.utils import vc
+    vc.register_palette(dataclasses.replace(vc.get_palette('lumen'), name = 'window-only'))
+    panel = gui.SpectrumPanel(palette = 'window-only')
+    panel.annotate('Fuc(a1-2)Gal(b1-4)GlcNAc(b1-6)[Gal(b1-3)]GalNAc', [510.19, 715.27, 990.0], [30.0, 100.0, 20.0], -1, 2.0156, 'underivatized',
+                   candidates = ['Fuc(a1-2)Gal(b1-3)[Gal(b1-4)GlcNAc(b1-6)]GalNAc'])
+    end = time.time() + 120
+    while panel.drawn is None and time.time() < end:
+        app.processEvents()
+        time.sleep(0.05)
+    assert panel.drawn is not None and gui._ANNOTATION.process.is_alive() and gui._ANNOTATION.process.daemon
+    request, hit_dict, support = panel.drawn[0], panel.drawn[1], panel.cache[panel.drawn[0]['key']]['support']
+    assert hit_dict == gui._annotation_step('hits', request) and support == gui._annotation_step('support', request) and support['residues']
+    figure = panel.canvas.figure
+    local, index, _ = gui._annotation_step('draw', {**request, 'hit_dict': hit_dict, 'diagnostic': figure.diagnostic, 'mirror': None})
+    gui._support_markers(local.axes[index], request['structure'], support, request['ion_trap'])
+    assert figure.pal.name == 'window-only' and figure.to_svg() == local.to_svg()
+    # A figure goes through the process's pickler whole, its axes' scale functions included
+    data = io.BytesIO()
+    gui._FigurePickler(data).dump(local)
+    assert pickle.loads(data.getvalue()).to_svg() == local.to_svg()

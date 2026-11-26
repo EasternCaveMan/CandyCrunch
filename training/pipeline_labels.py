@@ -113,9 +113,12 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
    |                    5 compositions it lists once; with at least 10 of them, as a function of RT (within their RT range) and of the number of charged
    |                    residues where that fits them better, each term only where it brings more of them closer than it pushes away, and with an intercept
    |                    per map file where several maps have >= 5 of them; if their median deviation from it exceeds 1 min, the mapping counts as RT-less,
-   |                    unless at least 5 and 40% of them agree within 1 min, whose median then shifts it; the plain median of them or no shift instead for
-   |                    a map file's rows where that puts >= 10% more of them within rt_window of a passing input of their composition; rows with rt_own
-   |                    (RTs read in the run itself) neither anchor nor move, nor are dropped);
+   |                    unless at least 5 and 40% of them agree within 1 min, whose median then shifts it; a map file of several whose anchors, two or more
+   |                    of them rows with rt_own, all lie within half of rt_window of their median offset from that adds it as an intercept of its own; the
+   |                    plain median of them or no shift instead for
+   |                    a map file's rows where that puts >= 10% more of them within rt_window of a passing input of their composition (rows with rt_own
+   |                    and map_rt: of their own RT); rows with rt_own (RTs read in the run itself) neither move nor are dropped, and where the mapping
+   |                    gives their map_rt (the map's RT) each composition and map RT of them anchors by its offset from it, before any input);
    |                    default:1.0 (2.0 only added labels away from the
    |                    glycans' peaks)
    | crumbs_thresh (float): annotation score an input needs to take a mapping row without RT, and to anchor the RT shift, as the pipeline's gate; default:3
@@ -247,8 +250,8 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
     for i in by_intensity:
         if passing[i] and single.get(input_keys[i]) == 1:
             first.setdefault(input_keys[i], []).append(i)
-    # RTs read in the run itself (rt_own, a map's RT_<run> column) are already on its time axis: they neither anchor the shift of the other rows nor move
-    # (the drift fitted on the other rows moved a run's own rows by up to 14 min)
+    # RTs read in the run itself (rt_own, a map's RT_<run> column) are already on its time axis: they do not move (the drift fitted on the other rows moved
+    # a run's own rows by up to 14 min)
     own = mapping.loc[row_ids, 'rt_own'].fillna(False).to_numpy(bool) if 'rt_own' in mapping.columns else np.zeros(len(row_ids), bool)
     # Unless they are not: RT_<run> columns copied from a publication's table can be on another clock than the deposited run (1-5 of ~105 rows of a run
     # within 0.5 min of a peak of their ion, the others up to 6 min after it), so they count as the run's own only if at least half of the rows that have a
@@ -261,6 +264,20 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
     files = mapping.loc[row_ids, 'map_file'].astype(str).to_numpy() if 'map_file' in mapping.columns else np.full(len(row_ids), '')
     open_files = open_rows['map_file'].astype(str).to_numpy() if 'map_file' in open_rows.columns else np.full(len(open_rows), '')
     offsets, anchor_rts, anchor_acid, anchor_rows, anchored, drift, fixed = [], [], [], [], set(), None, {}
+    # but they anchor the shift of the others, each composition and map RT (isomers are peaks of their own, charge states one) by its own RT minus the map's
+    # RT (map_rt), before any input: such an RT is its ion's apex, confirmed by MS2, where a composition's strongest input can be another isomer's peak. As
+    # anchors read only inputs of rows without such an RT, runs whose RT_<run> cells covered most rows kept under 5 and no shift, and every other row (charge
+    # states and adduct ions without MS2 of their own, rows without a confirmed maximum) sat at its bare map RT, as far off as the run's drift
+    map_given = pd.to_numeric(mapping.loc[row_ids, 'map_rt'], errors = 'coerce').to_numpy(float) if 'map_rt' in mapping.columns else np.full(len(row_ids), np.nan)
+    for k in np.flatnonzero(own & ~np.isnan(map_rts) & ~np.isnan(map_given)):
+        if (keys[k], map_given[k]) not in anchored:
+            anchored |= {keys[k], (keys[k], map_given[k])}
+            offsets.append(map_rts[k] - map_given[k])
+            anchor_rts.append(map_given[k])
+            anchor_acid.append(acidic_count(dict(keys[k])))
+            anchor_rows.append(k)
+    # (an own row's drift is read at its map RT, as its anchor's: at its own RT the RT term gave it, and the switch check below, another shift)
+    map_x = np.where(own & ~np.isnan(map_given), map_given, map_rts)
     for k in range(len(keys)):
         if not np.isnan(map_rts[k]) and not own[k] and single[keys[k]] == 1 and keys[k] not in anchored:
             hit = next((i for i in first.get(keys[k], []) if fits[i, k]), None)
@@ -314,7 +331,7 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
                 coefs = iter(beta[1 + len(extra):])
                 b, c = float(next(coefs)) if keep_rt else 0.0, float(next(coefs)) if keep_acid else 0.0
                 # The RT term only within the anchors' RT range: beyond it the slope of a few minutes of anchors moved rows 15 min later by 1-3 min
-                row_shift = beta[0] + per_map @ beta[1:1 + len(extra)] + b * np.clip(map_rts, x.min(), x.max()) + c * np.minimum(n_acid, a.max())
+                row_shift = beta[0] + per_map @ beta[1:1 + len(extra)] + b * np.clip(map_x, x.min(), x.max()) + c * np.minimum(n_acid, a.max())
                 # (rows without structure take the same drift at their own RT, with the acidic residues of the composition an input gives them)
                 drift = lambda acid, beta = beta, b = b, c = c, lo = x.min(), hi = x.max(), amax = a.max(): (
                     beta[0] + sum(beta[1 + j] * (open_files == f) for j, f in enumerate(extra)) + b * np.clip(open_rts, lo, hi) + c * np.minimum(acid, amax))
@@ -335,6 +352,24 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
         else:
             rt_shift, map_rts, row_shift, past, alignment, drift = 0.0, np.where(own, map_rts, np.nan), np.zeros(len(map_rts)), np.zeros(len(map_rts), bool), 'dropped', None
     pre_switch = rt_shift
+    # A run reading several map files has each map's RTs from that map's own reference runs, but one shift for all of them (an intercept per map only
+    # from 5 anchors of it): a map file with two or more own rows among its anchors (MS2-confirmed apexes of its rows in this run) whose anchors all lie
+    # within half of rt_window of their median offset from that shift takes the median as an intercept of its own, for its open rows too (an O-glycan
+    # map whose two own rows sat on their map RTs was moved 0.9 min by the median of five anchors, three of them an N-glycan map's own rows, and its a2-6
+    # isomer's peak took the a2-3 label; a file whose anchors scatter keeps the shift: own rows at a map RT carried over from another run sit at another
+    # offset than the rest)
+    own_intercepts = {}
+    if len(offsets) >= 5 and alignment != 'dropped' and len(set(files)) > 1:
+        rest = np.array(offsets) - row_shift[anchor_rows]
+        for f in np.unique(files):
+            mine = files[anchor_rows] == f
+            if (mine & own[anchor_rows]).sum() >= 2 and np.abs(rest[mine] - np.median(rest[mine])).max() <= rt_window / 2:
+                own_intercepts[f] = float(np.median(rest[mine]))
+                row_shift = np.where(files == f, row_shift + own_intercepts[f], row_shift)
+        if own_intercepts:
+            shifts = row_shift[~np.isnan(given_rts)]
+            rt_shift = float(np.median(shifts))
+            alignment = 'model' if np.ptp(shifts) > 0 else 'none' if rt_shift == 0.0 else 'median'
     if len(offsets) >= 5 and alignment != 'dropped':
         # The whole map then checks the shift: each anchor is one input per composition, and where those inputs are other isomers' peaks (offsets in two
         # clusters, or a minority mode the agreeing anchors picked: 8 of 17 at -2.5 min against a plain median of 0.0) the shift moves the map off its
@@ -347,9 +382,17 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
         row_key, input_key = np.array([ids.setdefault(k, len(ids)) for k in keys]), np.array([ids.get(k, -1) for k in input_keys])
         at_row = (fits | other_charge) & passing[:, None] & (input_key[:, None] == row_key[None, :])
         counted, input_rts = ~np.isnan(given_rts) & ~own, inputs['RT'].to_numpy(dtype = float)
+        # (an own row anchoring by its map RT counts as placed where the shift puts that RT within rt_window of its own RT, its peak: without it, the
+        # inputs of the one or two other rows of a mostly own map decided against every own row, and shifts of 1-2.5 min that the own rows agreed on
+        # went back to none; but only where its offset lies within rt_window of the shift the fit gives it, as one off the map's gradient is a map RT
+        # carried over from another shift or another isomer's apex: three such rows 0.65 min before their map RT, against ten anchors 0.6 min after it,
+        # put a run back to no shift and every other row 0.65 min off its peak; the fit's, not the anchors' median, as where the drift has an acid term
+        # the median left out every sialylated own row and kept the own rows off the fit, and the plain median replaced a drift that had them on their peaks)
+        own_at = own & ~np.isnan(map_given) & (np.abs(given_rts - map_given - row_shift) <= rt_window)
         switched = False
         for f in np.unique(files[counted]):
-            placed = lambda shift: int((at_row & (np.abs(input_rts[:, None] - (given_rts + np.where(own, 0.0, shift))[None, :]) <= rt_window)).any(axis = 0)[counted & (files == f)].sum())
+            placed = lambda shift: int((at_row & (np.abs(input_rts[:, None] - (given_rts + np.where(own, 0.0, shift))[None, :]) <= rt_window)).any(axis = 0)[counted & (files == f)].sum()
+                                       + (np.abs(map_given + shift - given_rts) <= rt_window)[own_at & (files == f)].sum())
             best, now = max([float(np.median(offsets)), 0.0], key = placed), placed(row_shift)
             if placed(best) >= max(1.1 * now, now + 1):
                 row_shift, past, switched, fixed[f] = np.where(files == f, best, row_shift), past & (files != f), True, best
@@ -366,6 +409,8 @@ def label_inputs(inputs, mapping, mz_tolerance = 0.5, rt_window = 1.0, crumbs_th
         if alignment != 'model':
             return np.full(len(open_rows), rt_shift)
         shift = drift(acid) if drift is not None else np.full(len(open_rows), pre_switch)
+        for f, v in own_intercepts.items():
+            shift = np.where(open_files == f, shift + v, shift)
         for f, v in fixed.items():
             shift = np.where(open_files == f, v, shift)
         return shift
