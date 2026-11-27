@@ -27,7 +27,7 @@ def build_parser():
     parser.add_argument('--adducts', help='Ions that carry the charge of the precursors in place of protons, e.g., Li+ for lithium salts in the mobile phase; the usual adducts (Na+, K+, and NH4+ in positive mode; acetate, formate, and HCO3- in negative mode) are always considered; default: none (Na+ for permethylated glycans in positive mode)', type=str, nargs='+', required=False)
     parser.add_argument('--run_anion', help='Anion of the mobile phase in negative mode: read before the other anion adducts, and its adduct ions count for abundances; default: all are considered, and with survey scans the anion that neutral glycans show counts for abundances', type=str, choices=['HCO3-', 'Formate', 'Acetate'], required=False)
     parser.add_argument('--reducing_end_variants', help='Other reducing ends the glycans may carry: free (glycans that escaped reduction or labeling, counted for their glycan), ethyl_glycoside (rows of their own), glycosylamine (PA glycans whose label was not reduced, counted for their glycan), glycosylaminitol (reduced N-glycans that were glycosylamines when reduced, counted for their glycan); default: free, plus ethyl_glycoside for lipid, glycosylamine for PA, and glycosylaminitol for reduced N-glycans; give none of them to turn this off', type=str, nargs='*', choices=['free', 'ethyl_glycoside', 'glycosylamine', 'glycosylaminitol'], required=False)
-    parser.add_argument('--lc', help='Chromatography: PGC, C18, or other (e.g., HILIC); default: PGC', type=str, choices=['PGC', 'C18', 'other'], required=False)
+    parser.add_argument('--lc', help='Chromatography: PGC, C18, other (e.g., HILIC), or infusion (direct infusion, no LC; also taken for spectra without retention times); default: PGC', type=str, choices=['PGC', 'C18', 'other', 'infusion'], required=False)
     parser.add_argument('--trap', help='Mass analyzer of the MS2 spectra (the survey scan analyzer is read from the file); the instrument stored in the file overrides it; linear (linear ion trap), orbitrap, amazon (Bruker amaZon), or other (e.g., TOF); default: linear', type=str, choices=['linear', 'orbitrap', 'amazon', 'other'], required=False)
     parser.add_argument('--rt_min', help='Minimum retention time in minutes; default: 0 (runs longer than 20 min then skip their first 2 min)', type=float, required=False)
     parser.add_argument('--rt_max', help='Maximum retention time in minutes; default: 0 (all; in runs longer than 40 min, rows in the last 10%% need a peak of their own over a low background)', type=float, required=False)
@@ -44,6 +44,8 @@ def build_parser():
     parser.add_argument('--experimental', help='Whether to search databases for structures of unexplained peaks; default: True', type=str_to_bool, required=False)
     parser.add_argument('--taxonomy_level', help='Taxonomic level to restrict database searches to; default: Class', type=str, choices=['Species', 'Genus', 'Family', 'Order', 'Class', 'Phylum', 'Kingdom', 'Domain'], required=False)
     parser.add_argument('--taxonomy_filter', help='Taxon at --taxonomy_level to restrict database searches to (e.g., Mammalia for Class, Homo_sapiens for Species); default: Mammalia', type=str, required=False)
+    parser.add_argument('--glycan_database', help='Your own glycan database: .txt, .csv, .tsv, or .xlsx files of glycans, one per line or row, and/or glycans themselves, space-separated: structures (IUPAC-condensed, WURCS, GlycoCT, GlyTouCan IDs) and compositions (e.g., H5N4F1 or Hex5HexNAc4dHex1); also finds structures the model does not know, by their fragments; default: none (glycowork\'s database)', type=str, nargs='+', required=False)
+    parser.add_argument('--database_mode', help='only: --glycan_database in place of glycowork\'s database, so that only its glycans are reported; add: beside it; default: only', type=str, choices=['only', 'add'], required=False)
     parser.add_argument('--intra_cat_thresh', help='Several files only: minutes the RT of a structure can differ from the mean of its group; default: 1.0', type=float, default=1.0)
     parser.add_argument('--top_n_isomers', help='Several files only: number of isomer groups to retain per composition in each file; default: 5', type=int, default=5)
     parser.add_argument('--n_jobs', help='Number of processes: files processed in parallel, and fragment scoring and supporting peaks within a file; default: 1', type=int, default=1)
@@ -88,6 +90,13 @@ def main(argv=None):
         parser.error('--mass_tag and --modification custom go together (glycans with a free reducing end: --modification unreduced)')
     if args.max_charge == 0:
         parser.error('--max_charge has to be at least 1 (the ion mode is set by --mode)')
+    # Each --glycan_database value is a file of glycans or a glycan, read now, so that a glycan it cannot read ends the run before it starts
+    if args.glycan_database:
+        from candycrunch.utils import read_glycan_database
+        try:
+            args.glycan_database = [g for v in args.glycan_database for g in read_glycan_database(v if os.path.isfile(v) else [v])]
+        except ValueError as e:
+            parser.error(f'--glycan_database: {e}')
     # wrap_inference takes a free reducing end as a custom label without mass, as the app does
     ends = ['custom' if m == 'unreduced' else m for m in ends]
     args.modification = (ends[0] if len(ends) == 1 else ends) if ends else None

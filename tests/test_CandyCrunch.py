@@ -695,6 +695,35 @@ def test_filter_out_is_airtight():
     assert not any('Neu5Ac' in p[0] for preds in df['predictions'] for p in (preds or []))
 
 
+def test_glycan_database(tmp_path):
+    # The user's own glycan database: read in every notation from .txt, .csv (its named column) and .xlsx, an entry that is no glycan named, also by the CLI
+    # before it runs. In place of glycowork's database, only its glycans are reported, the model's structures included; a structure the model does not
+    # know is a row by its fragments (the example's H type 1 core 1 at 530.29 as Fuc(a1-4)), and a glycan it lacks is none (Fuc(a1-2)Gal(b1-3)[Gal(b1-4)GlcNAc(b1-6)]GalNAc)
+    from candycrunch import cli
+    from candycrunch.utils import read_glycan_database
+    entries = ['Fuc(a1-4)Gal(b1-3)GalNAc', 'Fuc(a1-2)Gal(b1-3)[GlcNAc(b1-6)]GalNAc', 'H5', "{'Hex': 5}", 'G00055MO', '# a comment', '']
+    (tmp_path / 'mine.txt').write_text('\n'.join(entries))
+    pd.DataFrame({'Glycan': entries[:3]}).to_csv(tmp_path / 'mine.csv', index = False)
+    pd.DataFrame({'x': entries[:3]}).to_excel(tmp_path / 'mine.xlsx', index = False, header = False)
+    expected = ['Fuc(a1-4)Gal(b1-3)GalNAc', 'Fuc(a1-2)Gal(b1-3)[GlcNAc(b1-6)]GalNAc', {'Hex': 5}]
+    assert read_glycan_database(tmp_path / 'mine.txt') == expected + ['Gal(b1-4)GlcNAc']
+    assert read_glycan_database(str(tmp_path / 'mine.csv')) == read_glycan_database(str(tmp_path / 'mine.xlsx')) == expected
+    with pytest.raises(ValueError, match = 'notaglycan'):
+        read_glycan_database(['Gal(b1-4)GlcNAc', 'notaglycan'])
+    example = str(BASE_DIR / 'candycrunch' / 'example_PGM_O-glycans.xlsx')
+    with pytest.raises(SystemExit):
+        cli.main(['--spectra_filepath', example, '--glycan_class', 'O', '--glycan_database', str(tmp_path / 'mine.txt'), 'notaglycan', '--output', str(tmp_path / 'out.csv')])
+    assert not (tmp_path / 'out.csv').exists()
+    df = wrap_inference(example, 'O', glycan_database = tmp_path / 'mine.txt')
+    reported_as = listed_glycans(read_glycan_database(tmp_path / 'mine.txt'))[2]
+    assert len(df) and all(reported_as(g) == [g] for g in df['top1_pred'])
+    assert df.loc[np.abs(df.index.values - 530.29) < 0.01, 'top1_pred'].tolist() == ['Fuc(a1-4)Gal(b1-3)GalNAc']
+    assert (np.abs(df.index.values - 733.39) < 0.01).any() and not (np.abs(df.index.values - 895.47) < 0.05).any()
+    # Beside glycowork's database, the model's structure of the peak stands
+    df = wrap_inference(example, 'O', glycan_database = tmp_path / 'mine.txt', database_mode = 'add')
+    assert df.loc[np.abs(df.index.values - 530.29) < 0.01, 'top1_pred'].tolist() == ['Fuc(a1-2)Gal(b1-3)GalNAc'] and (np.abs(df.index.values - 895.47) < 0.05).any()
+
+
 def test_search_options_keep_the_checks(tmp_path):
     # Without imputation and database search a run only loses what those two add: domain_filter still runs, so a [M+HCO3]- three times stronger than its [M-H]- is
     # never listed at its own m/z, and its spectra count for the row of their glycan nearest in RT. That holds also where the model names none of them: spectra
@@ -1519,6 +1548,16 @@ def test_bruker_mzxml(tmp_path):
     # The scans' details: analyzer and polarity, nothing the file does not state, the header m/z as the shift refinement applied
     assert df['analyzer'].tolist() == ['amazon'] * 3 and df['polarity'].tolist() == ['-'] * 3 and df['collision_energy'].isna().all()
     assert np.allclose(df['m/z'] + df['header_shift'], [966.204528808594, 675.813842773438, 675.418823242188])
+
+
+def test_run_activation_in_tables(tmp_path):
+    # A run's table names its fragmentation (most frequent activation), alone and in a batch, as the app annotates its spectra with it
+    run = BASE_DIR / 'packaging' / 'self_test.mzML'
+    assert wrap_inference(str(run), 'O').attrs['activation'] == 'CID'
+    for name in ('a.mzML', 'b.mzML'):
+        (tmp_path / name).write_bytes(run.read_bytes())
+    _, tables = wrap_inference_batch([str(tmp_path / 'a.mzML'), str(tmp_path / 'b.mzML')], 'O', intra_cat_thresh = 1.0)
+    assert [t.attrs['activation'] for t in tables.values()] == ['CID', 'CID']
 
 
 def test_mzxml_without_ms2_or_rt(tmp_path):
@@ -2465,8 +2504,9 @@ def test_inputs_of_other_writers(tmp_path):
     (tmp_path / 'short.mzML.gz').write_bytes(gzip.compress(mzml().encode())[:200])
     with pytest.raises(ValueError, match = 'not a complete gzip file'):
         load_spectra_filepath(str(tmp_path / 'short.mzML.gz'))
-    # mgf retention times without RTINSECONDS: RTINMINUTES, Mascot Distiller's elution span, a time in minutes in the title (Bruker DataAnalysis); a time every
-    # title repeats is part of a name, and none at all is an error
+    # mgf retention times without RTINSECONDS: RTINMINUTES, Mascot Distiller's elution span, a time in minutes in the title (Bruker DataAnalysis); spectra
+    # without one, or with a time every title repeats (part of a name), are one time point, which wrap_inference processes as a direct infusion, and some
+    # spectra with a time beside others without one are an error
     titles = ['RTINMINUTES={}', 'TITLE=File: run.wiff, Elution from: {} to {} period: 0', 'TITLE=Cmpd 1, +MSn(675.2500), {:.2f} min']
     for k, title in enumerate(titles):
         (tmp_path / f'rt{k}.mgf').write_text(''.join(f'BEGIN IONS\n{title.format(rt, rt)}\nPEPMASS=675.25\nCHARGE=2-\n290.09 100\nEND IONS\n' for rt in (10.0, 10.5)))
@@ -2474,11 +2514,33 @@ def test_inputs_of_other_writers(tmp_path):
     (tmp_path / 'gz.mgf.gz').write_bytes(gzip.compress((tmp_path / 'rt0.mgf').read_bytes()))
     assert load_spectra_filepath(str(tmp_path / 'gz.mgf.gz')).equals(load_spectra_filepath(str(tmp_path / 'rt0.mgf')))
     (tmp_path / 'named.mgf').write_text('BEGIN IONS\nTITLE=glycans 5 min gradient\nPEPMASS=675.25\n290.09 100\nEND IONS\n' * 2)
-    with pytest.raises(ValueError, match = 'no retention time'):
-        load_spectra_filepath(str(tmp_path / 'named.mgf'))
     (tmp_path / 'none.mgf').write_text('BEGIN IONS\nTITLE=run.1.1.2\nPEPMASS=675.25\n290.09 100\nEND IONS\n')
+    for name in ('named.mgf', 'none.mgf'):
+        df = load_spectra_filepath(str(tmp_path / name))
+        assert df.attrs['no_rt'] and (df['RT'] == 0).all(), name
+    (tmp_path / 'mixed.mgf').write_text((tmp_path / 'rt0.mgf').read_text() + (tmp_path / 'none.mgf').read_text())
     with pytest.raises(ValueError, match = 'no retention time'):
-        load_spectra_filepath(str(tmp_path / 'none.mgf'))
+        load_spectra_filepath(str(tmp_path / 'mixed.mgf'))
+
+
+def test_direct_infusion(tmp_path):
+    # Spectra without retention times (a direct infusion, as many exports write it) are one time point: a glycan's spectra, in any order and with the
+    # spray's fluctuating precursor intensities, are one row at RT 0; chosen as lc = 'infusion', the spectra of a run with times pool the same way, at
+    # the middle of the acquisition
+    df = load_spectra_filepath(str(BASE_DIR / 'examples' / 'JC_171002Y1_extracted_spectra.xlsx'))
+    mz = 1040.35
+    spectra = df[np.abs(df['reducing_mass'] - mz) < 0.05].head(8)
+    for name, rts in (('infusion.mgf', [None] * 8), ('timed.mgf', [0.5 + 0.3 * k for k in range(8)])):
+        with open(tmp_path / name, 'w') as f:
+            for k, (m, peaks, intensity, rt) in enumerate(zip(spectra['reducing_mass'], spectra['peak_d'], [9e5, 2e5, 8e5, 1e5, 9e5, 3e5, 7e5, 1e5], rts)):
+                f.write(f'BEGIN IONS\nTITLE=scan {k}\n' + (f'RTINSECONDS={60 * rt}\n' if rt is not None else '') + f'PEPMASS={m} {intensity}\nCHARGE=1-\n' +
+                        ''.join(f'{a} {b}\n' for a, b in peaks.items()) + 'END IONS\n')
+    out = wrap_inference(str(tmp_path / 'infusion.mgf'), glycan_class = 'O')
+    rows = out[np.abs(out.index.values - mz) < 0.5]
+    assert len(rows) == 1 and rows['num_spectra'].iat[0] == len(spectra) and (out['RT'] == 0).all()
+    timed = wrap_inference(str(tmp_path / 'timed.mgf'), glycan_class = 'O', lc = 'infusion')
+    rows = timed[np.abs(timed.index.values - mz) < 0.5]
+    assert len(rows) == 1 and rows['num_spectra'].iat[0] == len(spectra) and np.allclose(timed['RT'], 1.55)
 
 
 def test_mass_spec_helpers_from_glycopeptide_search():

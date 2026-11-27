@@ -47,7 +47,7 @@ except ImportError as error:
         ctypes.windll.user32.MessageBoxW(None, message, 'CandyCrunch', 0x10)
     raise ImportError(message) from error
 from candycrunch import __version__, references
-from candycrunch.utils import PALETTE, format_composition, one_file_per_run, vc
+from candycrunch.utils import PALETTE, format_composition, one_file_per_run, read_glycan_database, vc
 from viscose.qt import DPI, Canvas, ChartEvent, ChartView, Target, Toolbar
 
 # Defaults and constants are read from prediction.py's source, so the app always offers the library's own defaults without importing torch. Only the
@@ -67,8 +67,9 @@ def _statement(head):
 
 
 _batch_def = _statement('def wrap_inference_batch(')
-# model_file is the app's own setting (an imported model, None for the built-in one), which the worker turns into wrap_inference's model and glycans
-DEFAULTS = {'intra_cat_thresh': 1.0, 'model_file': None}
+# model_file is the app's own setting (an imported model, None for the built-in one), which the worker turns into wrap_inference's model and glycans;
+# database_file names the file glycan_database was read from
+DEFAULTS = {'intra_cat_thresh': 1.0, 'model_file': None, 'database_file': None}
 for _arg, _default in zip(_batch_def.args.args[-len(_batch_def.args.defaults):], _batch_def.args.defaults):
     try:
         DEFAULTS[_arg.arg] = ast.literal_eval(_default)
@@ -87,7 +88,7 @@ NAME_HINTS = {'glycan_class': {'N': r'n-?glycans?|ng|n(?![a-z0-9])', 'O': r'o-?g
               'modification': {'reduced': r'(?<!non-)reduced|alditols?', 'unreduced': r'un-?reduced|non-?reduced', '2AB': r'2-?ab', '2AA': r'2-?aa', 'procainamide': r'procainamide',
                                'PA': r'pa-?label\w*|pyridylamin\w*|2-?aminopyridin\w*', 'benzyl': r'benzyl\w*|bn-?galnac|cora',
                                'glycolate+lactate': r'bleach\w*|hypochlorit\w*|ca-?clo|oxidative\w*'},
-              'sample_prep': {'permethylated': r'permethyl\w*', 'deuteropermethylated': r'deutero-?permethyl\w*', 'peracetylated': r'peracetyl\w*'}, 'lc': {'PGC': r'pgc', 'C18': r'c18', 'other': r'hilic'}}
+              'sample_prep': {'permethylated': r'permethyl\w*', 'deuteropermethylated': r'deutero-?permethyl\w*', 'peracetylated': r'peracetyl\w*'}, 'lc': {'PGC': r'pgc', 'C18': r'c18', 'other': r'hilic', 'infusion': r'(?:direct-?)?infusions?|infused'}}
 BATCH_KEYS = ('intra_cat_thresh', 'top_n_isomers', 'n_jobs')
 FEATURES = '\x00features'
 GLYCAN_CLASSES = [('O-glycans', 'O'), ('N-glycans', 'N'), ('Free oligosaccharides (e.g., milk)', 'free'), ('Glycolipid glycans', 'lipid'),
@@ -113,7 +114,7 @@ MAIN_ADDUCT_TIPS = {'positive': 'Automatic suits most runs: protons first, then 
                     'negative': 'Automatic suits most runs: acetate, formate, and HCO3- are all considered, and with survey scans the anion that neutral glycans show counts for abundances. '
                                 'Choose the anion of your mobile phase (e.g., HCO3- with ammonium bicarbonate) to read it before the other anions and to count its adduct ions for abundances. '
                                 'Back to Automatic when CandyCrunch restarts'}
-LCS = [('PGC', 'PGC'), ('C18', 'C18'), ('Other', 'other')]
+LCS = [('PGC', 'PGC'), ('C18', 'C18'), ('Other', 'other'), ('Direct infusion (no LC)', 'infusion')]
 TRAPS = [('Linear ion trap', 'linear'), ('Orbitrap', 'orbitrap'), ('Bruker amaZon', 'amazon'), ('Other', 'other')]
 FRAGMENT_TYPES = [('Automatic', None), ('Glycosidic only', 'glycosidic'), ('All cross-rings', 'cross_rings')]
 TAXONOMY_LEVELS = ['Species', 'Genus', 'Family', 'Order', 'Class', 'Phylum', 'Kingdom', 'Domain']
@@ -167,6 +168,8 @@ DARK_GRAYS = {'#cccccc': '#4f4857', '#dddddd': '#3a3441', '#b8b0c0': '#6e6578'}
 # glycowork's modules import each other in a cycle, so two threads importing them at once (the drawing, annotation, and taxonomy threads all
 # start with an import) can hit Python's import deadlock detection, which killed the drawing thread or failed the first annotation
 IMPORT_LOCK = threading.Lock()
+# What's new dates its releases in English whatever the system's language (strftime's %B follows the locale Qt sets on Linux)
+MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December')
 STYLE = """
 QWidget#settings {{ background: {wash}; }}
 QLabel[role="heading"] {{ font-weight: 600; color: {ink}; padding-top: 8px; }}
@@ -281,6 +284,28 @@ def _send_session(update):
     thread = threading.Thread(target = _post_envelope, args = ({'sent_at': now}, [({'type': 'session'}, json.dumps({**update, 'timestamp': now}).encode())]), daemon = True)
     thread.start()
     return thread
+
+
+def _version_key(version):
+    """A version's numbers (1.0.2 of v1.0.2 or 1.0.2.dev3), to compare versions without the packaging package, which a pip install may lack"""
+    found = re.match(r'\D*(\d+(?:\.\d+)*)', version or '')
+    return tuple(int(n) for n in found.group(1).split('.')) if found else ()
+
+
+def _release_notes(upto, after = None):
+    """What's new: the notes of CandyCrunch's GitHub releases after version `after` up to `upto`, newest first, as Markdown with a heading and date per
+    release; without `after` only upto's own, and '' while upto has no release. Raises OSError without network"""
+    with urllib.request.urlopen('https://api.github.com/repos/BojarLab/CandyCrunch/releases?per_page=100', timeout = 10) as response:
+        releases = sorted((r for r in json.load(response) if not r['draft'] and r['published_at']), key = lambda r: _version_key(r['tag_name']), reverse = True)
+    top, notes = _version_key(upto), []
+    for release in releases:
+        version = _version_key(release['tag_name'])
+        if version <= top and (version > _version_key(after) if after else version == top):
+            year, month, day = map(int, release['published_at'][:10].split('-'))
+            # A release's own headings (older notes have them) become bold lines under its heading
+            body = re.sub(r'^#{1,6}[ \t]+(.+?)[ \t#]*$', r'**\1**', (release['body'] or '').replace('\r\n', '\n').strip(), flags = re.M)
+            notes.append(f'### CandyCrunch {release["tag_name"].lstrip("v")}\n\n*{MONTHS[month - 1]} {day}, {year}*\n\n{body}')
+    return '\n\n'.join(notes) if any(_version_key(r['tag_name']) == top for r in releases) else ''
 
 
 def _load_model(path):
@@ -410,7 +435,7 @@ def _worker_main(jobs, messages, warm_up = False):
         for name, files, settings in experiments:
             try:
                 _install_progress(messages, weights, len(files))
-                kwargs = {k: v for k, v in settings.items() if k not in BATCH_KEYS and k != 'model_file'}
+                kwargs = {k: v for k, v in settings.items() if k not in BATCH_KEYS + ('model_file', 'database_file')}
                 if settings.get('model_file'):
                     if settings['model_file'] not in models:
                         models[settings['model_file']] = _load_model(settings['model_file'])
@@ -1468,7 +1493,8 @@ class SpectrumPanel(QWidget):
         self.fragment_types = _combo(FRAGMENT_TYPES)
         self.fragment_types.setToolTip('Fragment types to annotate with. Automatic: glycosidic fragments (B, C, Y, Z, also internal ones) for permethylated glycans, whose '
                                        'cross-ring readings matched no more peaks than in m/z-shifted spectra (CID and HCD of protonated ions); otherwise also X '
-                                       'cross-rings, and A cross-rings in negative mode and of the reducing end of metal-adducted unreduced glycans in positive mode. '
+                                       'cross-rings, and A cross-rings in negative mode and of the reducing end of metal-adducted unreduced glycans in positive mode; '
+                                       'with electron-based or UV activation (EED, EDD, ECD, ETD, ..., from the file or the CandyCrumbs tab) every A and X cross-ring. '
                                        'All cross-rings: every A and X cross-ring, e.g., for sodiated permethylated glycans at high collision energy or in MSn')
         # The figure on screen is laid out for the panel, so saving it gave a small picture with cramped labels; this draws it again at print size
         self.save = QPushButton('Save image…')
@@ -1560,7 +1586,8 @@ class SpectrumPanel(QWidget):
         panel's current size and settings"""
         size = self.stack.size()
         choice = self.fragment_types.currentData()
-        if choice == 'glycosidic' or (choice is None and sample_prep in ('permethylated', 'deuteropermethylated')):
+        from candycrunch.analysis import RADICAL_METHODS
+        if choice == 'glycosidic' or (choice is None and sample_prep in ('permethylated', 'deuteropermethylated') and kwargs.get('fragmentation_method') not in RADICAL_METHODS):
             kwargs = {'disable_X_cross_rings': True, 'disable_A_cross_rings': True} | kwargs
         elif choice == 'cross_rings':
             kwargs = {'disable_X_cross_rings': False, 'disable_A_cross_rings': False} | kwargs
@@ -2251,6 +2278,17 @@ class SettingsPanel(QScrollArea):
         self.taxa.setCaseSensitivity(Qt.CaseInsensitive)
         self.taxa.setFilterMode(Qt.MatchContains)
         self.inputs['taxonomy_filter'].setCompleter(self.taxa)
+        # The user's own glycan database, read when loaded (read_glycan_database) and kept with the experiment and the session as its glycans, so that it
+        # needs its file only once; never in QSettings, as it describes these samples
+        self.database = _combo([("glycowork's", None), ('Mine only', 'only'), ("glycowork's and mine", 'add')])
+        self.database.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.database.setToolTip('Where candidate structures and compositions come from. Mine: a list of yours (.txt, .csv, .tsv, or .xlsx, one glycan per line or row: '
+                                 'structures as IUPAC-condensed, WURCS, GlycoCT, or GlyTouCan IDs, and compositions such as H5N4F1), in place of glycowork\'s database '
+                                 '(only your glycans are reported) or beside it. Structures the model does not know are found by their fragments')
+        self.database_button = QPushButton('Load list…')
+        self.database_button.setToolTip('Reads a list of glycans: a .txt file with one per line, or a .csv, .tsv, or .xlsx file with one per row')
+        self.database_note = _label('', 'hint')
+        self.database_glycans, self.database_file = None, None
         form.addRow('RT from', self.inputs['rt_min'])
         form.addRow('RT until', self.inputs['rt_max'])
         form.addRow('Peak width', self.inputs['rt_diff'])
@@ -2266,6 +2304,11 @@ class SettingsPanel(QScrollArea):
         form.addRow(self.inputs['get_missing'])
         form.addRow('Taxonomic level', self.inputs['taxonomy_level'])
         form.addRow('Taxon', self.inputs['taxonomy_filter'])
+        # (the note on a row of its own, as beside the labels it widened the panel past its pane)
+        form.addRow('Glycan database', self.database)
+        form.addRow('', self.database_button)
+        form.addRow(self.database_note)
+        self.advanced_form = form
         grid = QGridLayout()
         self.filter_boxes = {}
         for n, name in enumerate(FILTER_CHOICES):
@@ -2287,6 +2330,9 @@ class SettingsPanel(QScrollArea):
         self.mode.currentIndexChanged.connect(self.fill_main_adducts)
         self.adducts.currentIndexChanged.connect(lambda: self.advanced_toggle.setText(f'Advanced settings ({self.adducts.currentData()})' if self.adducts.currentData() else 'Advanced settings'))
         self.import_model_button.clicked.connect(self.import_model)
+        self.database.activated.connect(lambda: self.database.currentData() and not self.database_glycans and self.load_database())
+        self.database.currentIndexChanged.connect(lambda: [self.advanced_form.setRowVisible(w, self.database.currentData() is not None) for w in (self.database_button, self.database_note)])
+        self.database_button.clicked.connect(self.load_database)
         self.model_checked.connect(self.model_imported)
         self.remove.clicked.connect(self.remove_selected)
         self.experiment_button.clicked.connect(lambda: self.move_runs([item for item in self.files.selectedItems() if item.parent() is not None],
@@ -2299,7 +2345,7 @@ class SettingsPanel(QScrollArea):
         self.files_changed.connect(lambda: self.show_experiment(self.current_experiment()))
         self.files_changed.connect(lambda: self.files.setFixedHeight(min(240, max(110, 6 + max(self.files.sizeHintForRow(0), self.files.fontMetrics().height() + 4) * sum(
             self.files.topLevelItem(i).childCount() + 1 for i in range(self.files.topLevelItemCount()))))))
-        for widget in list(self.inputs.values()) + list(self.filter_boxes.values()) + [self.mode, self.charge, self.sialic, self.adducts, self.model]:
+        for widget in list(self.inputs.values()) + list(self.filter_boxes.values()) + [self.mode, self.charge, self.sialic, self.adducts, self.model, self.database]:
             getattr(widget, {QComboBox: 'currentIndexChanged', QCheckBox: 'toggled', QLineEdit: 'textChanged'}.get(type(widget), 'valueChanged')).connect(
                 lambda *_: self.reset.setEnabled(any(v != DEFAULTS.get(k, v) for k, v in self.values().items())))
         self.set_values(DEFAULTS)
@@ -2517,6 +2563,42 @@ class SettingsPanel(QScrollArea):
         self.advanced_toggle.setChecked(True)
         QTimer.singleShot(0, lambda: self.ensureWidgetVisible(self.model))
 
+    def load_database(self):
+        """Reads a list of glycans as the experiment's own glycan database; a list that cannot be read is named in a message, and with none loaded the
+        database is glycowork's again"""
+        path, _ = QFileDialog.getOpenFileName(self, 'Load a glycan database', QSettings().value('folder', os.path.expanduser('~')),
+                                              'Glycan lists (*.txt *.csv *.tsv *.xlsx);;All files (*)')
+        if path:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                with IMPORT_LOCK:
+                    glycans = read_glycan_database(path)
+            except Exception as error:
+                QMessageBox.warning(self, 'CandyCrunch', f'This list cannot be used: {error}')
+                glycans = None
+            finally:
+                QApplication.restoreOverrideCursor()
+            if glycans:
+                # (compositions as text, which the session's JSON keeps and read_glycan_database reads back)
+                self.set_database([format_composition(g) for g in glycans], os.path.basename(path), self.database.currentData() or DEFAULTS['database_mode'])
+        if not self.database_glycans:
+            self.database.setCurrentIndex(0)
+
+    def set_database(self, glycans, file, mode):
+        """Shows an experiment's own glycan database (None: glycowork's)"""
+        self.database_glycans, self.database_file = glycans or None, file if glycans else None
+        _set_combo(self.database, mode if glycans else None)
+        for widget in (self.database_button, self.database_note):
+            self.advanced_form.setRowVisible(widget, bool(glycans))
+        # (a composition as format_composition writes it: Hex5HexNAc4dHex1)
+        structures = sum('(' in g or not g[-1].isdigit() for g in glycans or [])
+        compositions = len(glycans or []) - structures
+        # (a long file name elided in the middle, as a word longer than the pane widens it)
+        name = file if not file or len(file) <= 36 else f'{file[:17]}…{file[-18:]}'
+        self.database_note.setText(f"{name or 'List'}: {structures} structure{'s' * (structures != 1)}, {compositions} composition{'s' * (compositions != 1)}" if glycans else 'No list loaded')
+        self.database_note.setToolTip('\n'.join((glycans or [])[:40]) + ('\n…' if glycans and len(glycans) > 40 else ''))
+        self.reset.setEnabled(any(v != DEFAULTS.get(k, v) for k, v in self.values().items()))
+
     def remove_selected(self):
         for item in self.files.selectedItems():
             if item.parent() is None:
@@ -2558,6 +2640,9 @@ class SettingsPanel(QScrollArea):
         values['sialic_derivatization'] = self.sialic.currentData()
         values['adducts'], values['run_anion'] = (None, self.adducts.currentData()) if self.mode.currentData() == 'negative' else (self.adducts.currentData(), None)
         values['model_file'] = self.model.currentData()
+        mode = self.database.currentData()
+        values['glycan_database'], values['database_mode'] = (list(self.database_glycans), mode) if mode and self.database_glycans else (None, DEFAULTS['database_mode'])
+        values['database_file'] = self.database_file if values['glycan_database'] else None
         # Classes measured together, and reducing ends side by side, go to wrap_inference as a list
         if '+' in values['glycan_class']:
             values['glycan_class'] = values['glycan_class'].split('+')
@@ -2605,6 +2690,7 @@ class SettingsPanel(QScrollArea):
         if model and self.model.findData(model) < 0 and os.path.exists(model):
             self.model.addItem(os.path.splitext(os.path.basename(model))[0], model)
         self.model.setCurrentIndex(max(self.model.findData(model), 0) if model else 0)
+        self.set_database(values.get('glycan_database'), values.get('database_file'), values.get('database_mode', DEFAULTS['database_mode']))
 
 
 class ResultsView(QWidget):
@@ -3296,11 +3382,12 @@ class ResultsView(QWidget):
         if not isinstance(peaks, dict) or not peaks or structure is None:
             return structure, ms3_groups, None
         preds = table['predictions'].iat[r]
-        from candycrunch.analysis import precursor_metals
+        from candycrunch.analysis import precursor_metals, RADICAL_METHODS
         return structure, ms3_groups, ((structure, list(peaks.keys()), list(peaks.values()), int(table['charge'].iat[r]), _mass_tag(settings), settings['sample_prep']),
                                        dict(ms3 = [(p, n) for p, _, n in ms3_groups], candidates = [p[0] for p in preds if p[0] != structure] if isinstance(preds, (list, tuple)) else [],
                                             sialic_derivatization = settings.get('sialic_derivatization'), ion_trap = settings.get('trap') in ('linear', 'amazon'),
-                                            metal_cations = 'adduct' not in table.columns or (precursor_metals([a]) if isinstance(a := table['adduct'].iat[r], str) else False)))
+                                            metal_cations = 'adduct' not in table.columns or (precursor_metals([a]) if isinstance(a := table['adduct'].iat[r], str) else False),
+                                            **({'fragmentation_method': table.attrs['activation']} if table.attrs.get('activation') in RADICAL_METHODS else {})))
 
     def annotate(self):
         table, spectra = self.payload['tables'][self.source[0]]
@@ -3569,7 +3656,8 @@ class ResultsView(QWidget):
         panel = self.ms3_panel if ms3 else self.spectrum
         # The settings the results' spectrum annotates with: the charge carrier of the peak's ion, and for its MS2 spectrum the competing structures and the analyzer
         annotation = (self.spectrum_args(r, self.alternative)[2] or (None, {}))[1]
-        extra = {'metal_cations': annotation.get('metal_cations', True)} | ({} if ms3 else {k: annotation[k] for k in ('candidates', 'ion_trap') if k in annotation})
+        extra = {'metal_cations': annotation.get('metal_cations', True), 'fragmentation_method': annotation.get('fragmentation_method')} | (
+            {} if ms3 else {k: annotation[k] for k in ('candidates', 'ion_trap') if k in annotation})
         self.open_in_crumbs.emit(extra | {'structure': structure if isinstance(structure, str) else _composition(table['composition'].iat[r]),
                                   'peaks': ms3[1] if ms3 else spectra[r] or {}, 'charge': int(table['charge'].iat[r]), 'settings': _row_settings(self.payload['settings'], table, r),
                                   'ms3_precursor': ms3[0] if ms3 else None, 'tolerance': (panel.tolerance.value(), panel.unit.currentData())})
@@ -3700,7 +3788,9 @@ class CrumbsTab(QWidget):
         self.cleavages.setToolTip('Maximum number of concurrent cleavages per fragment')
         self.fragmentation = _combo(FRAGMENTATIONS)
         self.fragmentation.setToolTip('Restricts peptide backbone ion types for glycopeptides (not EED/EDD/NETD/UVPD); every method but CID/HCD also '
-                                      'annotates free-glycan fragments one or two hydrogen atoms off (odd-electron, hydrogen-shifted ions)')
+                                      'annotates free-glycan fragments one or two hydrogen atoms off (odd-electron, hydrogen-shifted ions), keeps their '
+                                      'cross-rings, and lets a fragment keeping the precursor\'s metal cation have two cleavages. Open in CandyCrumbs sets it to the '
+                                      'run\'s activation where the file names one (Bruker mzXML of CompassXport names none)')
         self.ms3_precursor = _spin(0, 5000, 1, 4, ' m/z')
         self.ms3_precursor.setSpecialValueText('None (MS2 spectrum)')
         self.ms3_precursor.setToolTip('For an MS3 spectrum: m/z of the MS2 fragment that was isolated, so its peaks are only annotated as fragments of that '
@@ -3796,6 +3886,8 @@ class CrumbsTab(QWidget):
         self.ms3_precursor.setValue(request.get('ms3_precursor') or 0)
         metals = request.get('metal_cations', True)
         self.carrier.setCurrentIndex(0 if metals is True else 2 if metals and '+Li' in metals else 1)
+        # (Any where the run names no electron-based or UV activation)
+        _set_combo(self.fragmentation, request.get('fragmentation_method'))
         self.spectrum.set_tolerance(*request['tolerance'])
         self.loaded = (self.structure.text().strip(), self.peaks.toPlainText(), {'candidates': request.get('candidates', []), 'ion_trap': request.get('ion_trap', False)})
         self.annotate()
@@ -4572,6 +4664,7 @@ class MainWindow(QMainWindow):
     update_checked = Signal(str)
     update_progress = Signal(int)
     update_downloaded = Signal(bool)
+    notes_ready = Signal(object, bool)
     error_caught = Signal(str, object)
     report_done = Signal(bool, object)
 
@@ -4658,7 +4751,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_text, 1)
         self.statusBar().addPermanentWidget(self.elapsed)
         self.statusBar().addPermanentWidget(self.progress)
-        self.update_button, self.update_url, self.update_path = QPushButton(), None, None
+        self.update_button, self.update_url, self.update_path, self.update_notes = QPushButton(), None, None, None
         self.update_button.setFlat(True)
         self.update_button.setStyleSheet(f'color: {CANDY}; font-weight: 600;')
         self.update_button.hide()
@@ -4715,6 +4808,7 @@ class MainWindow(QMainWindow):
         self.usage_action.toggled.connect(lambda on: (self.store.setValue('usage_stats', on), on or self.store.remove(f'sessions/{os.getpid()}'),
                                                       setattr(self, 'session', self.session if on else None)))
         help_menu.addSeparator()
+        help_menu.addAction("What's new", lambda: self.whats_new(asked = True))
         help_menu.addAction('Check for updates…', lambda: self.check_update(announce = True))
         help_menu.addAction('About CandyCrunch', self.about)
         self.settings.add_files.clicked.connect(self.choose_files)
@@ -4742,9 +4836,12 @@ class MainWindow(QMainWindow):
         self.images.ready.connect(self.image_ready)
         self.update_button.clicked.connect(self.install_update)
         self.update_found.connect(lambda tag: (self.update_button.setText(f'Update to CandyCrunch {tag}'), self.update_button.show()))
+        self.update_button.setToolTip("Shows what's new, then downloads the update")
+        self.notes_ready.connect(self.show_notes)
         self.update_checked.connect(lambda text: QMessageBox.information(self, 'Check for updates', text))
         self.update_progress.connect(lambda percent: self.update_button.setText(f'Downloading update… {percent}%'))
-        self.update_downloaded.connect(lambda ok: (self.update_button.setEnabled(True), self.update_button.setText('Install update and restart' if ok else 'Download failed, retry')))
+        self.update_downloaded.connect(lambda ok: (self.update_button.setEnabled(True), self.update_button.setText(
+            'Download failed, retry' if not ok else "Quit and open the update's disk image" if self.update_path.endswith('.dmg') else 'Install update and restart')))
         self.error_caught.connect(self.caught_error, Qt.QueuedConnection)
         self.report_done.connect(self.report_sent)
         # Errors in the window and its threads went nowhere, as the app has no console; now they go to the log and become crash reports
@@ -4813,6 +4910,7 @@ class MainWindow(QMainWindow):
             self.open_session(sessions[0])
         self.load_taxa()
         self.check_update()
+        self.whats_new()
         if THEME['name'] == 'dark':
             self.retheme()
 
@@ -4842,10 +4940,10 @@ class MainWindow(QMainWindow):
         self.images.get('Fuc(a1-2)Gal(b1-3)GalNAc', compact = False, urgent = True)
 
     def check_update(self, announce = False):
-        """The installed Windows app offers the newest GitHub release that carries a Windows installer, without network access simply nothing; announce:
-        asked from the Help menu, so the answer comes also without a newer release, and other installs are told how they are updated"""
+        """The Windows and macOS apps offer the newest GitHub release that carries their installer or disk image, without network access simply nothing;
+        announce: asked from the Help menu, so the answer comes also without a newer release, and other installs are told how they are updated"""
         running = __version__
-        if not (getattr(sys, 'frozen', False) and sys.platform == 'win32'):
+        if not (getattr(sys, 'frozen', False) and sys.platform in ('win32', 'darwin')):
             if announce:
                 QMessageBox.information(self, 'Check for updates', f'This is CandyCrunch {running}. ' + (
                     'The newest release is on <a href="https://github.com/BojarLab/CandyCrunch/releases/latest">GitHub</a>.' if getattr(sys, 'frozen', False) else
@@ -4857,12 +4955,16 @@ class MainWindow(QMainWindow):
                 from packaging.version import Version
                 with urllib.request.urlopen('https://api.github.com/repos/BojarLab/CandyCrunch/releases/latest', timeout = 10) as response:
                     release = json.load(response)
-                asset = next((a for a in release['assets'] if a['name'].endswith('-Windows-Setup.exe')), None)
+                asset = next((a for a in release['assets'] if a['name'].endswith('-Windows-Setup.exe' if sys.platform == 'win32' else '-macOS.dmg')), None)
                 if asset and Version(release['tag_name'].lstrip('v')) > Version(running):
                     self.update_url = asset['browser_download_url']
+                    # What's new since this version, shown when Update is clicked (none without them: the update installs as before)
+                    with contextlib.suppress(Exception):
+                        self.update_notes = (release['tag_name'].lstrip('v'), _release_notes(release['tag_name'], running))
                     self.update_found.emit(release['tag_name'].lstrip('v'))
                     if announce:
-                        self.update_checked.emit(f'CandyCrunch {release["tag_name"].lstrip("v")} is out (this is {running}): Update in the status bar installs it.')
+                        self.update_checked.emit(f'CandyCrunch {release["tag_name"].lstrip("v")} is out (this is {running}): Update in the status bar shows '
+                                                 "what's new and installs it.")
                 elif announce:
                     self.update_checked.emit(f'CandyCrunch {running} is the newest version.')
             except Exception:
@@ -4870,6 +4972,64 @@ class MainWindow(QMainWindow):
                     self.update_checked.emit(f'This is CandyCrunch {running}. GitHub could not be reached to look for a newer version.')
 
         threading.Thread(target = check, daemon = True).start()
+
+    def whats_new(self, asked = False):
+        """What's new: once, at the first start of a version newer than the one whose notes were shown last (QSettings 'notes_seen'), the notes of every
+        release since that one (only this version's after an update from a version that kept no record); asked from the Help menu, every release's up to
+        this one. A first install only records its version, and notes GitHub does not give (no network, or this version not released yet) wait for the
+        next start"""
+        seen = self.store.value('notes_seen')
+        if not asked:
+            if seen and _version_key(seen) >= _version_key(__version__):
+                return
+            # A first start: no window was ever closed, so nothing was used before
+            if seen is None and self.store.value('geometry') is None:
+                self.store.setValue('notes_seen', __version__)
+                return
+
+        def fetch():
+            try:
+                notes = _release_notes(__version__, '0' if asked else seen)
+            except Exception:
+                notes = None
+            self.notes_ready.emit(notes, asked)
+
+        threading.Thread(target = fetch, daemon = True).start()
+
+    def show_notes(self, notes, asked):
+        """Shows what whats_new found: after an update once, recorded as shown; asked, also why there is nothing to show"""
+        if not asked:
+            if notes:
+                self.store.setValue('notes_seen', __version__)
+                self.notes_dialog(f'CandyCrunch is updated to {__version__}', notes)
+        elif notes:
+            self.notes_dialog(f'This is CandyCrunch {__version__}', notes)
+        else:
+            QMessageBox.information(self, "What's new", f'GitHub could not be reached for the release notes of CandyCrunch {__version__}.' if notes is None else
+                                    f'CandyCrunch {__version__} has no release notes on GitHub yet.')
+
+    def notes_dialog(self, heading, notes, install = False):
+        """The release notes (Markdown) under a heading, links opening in the browser; before an update with Update now and Later, which returns whether
+        Update now was clicked"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("What's new in CandyCrunch")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(_label(heading))
+        text = QTextBrowser()
+        text.setOpenExternalLinks(True)
+        text.setMarkdown(notes)
+        layout.addWidget(text, 1)
+        buttons = QDialogButtonBox()
+        if install:
+            buttons.addButton('Update now', QDialogButtonBox.AcceptRole).setDefault(True)
+            buttons.addButton('Later', QDialogButtonBox.RejectRole)
+        else:
+            buttons.addButton(QDialogButtonBox.Close)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(640, 480)
+        return dialog.exec() == QDialog.Accepted
 
     def caught_error(self, text, values):
         self.append_log(text)
@@ -5137,7 +5297,7 @@ class MainWindow(QMainWindow):
             return
         settings = self.settings.values()
         # Only the settings that differ from the defaults, so that a later release's defaults reach those left at theirs; the main adduct describes these runs, not the next ones
-        self.store.setValue('settings', json.dumps({k: sorted(v) if k == 'filter_out' else v for k, v in settings.items() if k not in ('adducts', 'run_anion') and (k not in DEFAULTS or v != DEFAULTS[k])}))
+        self.store.setValue('settings', json.dumps({k: sorted(v) if k == 'filter_out' else v for k, v in settings.items() if k not in ('adducts', 'run_anion', 'glycan_database', 'database_mode', 'database_file') and (k not in DEFAULTS or v != DEFAULTS[k])}))
         self.weights = {**STAGE_WEIGHTS, **json.loads(self.store.value('stage_weights', '{}'))}
         self.runner.submit(experiments, self.weights)
         self.started, self.stage_text = time.time(), 'Waiting for the CandyCrunch model to load' if self.status_text.text().startswith('Loading') else 'Starting'
@@ -5416,10 +5576,28 @@ class MainWindow(QMainWindow):
         if self.update_path:
             # Closing first releases the app's files (and asks if a run is still going); the installer updates the same folder in place and starts the new version
             if self.close():
-                subprocess.Popen([self.update_path, '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/RELAUNCH=1'])
+                if sys.platform == 'win32':
+                    subprocess.Popen([self.update_path, '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/RELAUNCH=1'])
+                elif self.update_path.endswith('.dmg'):
+                    # The app's folder takes no new version (an account that may not change Applications): its disk image opens to drag it there
+                    subprocess.Popen(['open', self.update_path])
+                else:
+                    # Once this process has ended, the new app (unpacked while this one ran) takes the old one's place and starts; if it cannot, the old one
+                    # comes back and starts
+                    subprocess.Popen(['/bin/sh', '-c', 'while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; old="$(dirname "$2")/.CandyCrunch.app.old"; '
+                                      'rm -rf "$old"; if mv "$2" "$old"; then if mv "$3" "$2"; then rm -rf "$old"; else rm -rf "$2"; mv "$old" "$2"; fi; fi; '
+                                      'open "$2"', 'sh', str(os.getpid()), _app_bundle(), self.update_path], start_new_session = True,
+                                     stdin = subprocess.DEVNULL, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
             return
+        # What's new first; taken, the notes count as shown, so the new version does not show them again at its first start
+        if self.update_notes and self.update_notes[1]:
+            if not self.notes_dialog(f'CandyCrunch {self.update_notes[0]} is out (this is {__version__})', self.update_notes[1], install = True):
+                return
+            self.store.setValue('notes_seen', self.update_notes[0])
+            self.update_notes = None
         self.update_button.setEnabled(False)
         self.update_button.setText('Downloading update…')
+
         def work():
             path = os.path.join(tempfile.gettempdir(), self.update_url.rsplit('/', 1)[1])
             try:
@@ -5432,6 +5610,23 @@ class MainWindow(QMainWindow):
                             self.update_progress.emit(done * 100 // total)
                 os.replace(path + '.part', path)
                 self.update_path = path
+                # On macOS the new app is unpacked from its disk image while this one runs, where its folder can take it: a failure shows before the window
+                # closes, and the restart only moves it into place
+                if sys.platform == 'darwin' and os.access(os.path.dirname(_app_bundle()), os.W_OK):
+                    app, mount = path[:-len('.dmg')] + '.app', tempfile.mkdtemp()
+                    try:
+                        shutil.rmtree(app, ignore_errors = True)
+                        subprocess.run(['hdiutil', 'attach', '-nobrowse', '-readonly', '-noverify', '-mountpoint', mount, path], check = True, capture_output = True)
+                        try:
+                            subprocess.run(['ditto', os.path.join(mount, 'CandyCrunch.app'), app], check = True, capture_output = True)
+                        finally:
+                            subprocess.run(['hdiutil', 'detach', '-quiet', mount], capture_output = True)
+                        os.remove(path)
+                        self.update_path = app
+                    except (OSError, subprocess.CalledProcessError):
+                        shutil.rmtree(app, ignore_errors = True)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(mount)
             except Exception:
                 pass
             self.update_downloaded.emit(self.update_path is not None)
@@ -5462,10 +5657,15 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _app_bundle():
+    """The folder of the macOS app this process runs from (CandyCrunch.app/Contents/MacOS/CandyCrunch is sys.executable)"""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(sys.executable))))
+
+
 def _moved_to_applications():
     """The macOS app started from its disk image (mounted under /Volumes, or translocated by Gatekeeper) offers to copy itself into Applications and
     start from there, as otherwise every start opens the disk image again; True once the copy is in place and starts after this process ends"""
-    bundle = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(sys.executable))))
+    bundle = _app_bundle()
     if not (bundle.endswith('.app') and (bundle.startswith('/Volumes/') or '/AppTranslocation/' in bundle)):
         return False
     if QMessageBox.question(None, 'CandyCrunch', 'CandyCrunch is running from its disk image. Move it into your Applications folder and start it from there?') != QMessageBox.Yes:
